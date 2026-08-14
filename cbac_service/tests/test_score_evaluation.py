@@ -171,7 +171,9 @@ def scores(tmp_path_factory):
 
     Skips the module when the models can't be loaded (offline CI).
     """
-    cbac = CBAC(provenance=SimpleNamespace(config_dir=str(tmp_path_factory.mktemp("eval"))))  # type: ignore[arg-type]
+    cbac = CBAC(
+        provenance=SimpleNamespace(config_dir=str(tmp_path_factory.mktemp("eval")))
+    )  # type: ignore[arg-type]
     results: dict[str, list[Scored]] = {}
     try:
         encoder = cbac._get_encoder()
@@ -183,9 +185,14 @@ def scores(tmp_path_factory):
             texts = POLICY_ALLOWED if chunk_type == "allowed" else POLICY_FORBIDDEN
             sims = vecs @ intent_vec  # rows are L2-normalised -> cosine similarity
             order = np.argsort(-sims)[:top_k]
-            return [SimpleNamespace(score=float(sims[i]), chunk_text=texts[i]) for i in order]
+            return [
+                SimpleNamespace(score=float(sims[i]), chunk_text=texts[i])
+                for i in order
+            ]
 
-        async def fake_vector_search(session, agent_id, intent_vec, top_k=1, chunk_type="allowed"):
+        async def fake_vector_search(
+            session, agent_id, intent_vec, top_k=1, chunk_type="allowed"
+        ):
             return _search(intent_vec, chunk_type, top_k)
 
         async def fake_hybrid_search(
@@ -227,7 +234,9 @@ def attack_cases(scores):
 
 def test_intent_score_passes_faithful_actions(scores):
     for case in scores["faithful"] + scores["partial_step"]:
-        assert case.intent_score > 0.7, f"faithful action flagged as drift: {case.action}"
+        assert case.intent_score > 0.7, (
+            f"faithful action flagged as drift: {case.action}"
+        )
 
 
 def test_intent_score_catches_syntactic_opposites(scores):

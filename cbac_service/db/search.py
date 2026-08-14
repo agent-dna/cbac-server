@@ -187,16 +187,22 @@ async def hybrid_search(
     chunk_map: dict[int, SearchResult] = {}
 
     for rank, result in enumerate(vector_results, start=1):
-        rrf_scores[result.chunk_id] = rrf_scores.get(result.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
+        rrf_scores[result.chunk_id] = rrf_scores.get(result.chunk_id, 0.0) + 1.0 / (
+            rrf_k + rank
+        )
         chunk_map[result.chunk_id] = result
 
     for rank, result in enumerate(bm25_results, start=1):
-        rrf_scores[result.chunk_id] = rrf_scores.get(result.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
+        rrf_scores[result.chunk_id] = rrf_scores.get(result.chunk_id, 0.0) + 1.0 / (
+            rrf_k + rank
+        )
         if result.chunk_id not in chunk_map:
             chunk_map[result.chunk_id] = result
 
     # Sort by RRF score descending and take top_k.
-    sorted_ids = sorted(rrf_scores, key=lambda cid: rrf_scores[cid], reverse=True)[:top_k]
+    sorted_ids = sorted(rrf_scores, key=lambda cid: rrf_scores[cid], reverse=True)[
+        :top_k
+    ]
 
     # Return results with the fused RRF score.
     return [

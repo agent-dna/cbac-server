@@ -24,9 +24,14 @@ def test_every_line_is_json_carrying_the_bound_context():
     logging.getLogger("uvicorn.access").info("%s %d", "POST /authorize-cbac", 200)
 
     records = [json.loads(line) for line in stream.getvalue().splitlines()]
-    assert [r["event"] for r in records] == ["cbac decision", "POST /authorize-cbac 200"]
+    assert [r["event"] for r in records] == [
+        "cbac decision",
+        "POST /authorize-cbac 200",
+    ]
     # Bound at the request boundary — present on the foreign uvicorn record too.
-    assert all(r["request_id"] == "r1" and r["agent_id"] == "did:agent" for r in records)
+    assert all(
+        r["request_id"] == "r1" and r["agent_id"] == "did:agent" for r in records
+    )
     assert records[0]["decision"] == "deny"
     assert records[0]["level"] == "info"
 

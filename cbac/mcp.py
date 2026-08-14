@@ -48,9 +48,9 @@ from .guard import (
 )
 
 __all__ = [
-    "cbac_intercept",
-    "cbac_guard",
     "cbac_context",
+    "cbac_guard",
+    "cbac_intercept",
 ]
 
 # The hidden tool argument carrying the root user intent across the wire.
@@ -114,7 +114,9 @@ async def cbac_intercept(request, handler):
     # getattr keeps the pass-through wired for an adapter version that does
     # expose it on the request.
     description = getattr(request, "description", None)
-    decision, detail, scores = await authorize_tool_call(request.name, request.args, description)
+    decision, detail, scores = await authorize_tool_call(
+        request.name, request.args, description
+    )
     if decision != "allow":
         return _denied_result(decision, detail)
 

@@ -86,13 +86,15 @@ alembic upgrade head
 `pyproject.toml`, `uv.lock`, and `.venv` all live at the **repo root** — run
 everything from there, not from inside `cbac_service/`:
 
-- `uv sync` — dev install. `[tool.uv.sources]` resolves `agent-dna` from the
-  sibling checkout (`path = "../agentdna", editable`), so library edits are
-  picked up live. The `dev` group pulls `agent-dna[mcp]` (fastmcp), which
-  `cbac/mcp.py` needs.
-- `uv sync --no-sources` — deploy install, resolving `agent-dna` from PyPI.
+- `uv sync --locked` — install from `uv.lock`. `agent-dna` resolves from PyPI
+  like any other dependency; there is no path source to the sibling checkout, so
+  library edits are **not** picked up live — publish, then bump the pin here.
+  The `dev` group declares `mcp` directly, which `cbac/mcp.py` needs (the
+  published `agent-dna` wheel ships no `mcp` extra).
 - `uv run pytest` — runs `cbac_service/tests/` (`[tool.pytest.ini_options]`,
   `pythonpath = ["."]`).
+- `ruff` and `pyright` are pinned **exactly**, not floored: CI and the local
+  `PostToolUse` hook must run the same linter. Bump them in `pyproject.toml`.
 - `transformers` is pinned `<5` on purpose — HHEM-2.1's remote code
   (`hallucination_score`) breaks on transformers 5.x. Don't loosen it.
 

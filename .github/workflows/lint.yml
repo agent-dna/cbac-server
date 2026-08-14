@@ -1,0 +1,36 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # The dev group supplies mcp, which pyright needs to resolve cbac/mcp.py.
+      # --locked fails if uv.lock drifts from pyproject.toml, so CI runs the same
+      # ruff/pyright versions the local PostToolUse hook does.
+      - name: Install dev environment
+        run: uv sync --locked
+
+      - name: ruff format
+        run: uv run ruff format --check cbac cbac_service
+
+      - name: ruff check
+        run: uv run ruff check cbac cbac_service
+
+      - name: pyright
+        run: uv run pyright

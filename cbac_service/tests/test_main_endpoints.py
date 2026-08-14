@@ -82,7 +82,9 @@ def test_authorize_omits_headers_for_missing_scores(monkeypatch):
     install_cbac(
         monkeypatch,
         verify_cbac=authorizing(
-            CBACResult(decision="advise", reason="Tier 3 inconclusive", intent_score=0.7)
+            CBACResult(
+                decision="advise", reason="Tier 3 inconclusive", intent_score=0.7
+            )
         ),
     )
     response = asyncio.run(main.authorize_cbac(stub_request(AUTHORIZE_BODY)))
@@ -101,7 +103,9 @@ def test_authorize_failure_sends_no_score_headers(monkeypatch):
     response = asyncio.run(main.authorize_cbac(stub_request(AUTHORIZE_BODY)))
 
     assert response.headers["X-CBAC-Decision"] == "error"
-    assert not any(h.startswith("x-cbac-") and h != "x-cbac-decision" for h in response.headers)
+    assert not any(
+        h.startswith("x-cbac-") and h != "x-cbac-decision" for h in response.headers
+    )
 
 
 def test_compute_lhi_forwards_all_scores(monkeypatch):
@@ -124,7 +128,9 @@ def test_compute_lhi_error_returns_500(monkeypatch):
         raise ValueError("intent_score must be in [0, 1], got 1.2")
 
     install_cbac(monkeypatch, compute_lhi=boom)
-    response = asyncio.run(main.compute_lhi(stub_request(dict(LHI_BODY, intent_score=1.2))))
+    response = asyncio.run(
+        main.compute_lhi(stub_request(dict(LHI_BODY, intent_score=1.2)))
+    )
 
     assert response.status_code == 500
     assert "must be in [0, 1]" in json.loads(response.body)["error"]
@@ -166,7 +172,9 @@ def test_precompute_rejects_non_string_policy(monkeypatch):
 
     install_cbac(monkeypatch, precompute_policy=never)
     response = asyncio.run(
-        main.precompute_policy(stub_request({"agent_id": "did:agent", "policy": {"a": 1}}))
+        main.precompute_policy(
+            stub_request({"agent_id": "did:agent", "policy": {"a": 1}})
+        )
     )
 
     assert response.status_code == 400

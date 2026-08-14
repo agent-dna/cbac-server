@@ -47,7 +47,9 @@ def split_by_word_budget(unit: str, max_words: int) -> list[str]:
         return [unit]
     sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(unit) if s.strip()]
     if len(sentences) <= 1:
-        return [" ".join(words[i : i + max_words]) for i in range(0, len(words), max_words)]
+        return [
+            " ".join(words[i : i + max_words]) for i in range(0, len(words), max_words)
+        ]
     out: list[str] = []
     current: list[str] = []
     current_len = 0
@@ -73,7 +75,9 @@ def chunk_body_text(text: str, max_words: int = CHUNK_MAX_WORDS) -> list[str]:
     Lines starting with ``#`` are dropped, matching the previous
     comment-stripping behaviour.
     """
-    filtered = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
+    filtered = "\n".join(
+        ln for ln in text.splitlines() if not ln.strip().startswith("#")
+    )
     chunks: list[str] = []
     for block in re.split(r"\n\s*\n", filtered):
         block = block.strip()

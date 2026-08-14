@@ -57,8 +57,8 @@ class GovernanceContext:
     user_intent: str = ""
 
 
-_governance_ctx: contextvars.ContextVar[GovernanceContext | None] = contextvars.ContextVar(
-    "agentdna_governance_ctx", default=None
+_governance_ctx: contextvars.ContextVar[GovernanceContext | None] = (
+    contextvars.ContextVar("agentdna_governance_ctx", default=None)
 )
 
 
@@ -139,7 +139,7 @@ def _default_intent(
     """
     text = _action_summary(action_name, description).rstrip(".")
     if kwargs:
-        text += ", with " + ", ".join(f"{k} = {str(v)}" for k, v in kwargs.items())
+        text += ", with " + ", ".join(f"{k} = {v!s}" for k, v in kwargs.items())
     return text + "."
 
 
@@ -292,7 +292,9 @@ async def _report_lhi(
             output_score,
             cfg,
         )
-    except Exception:
+    except Exception:  # noqa: S110
+        # Trust reporting is fire-and-forget telemetry: it must never surface an
+        # error into the caller's tool call. Swallowed deliberately, not unfinished.
         pass
 
 
@@ -343,7 +345,9 @@ async def report_tool_outcome(
     ctx = get_context()
     if ctx is None:
         return
-    await _report_lhi(ctx, callee_name, callee_type, scores, 1.0 if ok else 0.0, get_config())
+    await _report_lhi(
+        ctx, callee_name, callee_type, scores, 1.0 if ok else 0.0, get_config()
+    )
 
 
 # ── The decorator ─────────────────────────────────────────────────────────────
@@ -436,7 +440,9 @@ def cbac_guard(
                 await _report_lhi(ctx, action_name, callee_type, scores, 0.0, cfg)
                 raise
 
-            await _report_lhi(ctx, action_name, callee_type, scores, _output_score(result), cfg)
+            await _report_lhi(
+                ctx, action_name, callee_type, scores, _output_score(result), cfg
+            )
             return result
 
         # Frameworks (LangChain / MCP) build the LLM-facing tool schema by

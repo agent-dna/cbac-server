@@ -28,7 +28,9 @@ def _make_provenance(tmp_path, policy_text="Agents may read pull requests."):
     )
 
 
-def make_verify_cbac(tmp_path, monkeypatch, policy_text="Agents may read pull requests."):
+def make_verify_cbac(
+    tmp_path, monkeypatch, policy_text="Agents may read pull requests."
+):
     """CBAC instance with the policy pipeline stubbed out (no NLI/encoder model
     load), so it deterministically falls through Tier 1/2/3 to Tier 3's
     no-backend "advise" — leaving `hallucination_score` as the only real model
@@ -44,7 +46,9 @@ def make_verify_cbac(tmp_path, monkeypatch, policy_text="Agents may read pull re
         ),
     )
     monkeypatch.setattr(
-        cbac, "_nli_scores", lambda premise, hypothesis: {"contradiction": 0.0, "entailment": 0.0}
+        cbac,
+        "_nli_scores",
+        lambda premise, hypothesis: {"contradiction": 0.0, "entailment": 0.0},
     )
 
     # DB search layer stubbed to in-memory so the pipeline runs without Postgres:
@@ -56,7 +60,9 @@ def make_verify_cbac(tmp_path, monkeypatch, policy_text="Agents may read pull re
     async def _get_chunks(session, agent_id):
         return ["allowed chunk"]
 
-    async def _search(session, agent_id, intent_vec, *args, chunk_type="allowed", **kwargs):
+    async def _search(
+        session, agent_id, intent_vec, *args, chunk_type="allowed", **kwargs
+    ):
         return [SimpleNamespace(score=0.5, chunk_text="allowed chunk")]
 
     monkeypatch.setattr(cbac_mod, "policy_hash_matches", _hash_matches)
@@ -91,7 +97,10 @@ def test_hallucination_score_none_without_user_intent(tmp_path, monkeypatch):
     cbac = make_verify_cbac(tmp_path, monkeypatch)
     result = asyncio.run(
         cbac.verify_cbac(
-            session=None, agent_id=AGENT_ID, intended_action="read pull requests", user_intent=None
+            session=None,
+            agent_id=AGENT_ID,
+            intended_action="read pull requests",
+            user_intent=None,
         )
     )
     assert result.decision == "advise"
@@ -121,7 +130,9 @@ def test_hallucination_scoring_failure_does_not_change_decision(tmp_path, monkey
 def test_intent_score_is_one_minus_contradiction(tmp_path, monkeypatch):
     cbac = make_verify_cbac(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        cbac, "_nli_scores", lambda premise, hypothesis: {"contradiction": 0.3, "entailment": 0.1}
+        cbac,
+        "_nli_scores",
+        lambda premise, hypothesis: {"contradiction": 0.3, "entailment": 0.1},
     )
     drift, intent_score = asyncio.run(cbac._check1_drift("user intent", "agent action"))
     assert drift is None  # 0.3 < contradiction_threshold, no deny
@@ -132,7 +143,9 @@ def test_policy_score_normalized_on_tier1_decision(tmp_path, monkeypatch):
     cbac = make_verify_cbac(tmp_path, monkeypatch)
 
     # Tier-1 search: allowed cosine 1.0, forbidden 0.0 -> gap 1.0, clamps above allow_gap.
-    async def _vsearch(session, agent_id, intent_vec, *args, chunk_type="allowed", **kwargs):
+    async def _vsearch(
+        session, agent_id, intent_vec, *args, chunk_type="allowed", **kwargs
+    ):
         score = 1.0 if chunk_type == "allowed" else 0.0
         return [SimpleNamespace(score=score, chunk_text=f"{chunk_type} chunk")]
 
@@ -150,7 +163,9 @@ def test_hallucination_score_not_computed_on_early_hard_fail(tmp_path, monkeypat
     monkeypatch.setattr(
         cbac,
         "hallucination_score",
-        lambda *a, **k: pytest.fail("hallucination_score must not run on an early hard-fail"),
+        lambda *a, **k: pytest.fail(
+            "hallucination_score must not run on an early hard-fail"
+        ),
     )
     result = asyncio.run(
         cbac.verify_cbac(

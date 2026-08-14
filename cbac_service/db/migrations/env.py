@@ -14,11 +14,11 @@ _repo_root = str(Path(__file__).resolve().parents[3])
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from cbac_service.config import DATABASE_URL  # noqa: E402
-from cbac_service.db.base import Base  # noqa: E402
+from cbac_service.config import DATABASE_URL
+from cbac_service.db.base import Base
 
 # Import models so their tables are registered on Base.metadata.
-from cbac_service.db.models import PolicyChunk, PolicyMeta  # noqa: E402, F401
+from cbac_service.db.models import PolicyChunk, PolicyMeta  # noqa: F401
 
 # ── Alembic config ────────────────────────────────────────────────────────────
 config = context.config

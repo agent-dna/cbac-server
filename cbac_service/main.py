@@ -4,11 +4,11 @@ from uuid import uuid4
 
 import structlog
 import uvicorn
+from agentdna.provenance import Provenance
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import text
 
-from agentdna.provenance import Provenance
 from cbac_service.cbac import CBAC
 from cbac_service.db.engine import close_db, get_session
 from cbac_service.logging_config import setup_logging
@@ -137,7 +137,9 @@ async def compute_lhi(request: Request) -> JSONResponse:
         logger.exception("lhi update failed", callee_name=body.get("callee_name", ""))
         return JSONResponse({"error": str(exc)}, status_code=500)
 
-    logger.info("lhi trust updated", callee_name=body.get("callee_name", ""), trust=trust)
+    logger.info(
+        "lhi trust updated", callee_name=body.get("callee_name", ""), trust=trust
+    )
     return JSONResponse({"trust": trust})
 
 

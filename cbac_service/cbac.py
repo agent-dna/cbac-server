@@ -6,12 +6,12 @@ from collections.abc import Callable
 from typing import Any
 
 import structlog
-from sentence_transformers import SentenceTransformer
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from agentdna.id import get_id
 from agentdna.provenance import Provenance
 from agentdna.types import AgentCard
+from sentence_transformers import SentenceTransformer
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from cbac_service.chunking import flatten_policy_chunks
 from cbac_service.config import (
     ALLOW_GAP,
@@ -190,12 +190,16 @@ class CBAC:
 
     def _get_latest_agent_policy(self, agent_id: str) -> str:
         """Returns the latest decoded policy associated with an agent."""
-        actor_card_dict = self.provenance.get_latest_provenance_record(actor_id=agent_id)
+        actor_card_dict = self.provenance.get_latest_provenance_record(
+            actor_id=agent_id
+        )
         actor_card = AgentCard(**actor_card_dict)
         try:
             return base64.b64decode(actor_card.policy).decode("utf-8")
         except Exception as exc:
-            raise RuntimeError(f"failed to decode policy for agent {agent_id}: {exc}") from exc
+            raise RuntimeError(
+                f"failed to decode policy for agent {agent_id}: {exc}"
+            ) from exc
 
     # ── Precompute (DB-backed) ────────────────────────────────────────────────
 
@@ -237,11 +241,15 @@ class CBAC:
         if not chunks:
             raise RuntimeError(f"Policy for agent {agent_id} produced no chunks")
 
-        allowed_chunks, forbidden_chunks = await asyncio.to_thread(self._classify_chunks, chunks)
+        allowed_chunks, forbidden_chunks = await asyncio.to_thread(
+            self._classify_chunks, chunks
+        )
 
         # Encode all chunks.
         all_chunks = allowed_chunks + forbidden_chunks
-        chunk_types = (["allowed"] * len(allowed_chunks)) + (["forbidden"] * len(forbidden_chunks))
+        chunk_types = (["allowed"] * len(allowed_chunks)) + (
+            ["forbidden"] * len(forbidden_chunks)
+        )
 
         encoder = self._get_encoder()
         embeddings = await asyncio.to_thread(
@@ -321,7 +329,9 @@ class CBAC:
         gap = allowed_score - forbidden_score
 
         span = self._allow_gap + self._deny_gap
-        gap_score = max(0.0, min(1.0, (gap + self._deny_gap) / span)) if span > 0 else None
+        gap_score = (
+            max(0.0, min(1.0, (gap + self._deny_gap) / span)) if span > 0 else None
+        )
 
         if gap > self._allow_gap:
             return (
@@ -347,7 +357,12 @@ class CBAC:
         # otherwise fall back to the vector search result we already have.
         if HYBRID_SEARCH_ENABLED and allowed_results:
             top_results = await hybrid_search(
-                session, agent_id, intent_vec, intent_text, top_k=1, chunk_type="allowed"
+                session,
+                agent_id,
+                intent_vec,
+                intent_text,
+                top_k=1,
+                chunk_type="allowed",
             )
             top_chunk = top_results[0].chunk_text if top_results else None
         elif allowed_results:
@@ -363,7 +378,11 @@ class CBAC:
         contradiction = t2_scores.get("contradiction", 0.0)
 
         if entailment >= ENTAILMENT_THRESHOLD:
-            return ("allow", f"Tier 2 NLI entailment={entailment:.2f} vs {top_chunk!r}", entailment)
+            return (
+                "allow",
+                f"Tier 2 NLI entailment={entailment:.2f} vs {top_chunk!r}",
+                entailment,
+            )
         if contradiction >= CONTRADICTION_THRESHOLD:
             return (
                 "deny",
@@ -395,7 +414,10 @@ class CBAC:
         verdict = str(llm_decision).lower()
         if any(w in verdict for w in ("deny", "reject", "not allow", "prohibited")):
             return ("deny", f"Tier 3 LLM: {llm_decision}", None)
-        if any(w in verdict for w in ("allow", "permit", "approve", "authorise", "authorize")):
+        if any(
+            w in verdict
+            for w in ("allow", "permit", "approve", "authorise", "authorize")
+        ):
             return ("allow", f"Tier 3 LLM: {llm_decision}", None)
         return ("advise", f"Tier 3 LLM inconclusive: {llm_decision}", None)
 
@@ -449,17 +471,24 @@ class CBAC:
             drift, intent_score = await self._check1_drift(user_intent, intent_text)
             if drift is not None:
                 decision, reason = drift
-                return CBACResult(decision=decision, reason=reason, intent_score=intent_score)
+                return CBACResult(
+                    decision=decision, reason=reason, intent_score=intent_score
+                )
 
         # Fetch current policy from chain — always, so we can detect updates.
         try:
-            current_policy = await asyncio.to_thread(self._get_latest_agent_policy, agent_id)
+            current_policy = await asyncio.to_thread(
+                self._get_latest_agent_policy, agent_id
+            )
         except Exception as e:
             return CBACResult(
-                decision="deny", reason=f"Policy lookup failed for agent {agent_id}: {e}"
+                decision="deny",
+                reason=f"Policy lookup failed for agent {agent_id}: {e}",
             )
         if not current_policy:
-            return CBACResult(decision="deny", reason=f"No policy available for agent {agent_id}")
+            return CBACResult(
+                decision="deny", reason=f"No policy available for agent {agent_id}"
+            )
 
         current_hash = _policy_hash(current_policy)
 
@@ -470,16 +499,21 @@ class CBAC:
                 await self.index_policy(session, agent_id, policy=current_policy)
             except Exception as e:
                 return CBACResult(
-                    decision="deny", reason=f"Policy unavailable for agent {agent_id}: {e}"
+                    decision="deny",
+                    reason=f"Policy unavailable for agent {agent_id}: {e}",
                 )
 
         # Check that chunks actually exist.
         all_chunks = await get_policy_chunks(session, agent_id)
         if not all_chunks:
-            return CBACResult(decision="deny", reason="Policy carries no analysable content")
+            return CBACResult(
+                decision="deny", reason="Policy carries no analysable content"
+            )
 
         # Run the tiered decision pipeline (DB-backed search).
-        decision, reason, policy_score = await self._tiered_decision(session, agent_id, intent_text)
+        decision, reason, policy_score = await self._tiered_decision(
+            session, agent_id, intent_text
+        )
 
         # Hallucination score — informational, never gates the decision.
         hallucination = None
@@ -489,7 +523,9 @@ class CBAC:
                     self.hallucination_score, user_intent, intent_text
                 )
             except Exception:
-                logger.warning("hallucination scoring failed", decision=decision, exc_info=True)
+                logger.warning(
+                    "hallucination scoring failed", decision=decision, exc_info=True
+                )
                 hallucination = None
 
         return CBACResult(
@@ -551,7 +587,8 @@ class CBAC:
                 raise ValueError(f"{key}_score must be in [0, 1], got {value}")
 
         s = sum(
-            value * weight for value, weight in zip(scores.values(), self._lhi_weights, strict=True)
+            value * weight
+            for value, weight in zip(scores.values(), self._lhi_weights, strict=True)
         )
 
         prev = await get_latest_trust(session, agent_id, callee_name, callee_type)

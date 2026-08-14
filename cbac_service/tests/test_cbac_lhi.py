@@ -6,8 +6,9 @@ import pytest
 
 pytest.importorskip("sentence_transformers")
 
-import cbac_service.cbac as cbac_mod
 from agentdna.id import get_id
+
+import cbac_service.cbac as cbac_mod
 from cbac_service.cbac import CBAC
 from cbac_service.config import LHI_LAMBDA_DOWN, LHI_LAMBDA_UP, LHI_WEIGHTS
 
@@ -25,7 +26,9 @@ SESSION = SimpleNamespace()
 
 def weighted_mean(intent_score, policy_score, hallucination_score, output_score):
     values = (intent_score, policy_score, hallucination_score, output_score)
-    return sum(value * weight for value, weight in zip(values, LHI_WEIGHTS, strict=True))
+    return sum(
+        value * weight for value, weight in zip(values, LHI_WEIGHTS, strict=True)
+    )
 
 
 @pytest.fixture
@@ -76,13 +79,17 @@ def make_cbac(tmp_path):
 
 def compute(cbac, callee_name="github_tool", callee_type="tool", **overrides):
     return asyncio.run(
-        cbac.compute_lhi(SESSION, "did:agent", callee_name, callee_type, **{**SCORES, **overrides})
+        cbac.compute_lhi(
+            SESSION, "did:agent", callee_name, callee_type, **{**SCORES, **overrides}
+        )
     )
 
 
 def edge_history(records, callee_name, callee_type):
     return [
-        r.trust for r in records if (r.callee_name, r.callee_type) == (callee_name, callee_type)
+        r.trust
+        for r in records
+        if (r.callee_name, r.callee_type) == (callee_name, callee_type)
     ]
 
 
@@ -207,7 +214,9 @@ def test_hallucination_score_orientation(tmp_path):
         contradicted = cbac.hallucination_score(
             "The capital of France is Berlin.", "The capital of France is Paris."
         )
-        grounded = cbac.hallucination_score("I am in California", "I am in United States.")
+        grounded = cbac.hallucination_score(
+            "I am in California", "I am in United States."
+        )
     except Exception as exc:
         pytest.skip(f"HHEM model unavailable: {exc}")
     assert 0.0 <= contradicted <= 1.0

@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # Not a package (`package = false`, no [build-system]), so there is nothing
+      # to pip install -e. uv sync builds the .venv from uv.lock instead.
+      - name: Install dev environment
+        run: uv sync --locked
+
+      - name: Run tests
+        run: uv run pytest -v

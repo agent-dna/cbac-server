@@ -63,7 +63,9 @@ async def save_policy_chunks(
 
     # 2. Insert new chunks.
     rows = []
-    for i, (text, ctype, section) in enumerate(zip(chunks, chunk_types, sections, strict=True)):
+    for i, (text, ctype, section) in enumerate(
+        zip(chunks, chunk_types, sections, strict=True)
+    ):
         row = PolicyChunk(
             agent_id=agent_id,
             chunk_text=text,
@@ -162,7 +164,9 @@ async def delete_policy_chunks(
     agent_id: str,
 ) -> int:
     """Delete all chunks and meta for an agent. Returns rows deleted."""
-    result = await session.execute(delete(PolicyChunk).where(PolicyChunk.agent_id == agent_id))
+    result = await session.execute(
+        delete(PolicyChunk).where(PolicyChunk.agent_id == agent_id)
+    )
     await session.execute(delete(PolicyMeta).where(PolicyMeta.agent_id == agent_id))
     await session.commit()
     return result.rowcount  # type: ignore[return-value]

@@ -19,7 +19,9 @@ class PolicyChunk(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     agent_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
-    chunk_type: Mapped[str] = mapped_column(String, nullable=False)  # 'allowed' | 'forbidden'
+    chunk_type: Mapped[str] = mapped_column(
+        String, nullable=False
+    )  # 'allowed' | 'forbidden'
     embedding: Mapped[list] = mapped_column(Vector(384), nullable=False)
     policy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     section: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -82,7 +84,9 @@ class LHIRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     agent_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
     callee_name: Mapped[str] = mapped_column(String, nullable=False)
-    callee_type: Mapped[str] = mapped_column(String, nullable=False)  # 'tool' | 'agent' | 'mcp'
+    callee_type: Mapped[str] = mapped_column(
+        String, nullable=False
+    )  # 'tool' | 'agent' | 'mcp'
     intent_score: Mapped[float] = mapped_column(Float, nullable=False)
     policy_score: Mapped[float] = mapped_column(Float, nullable=False)
     hallucination_score: Mapped[float] = mapped_column(Float, nullable=False)
@@ -95,7 +99,9 @@ class LHIRecord(Base):
     )
 
     # Latest-row-per-edge is the hot query; id disambiguates same-timestamp rows.
-    __table_args__ = (Index("ix_lhi_records_edge", "agent_id", "callee_name", "callee_type", "id"),)
+    __table_args__ = (
+        Index("ix_lhi_records_edge", "agent_id", "callee_name", "callee_type", "id"),
+    )
 
     def __repr__(self) -> str:
         return (
