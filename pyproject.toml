@@ -32,9 +32,7 @@ package = false
 # agent-dna extra, which the published wheel doesn't ship.
 dev = [
     "pytest>=8.0.0",
-    "mcp>=1.2.0",
-    # Pinned exactly, not floored: CI must resolve these to the same versions the
-    # local PostToolUse hook runs. Bump both here.
+    "mcp>=2.0.0",
     "ruff==0.16.3",
     "pyright==1.1.411",
 ]
@@ -44,6 +42,24 @@ dev = [
 # a failed trust update is logged rather than raised. Every `except Exception`
 # here is that contract, not an oversight.
 ignore = ["BLE001"]
+
+[tool.pyright]
+# Without these, a bare `pyright <file>` (what the PostToolUse hook runs) falls back
+# to system Python and reports every third-party import as unresolved, while
+# `uv run pyright` succeeds. Pinning the venv makes the hook and CI agree.
+venvPath = "."
+venv = ".venv"
+
+# Test doubles — SimpleNamespace fakes, None sessions, monkeypatched repositories —
+# deliberately don't satisfy production signatures; that is what makes them usable
+# as doubles. Everything else still type-checks here.
+[[tool.pyright.executionEnvironments]]
+root = "cbac_service/tests"
+# `root` also re-roots import resolution, so `from cbac_service.cbac import ...`
+# stops resolving without the repo root added back (mirrors pytest's pythonpath).
+extraPaths = ["."]
+reportArgumentType = "none"
+reportAttributeAccessIssue = "none"
 
 [tool.pytest.ini_options]
 # `from cbac_service.cbac import ...` resolves against the repo root.

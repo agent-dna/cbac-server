@@ -3,19 +3,14 @@
 Guidance for this repo. It holds two things:
 
 - `cbac_service/` — the decision service (this file is mostly about it).
-- `cbac/` — the framework-agnostic guard + optional MCP glue, a verbatim copy of
-  `agentdna/cbac/` in the sibling `agent-dna` checkout. `import cbac` gets this
-  copy; `from agentdna.cbac import ...` gets the library's. Keep them in sync or
-  pick one.
-
-The `agent-dna` library itself lives in its own checkout (`../agentdna`) with its
-own `CLAUDE.md`.
+- `cbac/` — the framework-agnostic guard + optional MCP glue. `import cbac` gets
+  it; this repo owns it outright.
 
 ## What this is
 
 `cbac_service` is the **reference CBAC decision service** — a standalone FastAPI
-app that the library's guard calls over HTTP. All the ML deps live here;
-`agentdna/` imports **none** of them.
+app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
+**none** of them.
 
 - `main.py` — the HTTP boundary: `app = FastAPI()`, the lazy `CBAC` singleton,
   DB lifecycle via lifespan, and the `__main__` uvicorn runner.
@@ -37,7 +32,7 @@ app that the library's guard calls over HTTP. All the ML deps live here;
 ## Architecture
 
 ```
-Guard (cbac/ | agentdna.cbac) --HTTP--> cbac_service (FastAPI)
+Guard (cbac/) --HTTP--> cbac_service (FastAPI)
                                      |
                                 PostgreSQL 18
                                 ├── pgvector 0.8.6 (semantic search)

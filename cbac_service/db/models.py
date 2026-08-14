@@ -76,7 +76,7 @@ class LHIRecord(Base):
     ``scores`` list used to approximate. The current trust for an edge
     (agent_id, callee_name, callee_type) is the ``trust`` of its latest row;
     the EMA chain is reconstructable because every row stores the value it
-    produced. Replaces trust_scores.json under ~/.agentdna/.
+    produced.
     """
 
     __tablename__ = "lhi_records"
