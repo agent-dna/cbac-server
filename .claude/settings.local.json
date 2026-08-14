@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python)",
+      "Bash(.venv/bin/ruff)",
+      "Bash(.venv/bin/pyright)",
+      "Bash(uv *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // empty' | { read -r f; [ -n \"$f\" ] || exit 0; case \"$f\" in *.py) .venv/bin/ruff format \"$f\"; .venv/bin/ruff check \"$f\"; case \"$f\" in */examples/*) ;; *) .venv/bin/pyright \"$f\";; esac;; esac; }; true",
+            "timeout": 120,
+            "statusMessage": "ruff + pyright"
+          }
+        ]
+      }
+    ]
+  }
+}
