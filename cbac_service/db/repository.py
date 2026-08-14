@@ -63,7 +63,9 @@ async def save_policy_chunks(
 
     # 2. Insert new chunks.
     rows = []
-    for i, (text, ctype, section) in enumerate(zip(chunks, chunk_types, sections, strict=True)):
+    for i, (text, ctype, section) in enumerate(
+        zip(chunks, chunk_types, sections, strict=True)
+    ):
         row = PolicyChunk(
             agent_id=agent_id,
             chunk_text=text,
@@ -162,7 +164,9 @@ async def delete_policy_chunks(
     agent_id: str,
 ) -> int:
     """Delete all chunks and meta for an agent. Returns rows deleted."""
-    result = await session.execute(delete(PolicyChunk).where(PolicyChunk.agent_id == agent_id))
+    result = await session.execute(
+        delete(PolicyChunk).where(PolicyChunk.agent_id == agent_id)
+    )
     await session.execute(delete(PolicyMeta).where(PolicyMeta.agent_id == agent_id))
     await session.commit()
     return result.rowcount  # type: ignore[return-value]
@@ -208,13 +212,16 @@ async def insert_lhi_record(
     agent_id: str,
     callee_name: str,
     callee_type: str,
-    intent_score: float,
-    policy_score: float,
-    hallucination_score: float,
-    output_score: float,
+    intent_score: float | None,
+    policy_score: float | None,
+    hallucination_score: float | None,
     trust: float,
 ) -> LHIRecord:
-    """Append one interaction's scores + resulting trust. Commits."""
+    """Append one interaction's scores + resulting trust. Commits.
+
+    An unmeasured component is stored as NULL — `trust` already renormalizes
+    over the observed ones, so nothing here substitutes a value.
+    """
     record = LHIRecord(
         agent_id=agent_id,
         callee_name=callee_name,
@@ -222,7 +229,6 @@ async def insert_lhi_record(
         intent_score=intent_score,
         policy_score=policy_score,
         hallucination_score=hallucination_score,
-        output_score=output_score,
         trust=trust,
     )
     session.add(record)

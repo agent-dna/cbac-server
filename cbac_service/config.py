@@ -14,7 +14,9 @@ DATABASE_URL: str = os.environ.get(
 VECTOR_INDEX_TYPE: str = os.environ.get("VECTOR_INDEX_TYPE", "hnsw")
 
 # Hybrid search: enable BM25 fusion alongside vector cosine.
-HYBRID_SEARCH_ENABLED: bool = os.environ.get("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+HYBRID_SEARCH_ENABLED: bool = (
+    os.environ.get("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+)
 
 # Reciprocal Rank Fusion constant (higher = less aggressive re-ranking).
 RRF_K: int = int(os.environ.get("RRF_K", "60"))
@@ -22,7 +24,9 @@ RRF_K: int = int(os.environ.get("RRF_K", "60"))
 # Models
 ENCODER_MODEL = "BAAI/bge-small-en-v1.5"  # bi-encoder for Tier 1 cosine
 NLI_MODEL = "cross-encoder/nli-deberta-v3-small"  # NLI for classify + Tier 2
-HHEM_MODEL = "vectara/hallucination_evaluation_model"  # hallucination scoring (1 = grounded)
+HHEM_MODEL = (
+    "vectara/hallucination_evaluation_model"  # hallucination scoring (1 = grounded)
+)
 
 # Tier 1 gap thresholds: allow when gap > +allow_gap, deny when gap < -deny_gap,
 # else escalate. Model-agnostic (relative difference, not absolute scores).
@@ -34,10 +38,13 @@ ENTAILMENT_THRESHOLD = 0.55
 CONTRADICTION_THRESHOLD = 0.60
 
 # LHI (Local Heuristic Intelligence): weighted arithmetic mean of the
-# (intent, policy, hallucination, output) scores — expected interaction quality;
-# the allow/deny gates already enforce the hard constraints pre-execution —
-# then an asymmetric EMA against the stored trust: slow to build, fast to lose.
-LHI_WEIGHTS: tuple[float, float, float, float] = (0.3, 0.3, 0.2, 0.2)
+# (intent, policy, hallucination) scores — expected interaction quality; the
+# allow/deny gates already enforce the hard constraints — then an asymmetric
+# EMA against the stored trust: slow to build, fast to lose.
+# The mean renormalizes over whichever components were actually observed
+# (s = Σ wᵢxᵢ / Σ wᵢ), so these weights are scale-invariant — only their ratio
+# matters, and adding/removing a component needs no retuning of the rest.
+LHI_WEIGHTS: tuple[float, float, float] = (0.3, 0.3, 0.2)
 LHI_LAMBDA_UP = 0.95
 LHI_LAMBDA_DOWN = 0.70
 

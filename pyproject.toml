@@ -27,14 +27,23 @@ dependencies = [
 [tool.uv]
 package = false
 
-# Dev only: resolve agent-dna from the sibling checkout instead of PyPI.
-# Deploy against the published library with `uv sync --no-sources`.
-[tool.uv.sources]
-agent-dna = { path = "../agentdna", editable = true }
-
 [dependency-groups]
-# agent-dna[mcp] pulls fastmcp, which cbac/mcp.py imports.
-dev = ["pytest>=8.0.0", "agent-dna[mcp]"]
+# cbac/mcp.py imports mcp.types. Declared directly rather than via an
+# agent-dna extra, which the published wheel doesn't ship.
+dev = [
+    "pytest>=8.0.0",
+    "mcp>=1.2.0",
+    # Pinned exactly, not floored: CI must resolve these to the same versions the
+    # local PostToolUse hook runs. Bump both here.
+    "ruff==0.16.3",
+    "pyright==1.1.411",
+]
+
+[tool.ruff.lint]
+# The decision pipeline is fail-closed by design: any error becomes a `deny`, and
+# a failed trust update is logged rather than raised. Every `except Exception`
+# here is that contract, not an oversight.
+ignore = ["BLE001"]
 
 [tool.pytest.ini_options]
 # `from cbac_service.cbac import ...` resolves against the repo root.

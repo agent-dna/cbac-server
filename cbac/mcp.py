@@ -44,13 +44,12 @@ from .guard import (
     authorize_tool_call,
     cbac_context,
     cbac_guard,
-    report_tool_outcome,
 )
 
 __all__ = [
-    "cbac_intercept",
-    "cbac_guard",
     "cbac_context",
+    "cbac_guard",
+    "cbac_intercept",
 ]
 
 # The hidden tool argument carrying the root user intent across the wire.
@@ -102,8 +101,7 @@ async def cbac_intercept(request, handler):
     Client-side CBAC enforcement: authorizes each outgoing tool call before
     it leaves the process, so a third-party MCP server you do not own (and
     cannot decorate) still gets governed. All CBAC logic lives in
-    :func:`~agentdna.cbac.guard.authorize_tool_call` /
-    :func:`~agentdna.cbac.guard.report_tool_outcome`; this only maps the MCP
+    :func:`~agentdna.cbac.guard.authorize_tool_call`; this only maps the MCP
     request/result types and renders the denial, so another framework needs
     just its own equally thin adapter. Requires an open :func:`cbac_context`;
     without one it is a passthrough.
@@ -114,14 +112,13 @@ async def cbac_intercept(request, handler):
     # getattr keeps the pass-through wired for an adapter version that does
     # expose it on the request.
     description = getattr(request, "description", None)
-    decision, detail, scores = await authorize_tool_call(request.name, request.args, description)
+    decision, detail = await authorize_tool_call(
+        request.name, request.args, description, callee_type="mcp"
+    )
     if decision != "allow":
         return _denied_result(decision, detail)
 
-    result = await handler(request)
-    ok = not getattr(result, "isError", False)
-    await report_tool_outcome(request.name, scores, ok=ok, callee_type="mcp")
-    return result
+    return await handler(request)
 
 
 def _denied_result(decision: str, detail: str) -> CallToolResult:

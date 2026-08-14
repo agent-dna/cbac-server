@@ -28,16 +28,23 @@ def upgrade() -> None:
         sa.Column("agent_id", sa.String(), nullable=False),
         sa.Column("chunk_text", sa.Text(), nullable=False),
         sa.Column("chunk_type", sa.String(), nullable=False),
-        sa.Column("embedding", pgvector.sqlalchemy.vector.VECTOR(dim=384), nullable=False),
+        sa.Column(
+            "embedding", pgvector.sqlalchemy.vector.VECTOR(dim=384), nullable=False
+        ),
         sa.Column("policy_hash", sa.String(length=64), nullable=False),
         sa.Column("section", sa.String(), nullable=True),
         sa.Column("chunk_index", sa.Integer(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
-        "ix_policy_chunks_agent_hash", "policy_chunks", ["agent_id", "policy_hash"], unique=False
+        "ix_policy_chunks_agent_hash",
+        "policy_chunks",
+        ["agent_id", "policy_hash"],
+        unique=False,
     )
-    op.create_index(op.f("ix_policy_chunks_agent_id"), "policy_chunks", ["agent_id"], unique=False)
+    op.create_index(
+        op.f("ix_policy_chunks_agent_id"), "policy_chunks", ["agent_id"], unique=False
+    )
 
     # ── Custom indexes (not expressible via ORM autogenerate) ──────────────────
 

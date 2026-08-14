@@ -28,8 +28,8 @@ app that the library's guard calls over HTTP. All the ML deps live here;
 - **Not published as a wheel** (`[tool.uv] package = false`). Deployed from a
   checkout: `uvicorn cbac_service.main:app`.
 - Endpoints:
-  - **`POST /authorize-cbac`** — main decision gate.
-  - **`POST /compute-lhi`** — fold interaction scores into trust.
+  - **`POST /authorize-cbac`** — main decision gate. Also folds the decision
+    into the caller→callee trust score, so it is the *only* call a guard makes.
   - **`POST /precompute-policy`** — explicitly trigger embedding precomputation.
   - **`GET /health`** — DB connectivity check.
 - Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`).
@@ -86,13 +86,15 @@ alembic upgrade head
 `pyproject.toml`, `uv.lock`, and `.venv` all live at the **repo root** — run
 everything from there, not from inside `cbac_service/`:
 
-- `uv sync` — dev install. `[tool.uv.sources]` resolves `agent-dna` from the
-  sibling checkout (`path = "../agentdna", editable`), so library edits are
-  picked up live. The `dev` group pulls `agent-dna[mcp]` (fastmcp), which
-  `cbac/mcp.py` needs.
-- `uv sync --no-sources` — deploy install, resolving `agent-dna` from PyPI.
+- `uv sync --locked` — install from `uv.lock`. `agent-dna` resolves from PyPI
+  like any other dependency; there is no path source to the sibling checkout, so
+  library edits are **not** picked up live — publish, then bump the pin here.
+  The `dev` group declares `mcp` directly, which `cbac/mcp.py` needs (the
+  published `agent-dna` wheel ships no `mcp` extra).
 - `uv run pytest` — runs `cbac_service/tests/` (`[tool.pytest.ini_options]`,
   `pythonpath = ["."]`).
+- `ruff` and `pyright` are pinned **exactly**, not floored: CI and the local
+  `PostToolUse` hook must run the same linter. Bump them in `pyproject.toml`.
 - `transformers` is pinned `<5` on purpose — HHEM-2.1's remote code
   (`hallucination_score`) breaks on transformers 5.x. Don't loosen it.
 
@@ -133,6 +135,14 @@ Class `CBAC`. On each request:
 
 6. **Hallucination score** (HHEM): Attached after the decision, never gates it.
 
+7. **LHI trust fold** (`_fold_trust` → `compute_lhi`): once a decision is
+   *reached*, its component scores are folded into the (agent → callee) trust
+   score and the new value is attached to the result. Also never gates the
+   decision — a failed trust update is logged, not raised. Skipped when no
+   `callee_name` was supplied, or when no component was measured. The early
+   returns *above* the decision (policy lookup down, no policy, no chunks) are
+   infrastructure failures, not evidence about the agent, and record nothing.
+
 Decisions are `"allow" | "deny" | "advise"` and the pipeline is **fail-closed**
 (any error → `deny`).
 
@@ -141,21 +151,44 @@ Decisions are `"allow" | "deny" | "advise"` and the pipeline is **fail-closed**
 - **Hallucination score (HHEM):** when a decision is reached with a user intent
   present, `CBAC.hallucination_score` (vectara HHEM model, 1 = grounded,
   0 = hallucinated) is attached to the result.
-- **LHI trust:** `compute_lhi` combines four component scores
-  (intent, policy, hallucination, output) as a **weighted arithmetic mean**
+- **LHI trust:** `compute_lhi` combines three component scores
+  (intent, policy, hallucination) as a **weighted arithmetic mean**
   (`LHI_WEIGHTS`) — deliberately compensatory, since the allow/deny gates
-  already enforce the hard constraints *before* execution — then folds it into a
-  stored trust value via an **asymmetric EMA — slow to build (`LHI_LAMBDA_UP`),
-  fast to lose (`LHI_LAMBDA_DOWN`)**. A zero component costs only its weight, not
-  the whole score (a transient tool failure must not annihilate an
-  otherwise-compliant interaction). Trust is tracked **per caller→callee edge**
-  — the edge key is (`agent_id`, `callee_name`, `callee_type`) — and stored in
-  the **`lhi_records` table, one row per interaction**. The table *is* the trust
-  history: rows are append-only, an edge's current trust is its latest row
-  (`repository.get_latest_trust`), and `get_trust_history` reads the series.
-  Each record is also appended to the agent's `{agent_id}:cbac` provenance card,
-  so the history is verifiable on-chain. `compute_lhi` is **async and takes an
-  `AsyncSession`** like the rest of the pipeline. The LHI math is covered by
-  `cbac_service/tests/test_cbac_lhi.py` (repository functions faked in-memory,
-  no DB needed); score attachment by `cbac_service/tests/test_cbac_verify.py` —
-  keep both green when touching it.
+  already enforce the hard constraints — then folds it into a stored trust value
+  via an **asymmetric EMA — slow to build (`LHI_LAMBDA_UP`), fast to lose
+  (`LHI_LAMBDA_DOWN`)**. A zero component costs only its weight, not the whole
+  score.
+
+  It is called **from `verify_cbac` itself**, at decision time. There is no
+  post-execution step and no `/compute-lhi` endpoint: every component is known
+  the moment a decision is reached, so a guard makes exactly **one** HTTP call
+  per action and no score ever round-trips through the client. **Every decision
+  records** — allow, deny and advise alike — so an agent probing forbidden
+  actions loses trust instead of keeping a pristine record.
+
+  The mean **renormalizes over the observed components** (`s = Σ wᵢxᵢ / Σ wᵢ`)
+  rather than skipping records with a missing one: the components are not
+  missing at random (`policy_score` is `None` exactly on Tier-3 gray-zone
+  decisions; intent/hallucination are `None` without a `user_intent`), so
+  complete-case analysis would silently exclude the very interactions trust
+  exists to arbitrate. An unmeasured component is stored **NULL**, never
+  substituted. Nothing observed → no record. Because of the renormalizing
+  denominator, `LHI_WEIGHTS` is **scale-invariant** — only the ratios matter, so
+  adding or removing a component needs no retuning.
+
+  Trust is tracked **per caller→callee edge** — the edge key is (`agent_id`,
+  `callee_name`, `callee_type`) — and stored in the **`lhi_records` table, one
+  row per decision**. The table *is* the trust history: rows are append-only, an
+  edge's current trust is its latest row (`repository.get_latest_trust`), and
+  `get_trust_history` reads the series. `compute_lhi` is **async and takes an
+  `AsyncSession`** like the rest of the pipeline.
+
+  The on-chain mirror (appending each record to the agent's `{agent_id}:cbac`
+  provenance card) is **currently commented out** in `compute_lhi` — the DB is
+  the working copy and nothing reads the card yet. The block names the imports
+  to restore alongside it.
+
+  The LHI math is covered by `cbac_service/tests/test_cbac_lhi.py` (repository
+  functions faked in-memory via the shared `rows` fixture in
+  `tests/conftest.py`, no DB needed); the fold into `verify_cbac` by
+  `cbac_service/tests/test_cbac_verify.py` — keep both green when touching it.

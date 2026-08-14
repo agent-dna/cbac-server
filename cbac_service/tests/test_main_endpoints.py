@@ -32,8 +32,10 @@ def install_cbac(monkeypatch, **attrs):
     return cbac
 
 
-def authorizing(result):
-    async def verify_cbac(session, agent_id, intended_action, user_intent):
+def authorizing(result, calls=None):
+    async def verify_cbac(session, **kwargs):
+        if calls is not None:
+            calls.append(kwargs)
         return result
 
     return verify_cbac
@@ -43,20 +45,14 @@ AUTHORIZE_BODY = {
     "agent_id": "did:agent",
     "intended_action": "read pull requests",
     "user_intent": "show me the PRs",
-}
-
-LHI_BODY = {
-    "agent_id": "did:agent",
     "callee_name": "github_tool",
     "callee_type": "tool",
-    "intent_score": 0.9,
-    "policy_score": 0.8,
-    "hallucination_score": 0.95,
-    "output_score": 1.0,
 }
 
 
-def test_authorize_returns_score_headers(monkeypatch):
+def test_authorize_returns_decision_and_reason_only(monkeypatch):
+    """The component scores stay server-side now — they are folded into trust
+    while deciding, so nothing rides back on the wire but the verdict."""
     install_cbac(
         monkeypatch,
         verify_cbac=authorizing(
@@ -66,68 +62,67 @@ def test_authorize_returns_score_headers(monkeypatch):
                 intent_score=0.9,
                 policy_score=0.8,
                 hallucination_score=0.95,
+                trust=0.87,
             )
         ),
     )
     response = asyncio.run(main.authorize_cbac(stub_request(AUTHORIZE_BODY)))
 
     assert response.headers["X-CBAC-Decision"] == "allow"
-    assert float(response.headers["X-CBAC-Intent-Score"]) == 0.9
-    assert float(response.headers["X-CBAC-Policy-Score"]) == 0.8
-    assert float(response.headers["X-CBAC-Hallucination-Score"]) == 0.95
     assert response.body == b"Tier 1 allow"
+    assert not any(
+        h.startswith("x-cbac-") and h != "x-cbac-decision" for h in response.headers
+    )
 
 
-def test_authorize_omits_headers_for_missing_scores(monkeypatch):
+def test_authorize_forwards_the_callee_edge(monkeypatch):
+    calls = []
     install_cbac(
         monkeypatch,
-        verify_cbac=authorizing(
-            CBACResult(decision="advise", reason="Tier 3 inconclusive", intent_score=0.7)
-        ),
+        verify_cbac=authorizing(CBACResult(decision="allow", reason="ok"), calls),
     )
-    response = asyncio.run(main.authorize_cbac(stub_request(AUTHORIZE_BODY)))
+    asyncio.run(main.authorize_cbac(stub_request(AUTHORIZE_BODY)))
 
-    assert response.headers["X-CBAC-Decision"] == "advise"
-    assert "X-CBAC-Intent-Score" in response.headers
-    assert "X-CBAC-Policy-Score" not in response.headers
-    assert "X-CBAC-Hallucination-Score" not in response.headers
+    assert calls == [
+        {
+            "agent_id": "did:agent",
+            "intended_action": "read pull requests",
+            "user_intent": "show me the PRs",
+            "callee_name": "github_tool",
+            "callee_type": "tool",
+        }
+    ]
 
 
-def test_authorize_failure_sends_no_score_headers(monkeypatch):
-    async def boom(session, agent_id, intended_action, user_intent):
+def test_authorize_defaults_the_callee_edge(monkeypatch):
+    """An older client that sends neither field still authorizes; the empty
+    callee_name is what tells verify_cbac to skip the trust update."""
+    calls = []
+    install_cbac(
+        monkeypatch,
+        verify_cbac=authorizing(CBACResult(decision="allow", reason="ok"), calls),
+    )
+    asyncio.run(main.authorize_cbac(stub_request({"agent_id": "did:agent"})))
+
+    assert calls[0]["callee_name"] == ""
+    assert calls[0]["callee_type"] == "tool"
+
+
+def test_authorize_failure_fails_closed(monkeypatch):
+    async def boom(session, **kwargs):
         raise RuntimeError("policy lookup failed")
 
     install_cbac(monkeypatch, verify_cbac=boom)
     response = asyncio.run(main.authorize_cbac(stub_request(AUTHORIZE_BODY)))
 
     assert response.headers["X-CBAC-Decision"] == "error"
-    assert not any(h.startswith("x-cbac-") and h != "x-cbac-decision" for h in response.headers)
+    assert b"policy lookup failed" in response.body
 
 
-def test_compute_lhi_forwards_all_scores(monkeypatch):
-    calls = []
-
-    async def compute_lhi(session, **kwargs):
-        calls.append(kwargs)
-        return 0.87
-
-    install_cbac(monkeypatch, compute_lhi=compute_lhi)
-    response = asyncio.run(main.compute_lhi(stub_request(LHI_BODY)))
-
-    assert calls == [LHI_BODY]
-    assert json.loads(response.body) == {"trust": 0.87}
-    assert response.status_code == 200
-
-
-def test_compute_lhi_error_returns_500(monkeypatch):
-    async def boom(session, **kwargs):
-        raise ValueError("intent_score must be in [0, 1], got 1.2")
-
-    install_cbac(monkeypatch, compute_lhi=boom)
-    response = asyncio.run(main.compute_lhi(stub_request(dict(LHI_BODY, intent_score=1.2))))
-
-    assert response.status_code == 500
-    assert "must be in [0, 1]" in json.loads(response.body)["error"]
+def test_compute_lhi_endpoint_is_gone():
+    """Trust is folded in by /authorize-cbac; there is no second call."""
+    assert not hasattr(main, "compute_lhi")
+    assert "/compute-lhi" not in {route.path for route in main.app.routes}
 
 
 def _recording_precompute(calls, result=7):
@@ -166,7 +161,9 @@ def test_precompute_rejects_non_string_policy(monkeypatch):
 
     install_cbac(monkeypatch, precompute_policy=never)
     response = asyncio.run(
-        main.precompute_policy(stub_request({"agent_id": "did:agent", "policy": {"a": 1}}))
+        main.precompute_policy(
+            stub_request({"agent_id": "did:agent", "policy": {"a": 1}})
+        )
     )
 
     assert response.status_code == 400

@@ -5,22 +5,29 @@ carry the reasoning from the design discussion so it isn't re-litigated.
 
 ## Correctness — LHI
 
-- [ ] **Renormalize over observed scores instead of skipping the record.**
-      Today a record is written only when *all* of intent/policy/hallucination
-      are present ([guard.py](../agentdna/cbac/guard.py) `_report_lhi`), which
-      is complete-case analysis over data that is **not** missing at random:
-      `policy_score` is `None` exactly on Tier-3 gray-zone decisions, and
-      intent/hallucination are `None` whenever no `user_intent` was supplied.
-      Net effect: the interactions trust is meant to arbitrate never build
-      trust, and a deployment without `user_intent` accumulates **no records
+- [x] **Renormalize over observed scores instead of skipping the record**
+      (done 2026-08-14). A record used to be written only when *all* of
+      intent/policy/hallucination were present (the guard's `_report_lhi` skip),
+      which was complete-case analysis over data that is **not** missing at
+      random: `policy_score` is `None` exactly on Tier-3 gray-zone decisions,
+      and intent/hallucination are `None` whenever no `user_intent` was
+      supplied — so a deployment without `user_intent` accumulated **no records
       at all**, silently.
-      Fix: `s = Σ_{observed} wᵢxᵢ / Σ_{observed} wᵢ`, store the missing
-      component as `null` (never a substituted 0.5 — the on-chain record must
-      stay honest about what was measured). Guard rail: require ≥1 *semantic*
-      score; skip when only `output_score` survives, or trust silently becomes
-      a pure reliability tracker.
-      Touches: `compute_lhi` (Optional params + renormalize), `_report_lhi`
-      skip condition, `tests/test_cbac_lhi.py`.
+      `compute_lhi` now takes `float | None` components and computes
+      `s = Σ_{observed} wᵢxᵢ / Σ_{observed} wᵢ`, storing an unmeasured component
+      as NULL (never a substituted value). Guard rail: nothing observed → no
+      record, `compute_lhi` returns `None`. Every component is semantic now that
+      `output_score` is gone, so "require ≥1 semantic score" reduces to
+      "require ≥1". Migration `9c4e1f80a72b` makes the three columns nullable.
+
+- [x] **Remove `output_score`; compute LHI at decision time** (done
+      2026-08-14). It was the only component that required waiting for
+      execution, and the weakest one (binary 1.0/0.0 from "did the call raise").
+      Dropping it collapses the guard's two HTTP calls into one: `verify_cbac`
+      folds trust in itself via `_fold_trust`, `/compute-lhi` is deleted, and no
+      component score round-trips through the client — which also closes the
+      score-transport hole below. `LHI_WEIGHTS` needed no retuning: the
+      renormalizing denominator makes it scale-invariant.
 
 - [x] **Render actions as natural language before scoring them.** Measured on
       14 realistic agent cases (2026-08-03): both Check-1 NLI and HHEM degrade
@@ -41,17 +48,15 @@ carry the reasoning from the design discussion so it isn't re-litigated.
       the `_action_summary` helper kept in guard.py, if separation matters
       later.
 
-- [ ] **Record violation / denial evidence.** A denied call writes nothing
-      (correct — nothing executed), so an agent probing forbidden actions 50
-      times keeps pristine trust. Needs a separate per-edge negative-evidence
-      stream (counter, or beta-style `α/β`) that feeds the EMA without
-      pretending a denial was an interaction. Biggest blind spot today.
-
-- [ ] **Continuous `output_score` instead of binary.** Currently 1.0/0.0 from
-      "did it raise / return an error dict". Post-execution the tool's actual
-      output can be scored: HHEM grounding of output vs. request (model already
-      loaded), schema validity, empty/error-shaped payloads. Upgrades the
-      weakest component from {0,1} to [0,1].
+- [x] **Record violation / denial evidence** (done 2026-08-14, as a side
+      effect of folding LHI into `verify_cbac`). A denied call used to write
+      nothing, so an agent probing forbidden actions 50 times kept pristine
+      trust. Now that trust is folded at *decision* time rather than after
+      execution, every decision records — and a deny carries the low
+      intent/policy scores that produced it.
+      Still open, if this proves too blunt: a denial and a low-scoring allow are
+      currently the same kind of evidence. A separate per-edge negative stream
+      (counter, or beta-style `α/β`) would weight them differently.
 
 - [ ] **Time decay + evidence volume in the update rule.** The EMA is
       per-interaction, so an edge idle for months keeps frozen trust — decay
@@ -87,11 +92,10 @@ after the core is validated against real workflows.
 - [ ] **Remove `authorise_agent_app_interaction`** (`cbac.py:592`) — superseded
       by the guard + `/authorize-cbac`; it also makes the engine an HTTP
       *client*, which the rest of the class isn't.
-- [ ] Score-transport hardening: `/compute-lhi` trusts caller-supplied
-      intent/policy/hallucination scores, so a malicious guard can inflate its
-      own reputation. Documented tradeoff (the guard is already trusted to make
-      the authorize call at all); revisit with server-side correlation
-      (`interaction_id` → cached scores) if the threat model tightens.
+- [x] Score-transport hardening (moot since 2026-08-14). `/compute-lhi` used to
+      trust caller-supplied intent/policy/hallucination scores, so a malicious
+      guard could inflate its own reputation. The endpoint is gone and the
+      scores never leave the service, so there is nothing left to forge.
 - [ ] No CI for `cbac_service/tests/` — the root workflow only runs the
       library's `tests/`.
 - [ ] Add Readme

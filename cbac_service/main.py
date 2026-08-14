@@ -4,11 +4,11 @@ from uuid import uuid4
 
 import structlog
 import uvicorn
+from agentdna.provenance import Provenance
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import text
 
-from agentdna.provenance import Provenance
 from cbac_service.cbac import CBAC
 from cbac_service.db.engine import close_db, get_session
 from cbac_service.logging_config import setup_logging
@@ -69,15 +69,14 @@ async def health():
 async def authorize_cbac(request: Request) -> PlainTextResponse:
     """Decide whether an agent may perform an intended action.
 
-    The body carries the reason and ``X-CBAC-Decision`` the verdict. The
-    three component scores ride along as headers (omitted when the pipeline
-    could not produce them) so the caller can feed them back to
-    ``/compute-lhi`` once it knows whether the action succeeded.
+    The body carries the reason and ``X-CBAC-Decision`` the verdict — that is
+    the whole wire contract. The component scores stay server-side: reaching a
+    decision also folds them into the (agent → callee) trust score, so there is
+    no second call for the caller to make and no score to round-trip.
     """
     body = await request.json()
     _bind_request_context(body)
 
-    headers = {}
     try:
         async with get_session() as session:
             result = await _get_cbac().verify_cbac(
@@ -85,15 +84,10 @@ async def authorize_cbac(request: Request) -> PlainTextResponse:
                 agent_id=body.get("agent_id", ""),
                 intended_action=body.get("intended_action"),
                 user_intent=body.get("user_intent"),
+                callee_name=body.get("callee_name", ""),
+                callee_type=body.get("callee_type", "tool"),
             )
         decision, reason = result.decision, result.reason
-        for header, score in (
-            ("X-CBAC-Intent-Score", result.intent_score),
-            ("X-CBAC-Policy-Score", result.policy_score),
-            ("X-CBAC-Hallucination-Score", result.hallucination_score),
-        ):
-            if score is not None:
-                headers[header] = str(score)
         logger.info(
             "cbac decision",
             decision=decision,
@@ -101,44 +95,13 @@ async def authorize_cbac(request: Request) -> PlainTextResponse:
             intent_score=result.intent_score,
             policy_score=result.policy_score,
             hallucination_score=result.hallucination_score,
+            trust=result.trust,
         )
     except Exception as exc:
         decision, reason = "error", str(exc)
         logger.exception("cbac authorization failed")
 
-    return PlainTextResponse(reason, headers={"X-CBAC-Decision": decision, **headers})
-
-
-@app.post("/compute-lhi")
-async def compute_lhi(request: Request) -> JSONResponse:
-    """Fold one completed interaction into the caller→callee trust score.
-
-    The four component scores are supplied by the caller: the first three
-    come back from its own ``/authorize-cbac`` response, ``output_score``
-    from whether the action actually succeeded. Every call appends one
-    ``lhi_records`` row, so the edge's full trust history is preserved.
-    """
-    body = await request.json()
-    _bind_request_context(body)
-
-    try:
-        async with get_session() as session:
-            trust = await _get_cbac().compute_lhi(
-                session=session,
-                agent_id=body.get("agent_id", ""),
-                callee_name=body.get("callee_name", ""),
-                callee_type=body.get("callee_type", ""),
-                intent_score=body.get("intent_score"),
-                policy_score=body.get("policy_score"),
-                hallucination_score=body.get("hallucination_score"),
-                output_score=body.get("output_score"),
-            )
-    except Exception as exc:
-        logger.exception("lhi update failed", callee_name=body.get("callee_name", ""))
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-    logger.info("lhi trust updated", callee_name=body.get("callee_name", ""), trust=trust)
-    return JSONResponse({"trust": trust})
+    return PlainTextResponse(reason, headers={"X-CBAC-Decision": decision})
 
 
 @app.post("/precompute-policy")

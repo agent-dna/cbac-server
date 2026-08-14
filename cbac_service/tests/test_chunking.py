@@ -64,12 +64,17 @@ def test_unsplittable_long_unit_falls_back_to_word_budget():
 
 
 def test_dict_expands_lists_and_skips_none():
-    chunks = flatten_policy_chunks({"allowed": ["read", "write"], "owner": "boss", "expires": None})
+    chunks = flatten_policy_chunks(
+        {"allowed": ["read", "write"], "owner": "boss", "expires": None}
+    )
     assert chunks == ["allowed: read", "allowed: write", "owner: boss"]
 
 
 def test_plain_string_is_chunked_as_body_text():
-    assert flatten_policy_chunks("just prose\n\nmore prose") == ["just prose", "more prose"]
+    assert flatten_policy_chunks("just prose\n\nmore prose") == [
+        "just prose",
+        "more prose",
+    ]
 
 
 def test_skill_md_string_yields_frontmatter_and_body():
@@ -80,7 +85,9 @@ def test_skill_md_string_yields_frontmatter_and_body():
 
 
 def test_skillscard_object_matches_its_source_string():
-    assert flatten_policy_chunks(parse_skill_md(SKILL_MD)) == flatten_policy_chunks(SKILL_MD)
+    assert flatten_policy_chunks(parse_skill_md(SKILL_MD)) == flatten_policy_chunks(
+        SKILL_MD
+    )
 
 
 def test_malformed_frontmatter_falls_back_instead_of_raising():

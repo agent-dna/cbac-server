@@ -15,6 +15,10 @@ provenance envelopes and does **not** perform the action itself:
 
     intent (from call args) -> authorize (CBAC) -> run the wrapped fn
 
+The trust score (LHI) is folded in service-side as part of reaching the
+decision, so there is exactly one HTTP call per guarded action and no
+component score ever round-trips through the client.
+
 Attestation (build/handle envelopes) is handled separately at the
 workflow's delegation boundaries, and the wrapped function does its own
 work -- e.g. a GitHub tool makes its own HTTP request and returns a
@@ -57,8 +61,8 @@ class GovernanceContext:
     user_intent: str = ""
 
 
-_governance_ctx: contextvars.ContextVar[GovernanceContext | None] = contextvars.ContextVar(
-    "agentdna_governance_ctx", default=None
+_governance_ctx: contextvars.ContextVar[GovernanceContext | None] = (
+    contextvars.ContextVar("agentdna_governance_ctx", default=None)
 )
 
 
@@ -139,7 +143,7 @@ def _default_intent(
     """
     text = _action_summary(action_name, description).rstrip(".")
     if kwargs:
-        text += ", with " + ", ".join(f"{k} = {str(v)}" for k, v in kwargs.items())
+        text += ", with " + ", ".join(f"{k} = {v!s}" for k, v in kwargs.items())
     return text + "."
 
 
@@ -154,22 +158,14 @@ def _bind_kwargs(sig: inspect.Signature, args: tuple, kwargs: dict) -> dict[str,
         return dict(kwargs)
 
 
-_SCORE_HEADERS = {
-    "intent_score": "X-CBAC-Intent-Score",
-    "policy_score": "X-CBAC-Policy-Score",
-    "hallucination_score": "X-CBAC-Hallucination-Score",
-}
-
-# Tools that report failure by return value rather than by raising.
-_FAILED_STATUSES = frozenset({"error", "denied", "failed"})
-
-
 def _authorize_sync(
     agent_id: str,
     intended_action: Any,
     user_intent: str | None,
+    callee_name: str,
+    callee_type: str,
     cfg: GuardConfig,
-) -> tuple[str, str, dict[str, float | None]]:
+) -> tuple[str, str]:
     """POST to the CBAC decision service.
 
     The reference implementation (the cbac_service package) runs
@@ -177,10 +173,10 @@ def _authorize_sync(
     decision only -- it never executes the action. The payload is
     exactly that method's inputs.
 
-    Alongside the decision the service returns the three component scores
-    it computed; they come back as headers and are carried here so the
-    caller can report them to ``/compute-lhi`` once the action's outcome
-    is known. A score the pipeline could not produce is absent.
+    ``callee_name``/``callee_type`` name the edge whose trust score the
+    service updates as a side effect of deciding. The component scores
+    behind that update stay server-side: there is nothing for the caller
+    to carry, and nothing to report back afterwards.
     """
     import requests  # lazy; transitive dependency of the library already
 
@@ -188,6 +184,8 @@ def _authorize_sync(
         "agent_id": agent_id,
         "intended_action": intended_action,
         "user_intent": user_intent,
+        "callee_name": callee_name,
+        "callee_type": callee_type,
     }
 
     response = requests.post(
@@ -196,104 +194,25 @@ def _authorize_sync(
         timeout=cfg.cbac_timeout,
     )
 
-    decision = response.headers.get("X-CBAC-Decision", "advise")
-
-    scores: dict[str, float | None] = {}
-    for name, header in _SCORE_HEADERS.items():
-        raw = response.headers.get(header)
-        try:
-            scores[name] = float(raw) if raw is not None else None
-        except ValueError:
-            scores[name] = None
-
-    return decision, response.text, scores
+    return response.headers.get("X-CBAC-Decision", "advise"), response.text
 
 
 async def _authorize(
     ctx: GovernanceContext,
     intent_text: str,
+    callee_name: str,
+    callee_type: str,
     cfg: GuardConfig,
-) -> tuple[str, str, dict[str, float | None]]:
-    decision, detail, scores = await asyncio.to_thread(
+) -> tuple[str, str]:
+    return await asyncio.to_thread(
         _authorize_sync,
         ctx.agent_id,
         intent_text,
         ctx.user_intent or None,
+        callee_name,
+        callee_type,
         cfg,
     )
-    return decision, detail, scores
-
-
-def _output_score(result: Any) -> float:
-    """1.0 when the call succeeded, 0.0 when it reported failure.
-
-    Raising is handled by the caller; this only inspects a returned value,
-    since plenty of tools signal failure with a status field instead.
-    """
-    if isinstance(result, dict) and result.get("status") in _FAILED_STATUSES:
-        return 0.0
-    return 1.0
-
-
-def _report_lhi_sync(
-    agent_id: str,
-    callee_name: str,
-    callee_type: str,
-    scores: dict[str, float | None],
-    output_score: float,
-    cfg: GuardConfig,
-) -> None:
-    """POST the completed interaction's four scores to the CBAC service."""
-    import requests
-
-    payload = {
-        "agent_id": agent_id,
-        "callee_name": callee_name,
-        "callee_type": callee_type,
-        "output_score": output_score,
-        **scores,
-    }
-
-    requests.post(
-        f"{cfg.cbac_url.rstrip('/')}/compute-lhi",
-        json=payload,
-        timeout=cfg.cbac_timeout,
-    )
-
-
-async def _report_lhi(
-    ctx: GovernanceContext,
-    callee_name: str,
-    callee_type: str,
-    scores: dict[str, float | None],
-    output_score: float,
-    cfg: GuardConfig,
-) -> None:
-    """Fold this interaction into the agent's trust score, best-effort.
-
-    Skipped entirely when the authorize step could not produce all three
-    component scores -- a trust record built on substituted values would
-    be indistinguishable from a measured one.
-
-    Never raises: the action has already run and its side effects have
-    happened, so a failure to record trust must not destroy the result the
-    caller is waiting for (nor mask the exception it is about to see).
-    """
-    if any(scores.get(name) is None for name in _SCORE_HEADERS):
-        return
-
-    try:
-        await asyncio.to_thread(
-            _report_lhi_sync,
-            ctx.agent_id,
-            callee_name,
-            callee_type,
-            scores,
-            output_score,
-            cfg,
-        )
-    except Exception:
-        pass
 
 
 # ── Framework-agnostic call gate ──────────────────────────────────────────────
@@ -308,42 +227,29 @@ async def authorize_tool_call(
     callee_name: str,
     args: dict[str, Any],
     description: str | None = None,
-) -> tuple[str, str, dict[str, float | None]]:
+    callee_type: str = "tool",
+) -> tuple[str, str]:
     """Authorize one tool call against the ambient policy (decision only).
 
-    Returns ``(decision, detail, scores)``. ``decision`` is ``"allow"`` when
+    Returns ``(decision, detail)``. ``decision`` is ``"allow"`` when
     governance is off (no :func:`cbac_context`), so a caller can always
     proceed on ``"allow"`` and short-circuit otherwise. Fail-closed: any
     error resolves to ``"error"`` and never raises.
 
     ``description`` is the tool's own description (schema/docstring first
     line) used as the verb phrase of the rendered intent; without it the
-    de-snaked ``callee_name`` is the fallback.
+    de-snaked ``callee_name`` is the fallback. ``callee_type`` labels the
+    other end of the edge (``"tool"``, ``"agent"``, ``"mcp"``) whose trust
+    score the service updates while deciding.
     """
     ctx = get_context()
     if ctx is None:
-        return "allow", "", {}
+        return "allow", ""
     intent = _default_intent(callee_name, args, description)
-    cfg = get_config()
     try:
-        return await _authorize(ctx, intent, cfg)
+        return await _authorize(ctx, intent, callee_name, callee_type, get_config())
     except Exception as exc:
-        return "error", str(exc), {}
-
-
-async def report_tool_outcome(
-    callee_name: str,
-    scores: dict[str, float | None],
-    *,
-    ok: bool,
-    callee_type: str = "tool",
-) -> None:
-    """Fold a finished tool call's outcome into the trust score. No-op when
-    governance is off; never raises (mirrors :func:`_report_lhi`)."""
-    ctx = get_context()
-    if ctx is None:
-        return
-    await _report_lhi(ctx, callee_name, callee_type, scores, 1.0 if ok else 0.0, get_config())
+        return "error", str(exc)
 
 
 # ── The decorator ─────────────────────────────────────────────────────────────
@@ -383,11 +289,11 @@ def cbac_guard(
       governance", the same way a route without rate-limiting opts out.
     - Otherwise: intent (from the call's arguments) -> authorize (one HTTP
       call to the CBAC decision service) -> a non-allow decision
-      short-circuits -> run the wrapped function -> report the outcome as
-      a trust score -> return the result.
+      short-circuits -> run the wrapped function -> return the result.
 
-    A denied call never runs, so it produces no trust record; the gate
-    already blocked it.
+    The trust score is updated service-side while the decision is made, so
+    the guard has nothing to report afterwards -- and a denied call, which
+    never runs, still leaves a record of having been denied.
     """
     if on_deny not in ("return", "raise"):
         raise ValueError(f"unsupported on_deny: {on_deny!r}")
@@ -417,10 +323,10 @@ def cbac_guard(
                 else _default_intent(action_name, call_kwargs, description)
             )
 
-            cfg = get_config()
-            scores: dict[str, float | None] = {}
             try:
-                decision, detail, scores = await _authorize(ctx, intent_text, cfg)
+                decision, detail = await _authorize(
+                    ctx, intent_text, action_name, callee_type, get_config()
+                )
             except Exception as exc:
                 decision, detail = "error", str(exc)
 
@@ -430,14 +336,7 @@ def cbac_guard(
                 status = "denied" if decision == "deny" else "error"
                 return {"status": status, "error": detail}
 
-            try:
-                result = await fn(*args, **kwargs)
-            except Exception:
-                await _report_lhi(ctx, action_name, callee_type, scores, 0.0, cfg)
-                raise
-
-            await _report_lhi(ctx, action_name, callee_type, scores, _output_score(result), cfg)
-            return result
+            return await fn(*args, **kwargs)
 
         # Frameworks (LangChain / MCP) build the LLM-facing tool schema by
         # introspecting the callable's signature. functools.wraps copies

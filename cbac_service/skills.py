@@ -53,6 +53,9 @@ class CBACResult:
     hallucination_score: float | None = None
     intent_score: float | None = None
     policy_score: float | None = None
+    # Post-decision LHI trust for the (agent → callee) edge. None when no
+    # trust update ran — see CBAC._fold_trust for the skip conditions.
+    trust: float | None = None
 
 
 def parse_skill_md(text: str) -> SkillsCard:
@@ -71,7 +74,9 @@ def parse_skill_md(text: str) -> SkillsCard:
 
     fm = yaml.safe_load(frontmatter_text)
     if not isinstance(fm, dict):
-        raise ValueError("skill.md frontmatter must be a YAML object")
+        # TRY004 suppressed below: the documented contract is ValueError for
+        # every structural problem, matching the other three raise sites.
+        raise ValueError("skill.md frontmatter must be a YAML object")  # noqa: TRY004
 
     missing = [k for k in REQUIRED_FRONTMATTER_KEYS if k not in fm]
     if missing:
@@ -128,7 +133,9 @@ def _collect_text(obj: Any, *, include_keys: bool = True, _depth: int = 0) -> st
             parts.append(_collect_text(v, include_keys=include_keys, _depth=_depth + 1))
         return " ".join(parts)
     if isinstance(obj, (list, tuple, set)):
-        return " ".join(_collect_text(v, include_keys=include_keys, _depth=_depth + 1) for v in obj)
+        return " ".join(
+            _collect_text(v, include_keys=include_keys, _depth=_depth + 1) for v in obj
+        )
     # Dataclass / arbitrary object → walk its __dict__.
     data = getattr(obj, "__dict__", None)
     if isinstance(data, dict):
