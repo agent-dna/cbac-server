@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 import structlog
 from agentdna.id import get_id
 from agentdna.provenance import Provenance
@@ -253,7 +254,10 @@ class CBAC:
 
         encoder = self._get_encoder()
         embeddings = await asyncio.to_thread(
-            lambda: encoder.encode(all_chunks, normalize_embeddings=True)
+            # asarray is a no-op for the ndarray encode() actually returns; it narrows
+            # the declared 5-way union (Tensor | ndarray | dict | ...) to what the DB
+            # layer accepts.
+            lambda: np.asarray(encoder.encode(all_chunks, normalize_embeddings=True))
         )
 
         # Persist to DB.
@@ -313,7 +317,9 @@ class CBAC:
         # Encode only the intent at runtime (~5 ms on CPU).
         encoder = self._get_encoder()
         intent_vec = await asyncio.to_thread(
-            lambda: encoder.encode([intent_text], normalize_embeddings=True)[0]
+            lambda: np.asarray(
+                encoder.encode([intent_text], normalize_embeddings=True)
+            )[0]
         )
 
         # Tier 1: cosine gap via pgvector.

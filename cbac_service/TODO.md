@@ -7,7 +7,7 @@ carry the reasoning from the design discussion so it isn't re-litigated.
 
 - [ ] **Renormalize over observed scores instead of skipping the record.**
       Today a record is written only when *all* of intent/policy/hallucination
-      are present ([guard.py](../agentdna/cbac/guard.py) `_report_lhi`), which
+      are present ([guard.py](../cbac/guard.py) `_report_lhi`), which
       is complete-case analysis over data that is **not** missing at random:
       `policy_score` is `None` exactly on Tier-3 gray-zone decisions, and
       intent/hallucination are `None` whenever no `user_intent` was supplied.

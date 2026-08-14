@@ -55,8 +55,11 @@ async def save_policy_chunks(
 
     Returns the number of chunks inserted.
     """
-    if sections is None:
-        sections = [None] * len(chunks)
+    # Annotated local rather than reassigning the parameter: `[None] * n` infers
+    # list[None], which invariance rejects against list[str | None].
+    chunk_sections: list[str | None] = (
+        list(sections) if sections is not None else [None] * len(chunks)
+    )
 
     # 1. Delete old chunks for this agent.
     await session.execute(delete(PolicyChunk).where(PolicyChunk.agent_id == agent_id))
@@ -64,7 +67,7 @@ async def save_policy_chunks(
     # 2. Insert new chunks.
     rows = []
     for i, (text, ctype, section) in enumerate(
-        zip(chunks, chunk_types, sections, strict=True)
+        zip(chunks, chunk_types, chunk_sections, strict=True)
     ):
         row = PolicyChunk(
             agent_id=agent_id,

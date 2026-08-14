@@ -303,7 +303,7 @@ async def _report_lhi(
 # The authorize/report flow every framework needs, split from any framework's
 # request/result types. A framework interceptor supplies only its own glue:
 # extract (name, args), execute, detect success, render a denial. See
-# `agentdna.cbac.mcp.cbac_intercept` for the MCP/LangChain adapter.
+# `cbac.mcp.cbac_intercept` for the MCP/LangChain adapter.
 
 
 async def authorize_tool_call(

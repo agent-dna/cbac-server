@@ -1,10 +1,10 @@
 """
 MCP integration for the CBAC guard (optional).
 
-Install with ``pip install agent-dna[mcp]``.
+Requires the ``mcp`` package (declared in the ``dev`` dependency group).
 
 ``@cbac_guard`` authorizes a tool against the ambient
-:func:`~agentdna.cbac.guard.cbac_context` -- trivial when the tool runs in the
+:func:`~cbac.guard.cbac_context` -- trivial when the tool runs in the
 same process. Over MCP the tool runs in the server process, and a
 contextvar cannot cross a process boundary. This module carries the one
 value that must cross -- the root user intent -- as a hidden tool
@@ -20,7 +20,7 @@ in-process ones and the ``@cbac_guard`` decorators need no change:
 
 Typical wiring (one import surface)::
 
-    from agentdna.cbac.mcp import cbac_guard, cbac_context, CBACMiddleware, intent_interceptor
+    from cbac.mcp import cbac_guard, cbac_context, CBACMiddleware, intent_interceptor
 
     # server
     mcp.add_middleware(CBACMiddleware(agent_id_provider=my_agent_id))
@@ -102,8 +102,8 @@ async def cbac_intercept(request, handler):
     Client-side CBAC enforcement: authorizes each outgoing tool call before
     it leaves the process, so a third-party MCP server you do not own (and
     cannot decorate) still gets governed. All CBAC logic lives in
-    :func:`~agentdna.cbac.guard.authorize_tool_call` /
-    :func:`~agentdna.cbac.guard.report_tool_outcome`; this only maps the MCP
+    :func:`~cbac.guard.authorize_tool_call` /
+    :func:`~cbac.guard.report_tool_outcome`; this only maps the MCP
     request/result types and renders the denial, so another framework needs
     just its own equally thin adapter. Requires an open :func:`cbac_context`;
     without one it is a passthrough.
@@ -121,7 +121,10 @@ async def cbac_intercept(request, handler):
         return _denied_result(decision, detail)
 
     result = await handler(request)
-    ok = not getattr(result, "isError", False)
+    # mcp 2.0 renamed the wire field isError -> is_error (camelCase kept only as a
+    # pydantic alias, which getattr does not see). Reading the old name here made
+    # every failing tool call report ok=True.
+    ok = not getattr(result, "is_error", False)
     await report_tool_outcome(request.name, scores, ok=ok, callee_type="mcp")
     return result
 
@@ -131,4 +134,6 @@ def _denied_result(decision: str, detail: str) -> CallToolResult:
     # so the agent loop can see the block and adapt.
     status = "denied" if decision == "deny" else "error"
     body = json.dumps({"status": status, "error": detail})
-    return CallToolResult(content=[TextContent(type="text", text=body)], isError=False)
+    # is_error defaults to False; passing it explicitly is unresolvable for pyright
+    # because mcp 2.0 generates the camelCase alias via alias_generator.
+    return CallToolResult(content=[TextContent(type="text", text=body)])
