@@ -110,3 +110,51 @@ class LHIRecord(Base):
             f"<LHIRecord(id={self.id}, agent_id={self.agent_id!r}, "
             f"edge={self.callee_name!r}:{self.callee_type!r}, trust={self.trust:.3f})>"
         )
+
+
+class CBACDecision(Base):
+    """One authorization verdict — the audit log of what was decided and why.
+
+    Append-only, and *complete*: every decision `verify_cbac` reaches lands here,
+    including the infrastructure-failure denies and calls that carry no callee.
+    That is what separates it from `lhi_records`, which looks similar but is a
+    trust history and is deliberately skipped without a callee, without a
+    measured component, and on those same infra-failure paths — so it can never
+    answer "what did we decide for this agent, and why".
+    """
+
+    __tablename__ = "cbac_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    decision: Mapped[str] = mapped_column(
+        String, nullable=False
+    )  # 'allow' | 'deny' | 'advise'
+    # Text, not String: a Tier-2 reason embeds the matched policy chunk verbatim.
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    # The *flattened* action text — what the scorers actually saw, so the row
+    # explains the verdict rather than just restating the request.
+    intended_action: Mapped[str] = mapped_column(Text, nullable=False)
+    # NULL when the caller supplied none, rather than an empty string, so
+    # "not provided" stays distinguishable from "provided as empty".
+    user_intent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    callee_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    callee_type: Mapped[str | None] = mapped_column(
+        String, nullable=True
+    )  # 'tool' | 'agent' | 'mcp'
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    # Newest-first-per-agent is the only read pattern; id disambiguates
+    # same-timestamp rows. The leftmost prefix also serves agent-only lookups,
+    # so no separate index on agent_id is needed.
+    __table_args__ = (Index("ix_cbac_decisions_agent_id_id", "agent_id", "id"),)
+
+    def __repr__(self) -> str:
+        return (
+            f"<CBACDecision(id={self.id}, agent_id={self.agent_id!r}, "
+            f"decision={self.decision!r})>"
+        )

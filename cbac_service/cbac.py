@@ -29,6 +29,7 @@ from cbac_service.config import (
 from cbac_service.db.repository import (
     get_latest_trust,
     get_policy_chunks,
+    insert_cbac_decision,
     insert_lhi_record,
     policy_hash_matches,
     save_policy_chunks,
@@ -466,7 +467,77 @@ class CBAC:
             )
         return result
 
+    async def _record_decision(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intent_text: str,
+        user_intent: str | None,
+        callee_name: str,
+        callee_type: str,
+        result: CBACResult,
+    ) -> None:
+        """Append the verdict to the ``cbac_decisions`` audit log.
+
+        Never gates the decision, on the same grounds as :meth:`_fold_trust`:
+        the verdict is already settled, and failing to *write down* what was
+        decided must not change what was decided. A failed insert is logged.
+
+        Unlike the trust fold this has no skip conditions — every verdict is
+        recorded, including the infrastructure-failure denies and calls with no
+        callee, which is exactly what ``lhi_records`` cannot give us.
+        """
+        try:
+            await insert_cbac_decision(
+                session,
+                agent_id=agent_id,
+                decision=result.decision,
+                reason=result.reason,
+                intended_action=intent_text,
+                # NULL rather than "" for what the caller never supplied, so
+                # "no callee" stays distinguishable from "a callee named ''".
+                user_intent=user_intent or None,
+                callee_name=callee_name or None,
+                callee_type=callee_type if callee_name else None,
+            )
+        except Exception:
+            logger.warning(
+                "cbac decision record failed",
+                decision=result.decision,
+                exc_info=True,
+            )
+
     async def verify_cbac(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intended_action: Any,
+        user_intent: str | None = None,
+        callee_name: str = "",
+        callee_type: str = "tool",
+    ) -> CBACResult:
+        """Decide, then write the verdict to the audit log.
+
+        The decision itself is :meth:`_decide`; this wrapper exists so the
+        recording happens at exactly one place. ``_decide`` has seven distinct
+        return paths, and every one of them must be logged — threading the
+        write through each is how a path silently stops being audited.
+        """
+        result = await self._decide(
+            session, agent_id, intended_action, user_intent, callee_name, callee_type
+        )
+        await self._record_decision(
+            session,
+            agent_id,
+            _intended_action_text(intended_action),
+            user_intent,
+            callee_name,
+            callee_type,
+            result,
+        )
+        return result
+
+    async def _decide(
         self,
         session: AsyncSession,
         agent_id: str,
@@ -497,7 +568,8 @@ class CBAC:
 
         The early returns *above* the decision are infrastructure failures
         (policy lookup down, no policy, no chunks), not judgments about the
-        agent, so they deliberately record nothing.
+        agent, so they deliberately fold no trust. They are still *audited* —
+        :meth:`verify_cbac` logs every path to ``cbac_decisions`` regardless.
 
         Parameters
         ----------

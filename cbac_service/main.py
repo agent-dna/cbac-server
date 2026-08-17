@@ -11,6 +11,8 @@ from sqlalchemy import text
 
 from cbac_service.cbac import CBAC
 from cbac_service.db.engine import close_db, get_session
+from cbac_service.db.models import CBACDecision
+from cbac_service.db.repository import get_cbac_decision, get_cbac_decisions
 from cbac_service.logging_config import setup_logging
 
 # ── App lifecycle ──────────────────────────────────────────────────────────────
@@ -102,6 +104,80 @@ async def authorize_cbac(request: Request) -> PlainTextResponse:
         logger.exception("cbac authorization failed")
 
     return PlainTextResponse(reason, headers={"X-CBAC-Decision": decision})
+
+
+MAX_DECISION_LIMIT = 500
+
+
+def _decision_json(record: CBACDecision) -> dict:
+    """Serialize one audit-log row for the wire."""
+    return {
+        "id": record.id,
+        "agent_id": record.agent_id,
+        "decision": record.decision,
+        "reason": record.reason,
+        "intended_action": record.intended_action,
+        "user_intent": record.user_intent,
+        "callee_name": record.callee_name,
+        "callee_type": record.callee_type,
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+@app.get("/cbac-decisions")
+async def list_cbac_decisions(request: Request) -> JSONResponse:
+    """Past authorization verdicts for one agent, newest first.
+
+    Every decision is here — including the ones that never reached the trust
+    fold (no callee, or an infrastructure-failure deny), which is what makes
+    this the audit log rather than ``lhi_records``.
+    """
+    params = request.query_params
+    agent_id = params.get("agent_id", "")
+    if not agent_id:
+        return JSONResponse({"error": "agent_id is required"}, status_code=400)
+
+    try:
+        limit = int(params.get("limit", "100"))
+        offset = int(params.get("offset", "0"))
+    except ValueError:
+        return JSONResponse(
+            {"error": "limit and offset must be integers"}, status_code=400
+        )
+    if limit < 1 or offset < 0:
+        return JSONResponse(
+            {"error": "limit must be >= 1 and offset >= 0"}, status_code=400
+        )
+    # Clamped rather than rejected: a caller asking for everything gets a large
+    # page, not a 400 it has to learn about.
+    limit = min(limit, MAX_DECISION_LIMIT)
+
+    try:
+        async with get_session() as session:
+            records = await get_cbac_decisions(
+                session, agent_id=agent_id, limit=limit, offset=offset
+            )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    decisions = [_decision_json(record) for record in records]
+    return JSONResponse(
+        {"agent_id": agent_id, "decisions": decisions, "count": len(decisions)}
+    )
+
+
+@app.get("/cbac-decisions/{decision_id}")
+async def read_cbac_decision(decision_id: int) -> JSONResponse:
+    """One authorization verdict by id."""
+    try:
+        async with get_session() as session:
+            record = await get_cbac_decision(session, decision_id=decision_id)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    if record is None:
+        return JSONResponse({"error": f"no decision {decision_id}"}, status_code=404)
+    return JSONResponse(_decision_json(record))
 
 
 @app.post("/precompute-policy")
