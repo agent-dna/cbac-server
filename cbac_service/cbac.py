@@ -376,7 +376,7 @@ class CBAC:
         if not top_chunk:
             return ("deny", "Tier 2: no allowed policy chunks found", None)
 
-        t2_scores = await asyncio.to_thread(self._nli_scores, intent_text, top_chunk)
+        t2_scores = await asyncio.to_thread(self._nli_scores, top_chunk, intent_text)
         entailment = t2_scores.get("entailment", 0.0)
         contradiction = t2_scores.get("contradiction", 0.0)
 
@@ -408,7 +408,9 @@ class CBAC:
         # Gather policy text for LLM context.
         all_chunks = await get_policy_chunks(session, agent_id)
         policy_text = "\n".join(all_chunks)
-
+        
+        #TODO:- llm decision should be structure with clear allow or deny with reason.
+        #string matching would lead to error. 
         try:
             llm_decision = await self._llm_backend(intent_text, policy_text)
         except Exception as e:
