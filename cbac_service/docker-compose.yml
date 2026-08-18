@@ -3,19 +3,19 @@
 # Usage:
 #   cd cbac_service
 #   docker compose up -d
-#
-# Then run migrations:
 #   alembic upgrade head
+#   uvicorn cbac_service.main:app
+#
+# First run builds the custom Postgres image (~2-3 min). Subsequent runs are instant.
 #
 # Connect manually:
 #   psql postgresql://cbac_user:cbac_pass@localhost:5432/cbac
 
 services:
   postgres:
-    image: pgvector/pgvector:pg17
-    # Note: As of Aug 2026, there is no official pg18 + pgvector + pg_textsearch
-    # all-in-one image. For production, build a custom image (see Dockerfile below).
-    # For local dev with PG 17+pgvector, this works. pg_textsearch requires PG 17+.
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
     container_name: cbac-postgres
     environment:
       POSTGRES_USER: cbac_user
@@ -24,8 +24,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - cbac_pgdata:/var/lib/postgresql/data
-      - ./init-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql
+      - cbac_pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cbac_user -d cbac"]
       interval: 5s
