@@ -408,9 +408,9 @@ class CBAC:
         # Gather policy text for LLM context.
         all_chunks = await get_policy_chunks(session, agent_id)
         policy_text = "\n".join(all_chunks)
-        
-        #TODO:- llm decision should be structure with clear allow or deny with reason.
-        #string matching would lead to error. 
+
+        # TODO:- llm decision should be structure with clear allow or deny with reason.
+        # string matching would lead to error.
         try:
             llm_decision = await self._llm_backend(intent_text, policy_text)
         except Exception as e:
