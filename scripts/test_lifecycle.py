@@ -7,6 +7,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+import numpy as np
+
 # Ensure repo root is importable.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -99,7 +101,7 @@ async def run_lifecycle():
         encoder = cbac._get_encoder()
         all_chunks = allowed_chunks + forbidden_chunks
         chunk_types = ["allowed"] * len(allowed_chunks) + ["forbidden"] * len(forbidden_chunks)
-        embeddings = encoder.encode(all_chunks, normalize_embeddings=True)
+        embeddings = np.asarray(encoder.encode(all_chunks, normalize_embeddings=True))
         print(f"  Encoded {len(all_chunks)} chunks → shape {embeddings.shape}")
 
 
@@ -119,7 +121,7 @@ async def run_lifecycle():
             ("search code in repos", "allowed"),
         ]
         for query, expected_type in test_queries:
-            query_vec = encoder.encode([query], normalize_embeddings=True)[0]
+            query_vec = np.asarray(encoder.encode([query], normalize_embeddings=True)[0])
             async with get_session() as session:
                 results = await vector_search(session, AGENT_ID, query_vec, top_k=3)
             top = results[0] if results else None
@@ -141,7 +143,7 @@ async def run_lifecycle():
 
         print("\n Step 7: Hybrid search (RRF) ")
         query = "read github issues"
-        query_vec = encoder.encode([query], normalize_embeddings=True)[0]
+        query_vec = np.asarray(encoder.encode([query], normalize_embeddings=True)[0])
         async with get_session() as session:
             results = await hybrid_search(session, AGENT_ID, query_vec, query, top_k=5)
         print(f"  Query: \"{query}\"")
