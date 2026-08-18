@@ -21,16 +21,21 @@ uv sync
 
 This installs all dependencies (including `agent-dna`, FastAPI, SQLAlchemy, etc.) into `.venv/`.
 
-### 2. Start Postgres (PG18 + pgvector + pg_textsearch)
+### 2. Build the Docker image and start Postgres (PG18 + pgvector + pg_textsearch)
 
 ```bash
 cd cbac_service
+docker compose build
 docker compose up -d
 ```
 
-First run builds a custom Postgres image from `Dockerfile.postgres` (~2-3 min). It compiles `pg_textsearch` from source on top of `pgvector/pgvector:pg18`. Subsequent runs are instant.
+The `build` step compiles `pg_textsearch` from source on top of the `pgvector/pgvector:pg18` base image (~2-3 min on first run). To force a clean rebuild (e.g. after Dockerfile changes):
 
-Both extensions (`vector`, `pg_textsearch`) are created automatically on first startup via `init-extensions.sql` — no manual SQL commands needed.
+```bash
+docker compose build --no-cache
+```
+
+Once built, `docker compose up -d` starts the container. Both extensions (`vector`, `pg_textsearch`) are created automatically on first startup via `init-extensions.sql` — no manual SQL commands needed.
 
 ### 3. Run database migrations
 
