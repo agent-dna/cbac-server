@@ -1,0 +1,22 @@
+# The example is standalone: create a venv here and install this file.
+# `cbac` itself is imported from the repo checkout (see agent.py), not pip.
+
+python-dotenv>=1.0.0
+
+# Agent loop + tool plumbing (create_agent moved to langchain in v1)
+langchain>=1.0.0
+langchain-core>=1.0.0
+langchain-mcp-adapters>=0.3.0
+
+# MCP server + the client transport cbac.mcp adapts
+fastmcp>=3.0.0
+mcp>=1.28.0
+
+# HTTP: httpx for the GitHub calls, requests for the guard's CBAC call
+httpx>=0.27.0
+requests>=2.32.0
+
+# Pick one to match LLM_PROVIDER
+langchain-openai>=1.0.0
+langchain-google-genai>=4.0.0
+langchain-ollama>=1.0.0

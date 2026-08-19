@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -6,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("sentence_transformers")
+
+from agentdna.types import AgentCard
 
 from cbac_service import main
 from cbac_service.cbac import CBACResult
@@ -179,3 +182,26 @@ def test_precompute_rejects_non_string_policy(monkeypatch):
 
     assert response.status_code == 400
     assert json.loads(response.body)["error"] == "policy must be a string"
+
+
+# ── Local policy source (CBAC_LOCAL_POLICY_DIR) ───────────────────────────────
+
+
+def test_local_policy_provenance_reads_agent_file(tmp_path):
+    (tmp_path / "github-worker.md").write_text("# Policy\n\nMay open issues.\n")
+
+    record = main._LocalPolicyProvenance(tmp_path).get_latest_provenance_record(
+        "github-worker"
+    )
+    card = AgentCard(**record)
+
+    assert card.id == "github-worker"
+    assert base64.b64decode(card.policy).decode() == "# Policy\n\nMay open issues.\n"
+
+
+def test_make_provenance_switches_on_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("CBAC_LOCAL_POLICY_DIR", str(tmp_path))
+    assert isinstance(main._make_provenance(), main._LocalPolicyProvenance)
+
+    monkeypatch.delenv("CBAC_LOCAL_POLICY_DIR")
+    assert not isinstance(main._make_provenance(), main._LocalPolicyProvenance)

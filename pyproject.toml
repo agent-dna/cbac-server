@@ -50,6 +50,12 @@ ignore = ["BLE001"]
 venvPath = "."
 venv = ".venv"
 
+# examples/ installs its own venv from its own requirements.txt (langgraph,
+# fastmcp, the LLM providers) — none of which belong in this repo's lock file.
+# Checking it against the root venv would report every one as unresolved.
+# Defaults are replaced, not merged, so the usual ignores are repeated here.
+exclude = ["**/node_modules", "**/__pycache__", "**/.*", "examples"]
+
 # Test doubles — SimpleNamespace fakes, None sessions, monkeypatched repositories —
 # deliberately don't satisfy production signatures; that is what makes them usable
 # as doubles. Everything else still type-checks here.
