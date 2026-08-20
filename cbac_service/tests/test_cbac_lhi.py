@@ -74,6 +74,7 @@ def test_improving_scores_raise_trust_slowly(rows, tmp_path):
     prev = compute(cbac, **{k: 0.5 for k in SCORES})
     trust = compute(cbac)
     s = weighted_mean(**SCORES)
+    assert s is not None and prev is not None and trust is not None
     assert trust == pytest.approx(LHI_LAMBDA_UP * prev + (1 - LHI_LAMBDA_UP) * s)
     assert prev < trust < s
 
@@ -82,6 +83,7 @@ def test_degrading_scores_drop_trust_fast(rows, tmp_path):
     cbac = make_cbac(tmp_path)
     prev = compute(cbac)
     trust = compute(cbac, **{k: 0.2 for k in SCORES})
+    assert prev is not None and trust is not None
     assert trust == pytest.approx(LHI_LAMBDA_DOWN * prev + (1 - LHI_LAMBDA_DOWN) * 0.2)
     assert trust < prev
 
@@ -92,7 +94,9 @@ def test_zero_component_costs_exactly_its_weight(rows, tmp_path):
     cbac = make_cbac(tmp_path)
     trust = compute(cbac, hallucination_score=0.0)
     normalized_weight = LHI_WEIGHTS[2] / sum(LHI_WEIGHTS)
-    assert trust == pytest.approx(weighted_mean(**SCORES) - normalized_weight * 0.95)
+    mean = weighted_mean(**SCORES)
+    assert trust is not None and mean is not None
+    assert trust == pytest.approx(mean - normalized_weight * 0.95)
     assert trust > 0.0
 
 
@@ -185,6 +189,7 @@ def test_ema_continues_across_instances(rows, tmp_path):
     prev = compute(make_cbac(tmp_path))
     trust = compute(make_cbac(tmp_path))
     s = weighted_mean(**SCORES)
+    assert prev is not None and trust is not None and s is not None
     assert trust == pytest.approx(LHI_LAMBDA_UP * prev + (1 - LHI_LAMBDA_UP) * s)
 
 

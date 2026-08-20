@@ -1,0 +1,40 @@
+# Multi-stage Dockerfile: PostgreSQL 18 + pgvector + pg_textsearch
+#
+# Stage 1: Build pg_textsearch from source
+# Stage 2: Final image with pgvector (from base image) + pg_textsearch (copied from builder)
+#
+# Usage:
+#   docker compose up -d
+#   (or: docker build -f Dockerfile.postgres -t cbac-postgres .)
+
+# ── Stage 1: Build pg_textsearch ──────────────────────────────────────────────
+
+FROM pgvector/pgvector:pg18 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        ca-certificates \
+        postgresql-server-dev-18 \
+    && git config --global http.sslVerify true \
+    && update-ca-certificates \
+    && cd /tmp \
+    && git clone --depth 1 https://github.com/timescale/pg_textsearch.git \
+    && cd pg_textsearch \
+    && make \
+    && make install \
+    && rm -rf /tmp/pg_textsearch
+
+# ── Stage 2: Final image ─────────────────────────────────────────────────────
+
+FROM pgvector/pgvector:pg18
+
+# Copy the compiled pg_textsearch extension files from builder
+COPY --from=builder /usr/lib/postgresql/18/lib/pg_textsearch.so /usr/lib/postgresql/18/lib/
+COPY --from=builder /usr/share/postgresql/18/extension/pg_textsearch* /usr/share/postgresql/18/extension/
+
+# Add shared_preload_libraries for pg_textsearch (required at server start)
+RUN echo "shared_preload_libraries = 'pg_textsearch'" >> /usr/share/postgresql/postgresql.conf.sample
+
+# Copy init script that creates extensions on first startup
+COPY init-extensions.sql /docker-entrypoint-initdb.d/01-extensions.sql
