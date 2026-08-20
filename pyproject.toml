@@ -23,13 +23,11 @@ dependencies = [
   "greenlet>=3.0.0",
 ]
 
-# Deployed from a checkout (uvicorn cbac_service.cbac:app); not published as a wheel.
+# Deployed from a checkout (uvicorn cbac_service.cbac:app).
 [tool.uv]
 package = false
 
 [dependency-groups]
-# cbac/mcp.py imports mcp.types. Declared directly rather than via an
-# agent-dna extra, which the published wheel doesn't ship.
 dev = [
     "pytest>=8.0.0",
     "mcp>=2.0.0",
@@ -49,6 +47,12 @@ ignore = ["BLE001"]
 # `uv run pyright` succeeds. Pinning the venv makes the hook and CI agree.
 venvPath = "."
 venv = ".venv"
+
+# examples/ installs its own venv from its own requirements.txt (langgraph,
+# fastmcp, the LLM providers) — none of which belong in this repo's lock file.
+# Checking it against the root venv would report every one as unresolved.
+# Defaults are replaced, not merged, so the usual ignores are repeated here.
+exclude = ["**/node_modules", "**/__pycache__", "**/.*", "examples"]
 
 # Test doubles — SimpleNamespace fakes, None sessions, monkeypatched repositories —
 # deliberately don't satisfy production signatures; that is what makes them usable
