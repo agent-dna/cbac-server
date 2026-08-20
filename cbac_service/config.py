@@ -7,7 +7,7 @@ import os
 # Override via environment variable for deployment.
 DATABASE_URL: str = os.environ.get(
     "DATABASE_URL",
-    "postgresql+asyncpg://madhavbaidya@localhost:5432/cbac",
+    "postgresql+asyncpg://cbac_user:cbac_pass@localhost:5432/cbac",
 )
 
 # pgvector index type: "hnsw" (low-latency, moderate data) or "ivfflat" (large scale).
@@ -15,7 +15,7 @@ VECTOR_INDEX_TYPE: str = os.environ.get("VECTOR_INDEX_TYPE", "hnsw")
 
 # Hybrid search: enable BM25 fusion alongside vector cosine.
 HYBRID_SEARCH_ENABLED: bool = (
-    os.environ.get("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+    os.environ.get("HYBRID_SEARCH_ENABLED", "false").lower() == "true"
 )
 
 # Reciprocal Rank Fusion constant (higher = less aggressive re-ranking).
