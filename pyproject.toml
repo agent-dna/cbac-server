@@ -23,13 +23,11 @@ dependencies = [
   "greenlet>=3.0.0",
 ]
 
-# Deployed from a checkout (uvicorn cbac_service.cbac:app); not published as a wheel.
+# Deployed from a checkout (uvicorn cbac_service.cbac:app).
 [tool.uv]
 package = false
 
 [dependency-groups]
-# cbac/mcp.py imports mcp.types. Declared directly rather than via an
-# agent-dna extra, which the published wheel doesn't ship.
 dev = [
     "pytest>=8.0.0",
     "mcp>=2.0.0",

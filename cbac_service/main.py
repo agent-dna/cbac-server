@@ -23,7 +23,8 @@ logger = structlog.get_logger("cbac_service.api")
 
 _cbac: CBAC | None = None
 
-# TODO:- Remove it. 
+
+# TODO:- Remove it.
 class _LocalPolicyProvenance:
     """Policy source backed by ``<dir>/{agent_id}.md`` instead of the chain.
 

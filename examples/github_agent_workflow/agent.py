@@ -32,6 +32,7 @@ See README.md for the CBAC service prerequisites.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -170,10 +171,51 @@ def make_llm(temperature: float = 0.0):
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 
+def _cbac_decision(message) -> tuple[str, str] | None:
+    """Read the guard's verdict off a tool-result message, or None if not one.
+
+    A blocked call carries ``{"status": "denied"|"error", "error": reason}`` —
+    returned by ``@cbac_guard`` directly, or substituted by ``cbac_intercept``
+    as the MCP text block. Any other tool result means the guard authorized the
+    call and the tool's own result came back.
+    """
+    if getattr(message, "type", "") != "tool":
+        return None
+
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+    else:
+        texts = []
+
+    for text in texts:
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("status") in ("denied", "error"):
+            return str(payload["status"]).upper(), str(payload.get("error", ""))
+    return "ALLOW", ""
+
+
 def _print_transcript(messages: list) -> None:
     for message in messages:
         for call in getattr(message, "tool_calls", None) or []:
             print(f"[call] {call['name']}({call['args']})")
+
+        verdict = _cbac_decision(message)
+        if verdict is not None:
+            decision, reason = verdict
+            print(
+                f"[cbac] {decision} — {reason or 'authorized by policy, tool executed'}"
+            )
+
         content = getattr(message, "content", "")
         if not isinstance(content, str):
             content = str(content)
@@ -195,6 +237,26 @@ def _mcp_client() -> MultiServerMCPClient:
         },
         tool_interceptors=[cbac_intercept],
     )
+
+
+async def run(request: str) -> None:
+    configure(cbac_url=CBAC_URL, cbac_timeout=CBAC_TIMEOUT)
+
+    tools = [
+        StructuredTool.from_function(coroutine=draft_summary),  # @cbac_guard
+        *await _mcp_client().get_tools(),  # cbac_intercept
+    ]
+    agent = create_agent(make_llm(), tools, system_prompt=SYSTEM)
+
+    print(f"\n[cbac] service={CBAC_URL} agent_id={CBAC_AGENT_ID}")
+    print(f"[user] {request}\n")
+
+    # The root request is the governance context: each guarded call is checked
+    # against the agent's policy AND for drift away from what the user asked.
+    with cbac_context(agent_id=CBAC_AGENT_ID, user_intent=request):
+        result = await agent.ainvoke({"messages": [HumanMessage(content=request)]})
+
+    _print_transcript(result.get("messages", []))
 
 
 async def check() -> None:
@@ -219,26 +281,6 @@ async def check() -> None:
     assert allowed.get("status") == "ok", f"allowed tool was blocked: {allowed}"
     assert "denied" in str(denied), f"forbidden tool was not blocked: {denied}"
     print("\nOK — permitted tool ran, forbidden tool blocked before the GitHub call.")
-
-
-async def run(request: str) -> None:
-    configure(cbac_url=CBAC_URL, cbac_timeout=CBAC_TIMEOUT)
-
-    tools = [
-        StructuredTool.from_function(coroutine=draft_summary),  # @cbac_guard
-        *await _mcp_client().get_tools(),  # cbac_intercept
-    ]
-    agent = create_agent(make_llm(), tools, system_prompt=SYSTEM)
-
-    print(f"\n[cbac] service={CBAC_URL} agent_id={CBAC_AGENT_ID}")
-    print(f"[user] {request}\n")
-
-    # The root request is the governance context: each guarded call is checked
-    # against the agent's policy AND for drift away from what the user asked.
-    with cbac_context(agent_id=CBAC_AGENT_ID, user_intent=request):
-        result = await agent.ainvoke({"messages": [HumanMessage(content=request)]})
-
-    _print_transcript(result.get("messages", []))
 
 
 if __name__ == "__main__":

@@ -119,12 +119,15 @@ python agent.py "Draft a summary for owner/repo from notes: rewrote the parser, 
 python agent.py "Close issue #3 in owner/repo"
 ```
 
+The `[cbac]` line is the guard's verdict for that call.
+
 Allowed:
 
 ```
 [call] draft_summary({'repo': 'owner/repo', 'notes': 'rewrote the parser, fixed two crashes'})
+[cbac] ALLOW — authorized by policy, tool executed
 [tool] {"status": "ok", "repo": "owner/repo", "summary": "rewrote the parser, fixed two crashes"}
-[ai]   I drafted the summary for owner/repo.
+[ai]   Here's the condensed summary for owner/repo: ...
 ```
 
 Denied — the denial comes back as a readable tool result rather than an
@@ -132,8 +135,9 @@ exception, so the model can see it and report it:
 
 ```
 [call] close_issue({'repo': 'owner/repo', 'number': 3})
-[tool] {"status": "denied", "error": "Tier 1 cosine gap -0.157 < -0.08 (intent closer to forbidden than allowed policy)"}
-[ai]   I can't close that issue — the policy forbids closing existing issues.
+[cbac] DENIED — Tier 1 cosine gap -0.157 < -0.08 (intent closer to forbidden than allowed policy)
+[tool] {"status": "denied", "error": "Tier 1 cosine gap -0.157 < -0.08 (...)"}
+[ai]   I'm unable to close the issue due to a policy restriction.
 ```
 
 The model must support tool calling. If you see an `[ai]` line containing
