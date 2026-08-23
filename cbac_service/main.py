@@ -15,7 +15,11 @@ from sqlalchemy import text
 from cbac_service.cbac import CBAC
 from cbac_service.db.engine import close_db, get_session
 from cbac_service.db.models import CBACDecision
-from cbac_service.db.repository import get_cbac_decision, get_cbac_decisions
+from cbac_service.db.repository import (
+    get_cbac_decision,
+    get_cbac_decision_by_hash,
+    get_cbac_decisions,
+)
 from cbac_service.logging_config import setup_logging
 
 # ── App lifecycle ──────────────────────────────────────────────────────────────
@@ -159,6 +163,8 @@ def _decision_json(record: CBACDecision) -> dict:
         "agent_id": record.agent_id,
         "decision": record.decision,
         "reason": record.reason,
+        "error_code": record.error_code,
+        "interaction_hash": record.interaction_hash,
         "intended_action": record.intended_action,
         "user_intent": record.user_intent,
         "callee_name": record.callee_name,
@@ -220,6 +226,43 @@ async def read_cbac_decision(decision_id: int) -> JSONResponse:
 
     if record is None:
         return JSONResponse({"error": f"no decision {decision_id}"}, status_code=404)
+    return JSONResponse(_decision_json(record))
+
+
+@app.get("/cbac-decisions/by-hash/{interaction_hash}")
+async def read_cbac_decision_by_hash(interaction_hash: str) -> JSONResponse:
+    """One authorization verdict by its ``interaction_hash``.
+
+    For a middleware dashboard that already holds the hash from a prior
+    ``/authorize-cbac`` call (or from streaming ``cbac_decisions`` some other
+    way) and wants the full row back without knowing the numeric ``id``.
+
+    ``interaction_hash`` is sha256 hex (64 lowercase hex chars) — rejected
+    with 400 if it isn't shaped like one, so a malformed lookup fails fast
+    instead of silently returning "not found". Not a uniqueness constraint:
+    the same interaction can be decided more than once, so this returns the
+    newest matching row — see ``get_cbac_decision_by_hash``.
+    """
+    if len(interaction_hash) != 64 or any(
+        c not in "0123456789abcdef" for c in interaction_hash.lower()
+    ):
+        return JSONResponse(
+            {"error": "interaction_hash must be 64 hex characters"}, status_code=400
+        )
+
+    try:
+        async with get_session() as session:
+            record = await get_cbac_decision_by_hash(
+                session, interaction_hash=interaction_hash.lower()
+            )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    if record is None:
+        return JSONResponse(
+            {"error": f"no decision with interaction_hash {interaction_hash}"},
+            status_code=404,
+        )
     return JSONResponse(_decision_json(record))
 
 

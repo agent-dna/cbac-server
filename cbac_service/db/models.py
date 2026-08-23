@@ -142,6 +142,19 @@ class CBACDecision(Base):
     callee_type: Mapped[str | None] = mapped_column(
         String, nullable=True
     )  # 'tool' | 'agent' | 'mcp'
+    # Which layer/condition produced `reason` — see cbac_service.error_codes.
+    # Nullable so a row written before this column existed doesn't need a
+    # fabricated backfill value; every row inserted going forward has one.
+    error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # sha256 over the row's content fields plus a fresh per-row uuid4 salt
+    # (agent_id, decision, reason, intended_action, user_intent, callee_name,
+    # callee_type, error_code, salt), computed by CBAC._interaction_hash
+    # immediately before insert. The salt makes this a per-row identifier —
+    # deliberately unique even across two decisions with byte-for-byte
+    # identical content (e.g. a caller retry) — not a content fingerprint,
+    # so don't use it to detect that an interaction was decided more than
+    # once; it can no longer answer that.
+    interaction_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -151,10 +164,13 @@ class CBACDecision(Base):
     # Newest-first-per-agent is the only read pattern; id disambiguates
     # same-timestamp rows. The leftmost prefix also serves agent-only lookups,
     # so no separate index on agent_id is needed.
-    __table_args__ = (Index("ix_cbac_decisions_agent_id_id", "agent_id", "id"),)
+    __table_args__ = (
+        Index("ix_cbac_decisions_agent_id_id", "agent_id", "id"),
+        Index("ix_cbac_decisions_interaction_hash", "interaction_hash"),
+    )
 
     def __repr__(self) -> str:
         return (
             f"<CBACDecision(id={self.id}, agent_id={self.agent_id!r}, "
-            f"decision={self.decision!r})>"
+            f"decision={self.decision!r}, error_code={self.error_code})>"
         )

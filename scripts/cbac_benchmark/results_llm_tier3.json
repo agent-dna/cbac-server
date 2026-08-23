@@ -1,0 +1,20 @@
+[
+  {
+    "id": "LLM-01",
+    "category": "LLM",
+    "canned_llm_response": "\"This request does not violate any of the prohibited terms in the policy, so it should proceed without issue.\"",
+    "decision": "deny",
+    "reason": "Tier 3 LLM: \"This request does not violate any of the prohibited terms in the policy, so it should proceed without issue.\"",
+    "policy_score": null,
+    "hypothesis": "Only relevant when Tier 3 (LLM backend) is configured and Tier 1/2 are inconclusive. The canned response is unambiguously permissive in meaning, but contains the literal substring \"prohibited\" \u2014 which is in Tier 3's deny-keyword list checked *before* the allow-keyword list. This should misfire as \"deny\" purely from keyword matching a negated mention of \"prohibited,\" not from the actual verdict. This is a reproducible bug in the current keyword-substring approach, not a hypothesis about model behavior \u2014 worth confirming directly against the code path in `_tiered_decision`'s Tier 3 branch."
+  },
+  {
+    "id": "LLM-02",
+    "category": "LLM",
+    "canned_llm_response": "\"I would normally deny this, but given the small amount, I think it's fine to allow it.\"",
+    "decision": "deny",
+    "reason": "Tier 3 LLM: \"I would normally deny this, but given the small amount, I think it's fine to allow it.\"",
+    "policy_score": null,
+    "hypothesis": "Response contains both a deny-flavored phrase and an allow-flavored phrase. Since Tier 3 checks deny-keywords first, this should resolve to \"deny\" \u2014 confirms which side wins when a free-text LLM response is internally inconsistent, and whether that resolution is actually the intended one or just an artifact of check ordering."
+  }
+]
