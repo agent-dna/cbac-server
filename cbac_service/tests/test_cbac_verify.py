@@ -8,6 +8,7 @@ import pytest
 pytest.importorskip("sentence_transformers")
 
 import cbac_service.cbac as cbac_mod
+from cbac_service import error_codes as ec
 from cbac_service.cbac import CBAC
 
 AGENT_ID = "did:agent"
@@ -158,10 +159,11 @@ def test_policy_score_normalized_on_tier1_decision(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cbac_mod, "vector_search", _vsearch)
 
-    decision, _reason, policy_score = asyncio.run(
+    decision, _reason, error_code, policy_score = asyncio.run(
         cbac._tiered_decision(None, AGENT_ID, "intent text")
     )
     assert decision == "allow"
+    assert error_code == ec.TIER1_GAP_ALLOW
     assert policy_score == pytest.approx(1.0)
 
 
