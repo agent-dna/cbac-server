@@ -6,6 +6,17 @@ Guidance for this repo. It holds two things:
 - `cbac/` — the framework-agnostic guard + optional MCP glue. `import cbac` gets
   it; this repo owns it outright.
 
+## Writing docs
+
+`README.md` and every doc here describe the code **as it currently stands**, never
+how it got there. Verify each claim against the actual files before writing it —
+endpoints against `main.py`, env vars against `config.py`, commands against
+`pyproject.toml` and `.github/workflows/` — rather than reconstructing from a
+conversation or from a previous version of the doc. No "we used to", no "removed X
+because it's no longer needed", no rationale that only makes sense as a diff. When
+resolving a doc merge conflict, re-check *both* sides against current code; neither
+side is presumed right.
+
 ## What this is
 
 `cbac_service` is the **reference CBAC decision service** — a standalone FastAPI

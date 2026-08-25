@@ -124,17 +124,21 @@ def _action_summary(action_name: str, description: str | None = None) -> str:
 
     The verb phrase is the tool's own description (docstring first line)
     when available, else the de-snaked tool name. This is the prefix of
-    :func:`_default_intent`'s full rendering; kept as its own function so a
+    :func:`render_intent`'s full rendering; kept as its own function so a
     verb-only view stays available to callers that want one.
     """
     verb = (description or action_name.replace("_", " ")).strip().rstrip(".")
     return f"The agent wants to {verb[:1].lower()}{verb[1:]}."
 
 
-def _default_intent(
+def render_intent(
     action_name: str, kwargs: dict[str, Any], description: str | None = None
 ) -> str:
     """Render the intended action as prose, parameters included.
+
+    Public because it is the one thing every enforcement point must agree on:
+    a guard, an MCP gateway and an ext_authz adapter have to phrase the same
+    call the same way, or the policy scores them differently.
 
     NLI and the policy tiers score natural language far better than raw
     ``tool k=v`` call syntax — snake_case tool names hide their verb from
@@ -245,7 +249,7 @@ async def authorize_tool_call(
     ctx = get_context()
     if ctx is None:
         return "allow", ""
-    intent = _default_intent(callee_name, args, description)
+    intent = render_intent(callee_name, args, description)
     try:
         return await _authorize(ctx, intent, callee_name, callee_type, get_config())
     except Exception as exc:
@@ -320,7 +324,7 @@ def cbac_guard(
             intent_text = (
                 action_intent(call_kwargs)
                 if action_intent
-                else _default_intent(action_name, call_kwargs, description)
+                else render_intent(action_name, call_kwargs, description)
             )
 
             try:
