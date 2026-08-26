@@ -37,3 +37,26 @@ def rows(monkeypatch):
     monkeypatch.setattr(cbac_mod, "get_latest_trust", fake_get_latest_trust)
     monkeypatch.setattr(cbac_mod, "insert_lhi_record", fake_insert_lhi_record)
     return records
+
+
+@pytest.fixture
+def decisions(monkeypatch):
+    """In-memory stand-in for the cbac_decisions table.
+
+    `verify_cbac` records on every path, so any test that calls it needs this
+    or it reaches the real repository.
+    """
+    pytest.importorskip("sentence_transformers")
+    import cbac_service.cbac as cbac_mod
+
+    records: list[SimpleNamespace] = []
+
+    async def fake_insert_cbac_decision(session, **kwargs):
+        record = SimpleNamespace(
+            id=len(records) + 1, created_at=datetime.now(timezone.utc), **kwargs
+        )
+        records.append(record)
+        return record
+
+    monkeypatch.setattr(cbac_mod, "insert_cbac_decision", fake_insert_cbac_decision)
+    return records

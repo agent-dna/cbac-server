@@ -19,8 +19,13 @@ SCORES = {
 SESSION = SimpleNamespace()
 
 
-def weighted_mean(intent_score, policy_score, hallucination_score):
-    """Renormalized mean over the observed components: s = Σ wᵢxᵢ / Σ wᵢ."""
+def weighted_mean(intent_score, policy_score, hallucination_score) -> float:
+    """Renormalized mean over the observed components: s = Σ wᵢxᵢ / Σ wᵢ.
+
+    Callers always pass at least one observed value — the nothing-observed case
+    is asserted through `compute` instead, which is where the production code
+    decides to write no record at all.
+    """
     observed = [
         (value, weight)
         for value, weight in zip(
@@ -28,8 +33,6 @@ def weighted_mean(intent_score, policy_score, hallucination_score):
         )
         if value is not None
     ]
-    if not observed:
-        return None
     return sum(v * w for v, w in observed) / sum(w for _, w in observed)
 
 
@@ -43,6 +46,14 @@ def compute(cbac, callee_name="github_tool", callee_type="tool", **overrides):
             SESSION, "did:agent", callee_name, callee_type, **{**SCORES, **overrides}
         )
     )
+
+
+def trust_of(cbac, **kwargs) -> float:
+    """`compute` for the paths that must yield a trust value — narrows away the
+    `None` that only the nothing-observed path returns."""
+    trust = compute(cbac, **kwargs)
+    assert trust is not None
+    return trust
 
 
 def edge_history(records, callee_name, callee_type):
@@ -71,8 +82,8 @@ def test_weights_are_scale_invariant(rows, tmp_path):
 
 def test_improving_scores_raise_trust_slowly(rows, tmp_path):
     cbac = make_cbac(tmp_path)
-    prev = compute(cbac, **{k: 0.5 for k in SCORES})
-    trust = compute(cbac)
+    prev = trust_of(cbac, **{k: 0.5 for k in SCORES})
+    trust = trust_of(cbac)
     s = weighted_mean(**SCORES)
     assert s is not None and prev is not None and trust is not None
     assert trust == pytest.approx(LHI_LAMBDA_UP * prev + (1 - LHI_LAMBDA_UP) * s)
@@ -92,7 +103,7 @@ def test_zero_component_costs_exactly_its_weight(rows, tmp_path):
     """A zero component lowers s by its renormalized weight, not to 0 — one
     weak signal must not annihilate an otherwise compliant interaction."""
     cbac = make_cbac(tmp_path)
-    trust = compute(cbac, hallucination_score=0.0)
+    trust = trust_of(cbac, hallucination_score=0.0)
     normalized_weight = LHI_WEIGHTS[2] / sum(LHI_WEIGHTS)
     mean = weighted_mean(**SCORES)
     assert trust is not None and mean is not None
@@ -186,8 +197,8 @@ def test_history_is_appended_not_replaced(rows, tmp_path):
 def test_ema_continues_across_instances(rows, tmp_path):
     """Trust state lives in the DB, not the CBAC object — a fresh instance
     (new process, restarted service) continues the same EMA chain."""
-    prev = compute(make_cbac(tmp_path))
-    trust = compute(make_cbac(tmp_path))
+    prev = trust_of(make_cbac(tmp_path))
+    trust = trust_of(make_cbac(tmp_path))
     s = weighted_mean(**SCORES)
     assert prev is not None and trust is not None and s is not None
     assert trust == pytest.approx(LHI_LAMBDA_UP * prev + (1 - LHI_LAMBDA_UP) * s)

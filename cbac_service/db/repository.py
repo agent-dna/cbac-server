@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cbac_service.config import ENCODER_MODEL, NLI_MODEL
 
-from .models import LHIRecord, PolicyChunk, PolicyMeta
+from .models import CBACDecision, LHIRecord, PolicyChunk, PolicyMeta
 
 
 async def policy_hash_matches(
@@ -259,3 +259,98 @@ async def get_trust_history(
     )
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+# ── CBAC decisions ────────────────────────────────────────────────────────────
+
+
+async def insert_cbac_decision(
+    session: AsyncSession,
+    agent_id: str,
+    decision: str,
+    reason: str,
+    intended_action: str,
+    user_intent: str | None,
+    callee_name: str | None,
+    callee_type: str | None,
+    error_code: int | None,
+    interaction_hash: str,
+) -> CBACDecision:
+    """Append one authorization verdict to the audit log. Commits.
+
+    ``intended_action`` is the flattened action text the scorers actually saw,
+    not the caller's raw payload. Values are stored exactly as given — the
+    caller decides what "absent" means and passes None for it.
+
+    ``error_code`` identifies which layer/condition of the pipeline produced
+    ``reason`` (see ``cbac_service.error_codes``). ``interaction_hash`` is a
+    salted sha256 of this same row's content, computed by the caller
+    (``CBAC._interaction_hash``) immediately before this call — passed in
+    rather than computed here so the repository layer stays pure DB access
+    with no hashing/business logic of its own. The salt makes it unique per
+    row, not a content-derived dedup key.
+    """
+    record = CBACDecision(
+        agent_id=agent_id,
+        decision=decision,
+        reason=reason,
+        intended_action=intended_action,
+        user_intent=user_intent,
+        callee_name=callee_name,
+        callee_type=callee_type,
+        error_code=error_code,
+        interaction_hash=interaction_hash,
+    )
+    session.add(record)
+    await session.commit()
+    return record
+
+
+async def get_cbac_decisions(
+    session: AsyncSession,
+    agent_id: str,
+    limit: int = 100,
+    offset: int = 0,
+) -> Sequence[CBACDecision]:
+    """Decision history for one agent, newest first."""
+    stmt = (
+        select(CBACDecision)
+        .where(CBACDecision.agent_id == agent_id)
+        .order_by(CBACDecision.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def get_cbac_decision(
+    session: AsyncSession,
+    decision_id: int,
+) -> CBACDecision | None:
+    """One decision by id, or None if there is no such row."""
+    stmt = select(CBACDecision).where(CBACDecision.id == decision_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_cbac_decision_by_hash(
+    session: AsyncSession,
+    interaction_hash: str,
+) -> CBACDecision | None:
+    """One decision by its interaction_hash, or None if there is no such row.
+
+    ``interaction_hash`` is salted per row (see ``CBAC._interaction_hash``),
+    so in practice each value identifies exactly one row. ``.limit(1)`` here
+    is defensive, not load-bearing — there is no database-level uniqueness
+    constraint on the column, so this still degrades gracefully (returns the
+    newest match) rather than raising if that were ever violated.
+    """
+    stmt = (
+        select(CBACDecision)
+        .where(CBACDecision.interaction_hash == interaction_hash)
+        .order_by(CBACDecision.id.desc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()

@@ -1,11 +1,11 @@
-# notes
+# benchmarking design for CBAC
 
 _no happy paths_
 
 Each entry in `intents.yaml` has: `id`, `category`, `policy_file`,
 `user_intent` (can also be omitted), `intended_action`, and `hypothesis` 
 
-## the attcking point in the CBAC pipeline
+## the check points in the CBAC pipeline
 
 1. **drift** (`_check1_drift`): runs *only if `user_intent` is
    thruthful*. NLI(`user_intent` as premise, `intended_action` as hypothesis).
@@ -26,9 +26,7 @@ Each entry in `intents.yaml` has: `id`, `category`, `policy_file`,
    is free text, decided by **keyword substring matching** (`deny`,
    `reject`, `not allow`, `prohibited` checked before `allow`, `permit`,
    `approve`, ...). No backend → `"advise"`.
-6. **Hallucination score**: computed if `user_intent` was supplied but
-   **never gates the decision**, just for info pruposes, goes into LHI trust
-   only.
+
 
 ---
 
@@ -49,7 +47,6 @@ Each entry in `intents.yaml` has: `id`, `category`, `policy_file`,
 | `EMPTY` | Input handling | Degenerate / empty inputs |
 | `LEN` | Tier 1 cosine | Extreme-length intents diluting or overloading the signal |
 | `DRIFT` | Check 1 | Contradiction detection, and the no-`user_intent` bypass |
-| `HAL` | Hallucination scoring | Confirming it's cosmetic, never gates |
 | `LLM` | Tier 3 keyword matching | Negated deny-words inside an allow-leaning LLM answer |
 | `POLICY` | Chunking / classification | Malformed, vague, contradictory, or lopsided policy files |
 | `DETERM` | Consistency | Same semantic policy, different formatting → different decision? |
@@ -78,4 +75,3 @@ Each entry in `intents.yaml` has: `id`, `category`, `policy_file`,
 This corpus assumes a `cbac-server` instance with these policies loaded per
 agent (one agent per fixture is simplest) and calls `verify_cbac` or
 `POST /authorize-cbac` 
-
