@@ -65,6 +65,16 @@ extraPaths = ["."]
 reportArgumentType = "none"
 reportAttributeAccessIssue = "none"
 
+# The benchmark harness drives the pipeline with the same doubles the tests use:
+# a SimpleNamespace Provenance, a monkeypatched encoder, a None session. Only
+# scripts/cbac_benchmark/ is exempt — the rest of scripts/ still type-checks, which
+# is what catches a stale caller when a pipeline signature changes.
+[[tool.pyright.executionEnvironments]]
+root = "scripts/cbac_benchmark"
+extraPaths = ["."]
+reportArgumentType = "none"
+reportAttributeAccessIssue = "none"
+
 [tool.pytest.ini_options]
 # `from cbac_service.cbac import ...` resolves against the repo root.
 pythonpath = ["."]

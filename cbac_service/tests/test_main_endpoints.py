@@ -11,6 +11,7 @@ pytest.importorskip("sentence_transformers")
 
 from agentdna.types import AgentCard
 
+from cbac_service import error_codes as ec
 from cbac_service import main
 from cbac_service.cbac import CBACResult
 
@@ -147,6 +148,9 @@ def decision_row(record_id=1, **overrides):
         "user_intent": "show me the PRs",
         "callee_name": "github_tool",
         "callee_type": "tool",
+        "error_code": ec.TIER1_GAP_ALLOW,
+        # Per-row unique in the real table (uuid4-salted), so vary it by id.
+        "interaction_hash": f"{record_id:064x}",
         "created_at": datetime(2026, 8, 17, 9, 14, 22, tzinfo=timezone.utc),
     }
     return SimpleNamespace(**{**fields, **overrides})

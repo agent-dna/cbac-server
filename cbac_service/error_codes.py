@@ -41,7 +41,9 @@ TIER2_ENTAILMENT_ALLOW = 3302  # allow — entailment >= ENTAILMENT_THRESHOLD
 TIER2_CONTRADICTION_DENY = 3303  # deny  — contradiction >= CONTRADICTION_THRESHOLD
 
 # ── 3400s: Tier 3 — optional LLM backend ─────────────────────────────────────
-TIER3_NO_BACKEND_ADVISE = 3401  # advise — Tier 1/2 inconclusive, no llm_backend configured
+TIER3_NO_BACKEND_ADVISE = (
+    3401  # advise — Tier 1/2 inconclusive, no llm_backend configured
+)
 TIER3_LLM_ERROR_ADVISE = 3402  # advise — llm_backend() raised
 
 # 3403-3405 are RETIRED, not reusable: the free-text keyword-matching Tier 3

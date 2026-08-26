@@ -160,7 +160,7 @@ async def run_lifecycle():
         ]
         for intent, expectation in test_intents:
             async with get_session() as session:
-                decision, reason, policy_score = await cbac._tiered_decision(
+                decision, reason, _error_code, policy_score = await cbac._tiered_decision(
                     session, AGENT_ID, intent
                 )
             icon = "✓" if ("allow" in expectation and decision == "allow") or \

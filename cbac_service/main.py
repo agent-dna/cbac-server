@@ -29,6 +29,10 @@ logger = structlog.get_logger("cbac_service.api")
 
 _cbac: CBAC | None = None
 
+# Fail closed when a call arrives without the root user intent: the drift check
+# is half the decision, and a caller that omits it gets neither half.
+REQUIRE_CONTEXT = os.environ.get("CBAC_REQUIRE_CONTEXT", "true").lower() == "true"
+
 
 # TODO:- Remove it.
 class _LocalPolicyProvenance:

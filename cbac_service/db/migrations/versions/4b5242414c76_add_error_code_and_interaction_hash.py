@@ -50,8 +50,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Downgrade schema."""
-    op.drop_index(
-        "ix_cbac_decisions_interaction_hash", table_name="cbac_decisions"
-    )
+    op.drop_index("ix_cbac_decisions_interaction_hash", table_name="cbac_decisions")
     op.drop_column("cbac_decisions", "interaction_hash")
     op.drop_column("cbac_decisions", "error_code")

@@ -24,13 +24,19 @@ workflow's delegation boundaries, and the wrapped function does its own
 work -- e.g. a GitHub tool makes its own HTTP request and returns a
 result dict.
 
-Two kinds of input flow through two channels:
+There are two ways in, and which one fits depends on whether the caller
+already holds the governance context:
 
-1. Static config          -> decorator parameters (``@cbac_guard(...)``).
-2. Ambient governance context (actor identity, root user intent) -> a
-   ``contextvars.ContextVar`` set once at the request entry point via
-   :func:`cbac_context`. It is never a function argument, so an LLM can
-   neither supply nor forge it.
+- :func:`authorize` takes everything as arguments -- for an enforcement
+  point that parsed the context off the wire, such as an MCP gateway.
+- :func:`authorize_tool_call` and ``@cbac_guard`` read it from a
+  ``contextvars.ContextVar`` set once at the request entry point via
+  :func:`cbac_context` -- for in-process calls, which have no way to
+  thread it down to the call site. It is never a function argument
+  there, so an LLM can neither supply nor forge it.
+
+Static config comes from the decorator's own parameters, and the layer
+config (service URL, timeout) from :func:`configure` at startup.
 """
 
 from __future__ import annotations
@@ -124,17 +130,21 @@ def _action_summary(action_name: str, description: str | None = None) -> str:
 
     The verb phrase is the tool's own description (docstring first line)
     when available, else the de-snaked tool name. This is the prefix of
-    :func:`_default_intent`'s full rendering; kept as its own function so a
+    :func:`render_intent`'s full rendering; kept as its own function so a
     verb-only view stays available to callers that want one.
     """
     verb = (description or action_name.replace("_", " ")).strip().rstrip(".")
     return f"The agent wants to {verb[:1].lower()}{verb[1:]}."
 
 
-def _default_intent(
+def render_intent(
     action_name: str, kwargs: dict[str, Any], description: str | None = None
 ) -> str:
     """Render the intended action as prose, parameters included.
+
+    Public because it is the one thing every enforcement point must agree on:
+    a guard, an MCP gateway and an ext_authz adapter have to phrase the same
+    call the same way, or the policy scores them differently.
 
     NLI and the policy tiers score natural language far better than raw
     ``tool k=v`` call syntax — snake_case tool names hide their verb from
@@ -198,29 +208,75 @@ def _authorize_sync(
 
 
 async def _authorize(
-    ctx: GovernanceContext,
+    agent_id: str,
     intent_text: str,
+    user_intent: str | None,
     callee_name: str,
     callee_type: str,
     cfg: GuardConfig,
 ) -> tuple[str, str]:
-    return await asyncio.to_thread(
-        _authorize_sync,
-        ctx.agent_id,
-        intent_text,
-        ctx.user_intent or None,
-        callee_name,
-        callee_type,
-        cfg,
-    )
+    """One decision call, fail-closed: any error resolves to ``"error"``.
+
+    ``cfg`` is threaded in rather than looked up here: it is set once when
+    the process starts, and a caller that forgot to :func:`configure` should
+    fail where it can be seen rather than quietly reach the default URL.
+    """
+    try:
+        return await asyncio.to_thread(
+            _authorize_sync,
+            agent_id,
+            intent_text,
+            user_intent or None,
+            callee_name,
+            callee_type,
+            cfg,
+        )
+    except Exception as exc:
+        return "error", str(exc)
 
 
 # ── Framework-agnostic call gate ──────────────────────────────────────────────
 #
-# The authorize/report flow every framework needs, split from any framework's
+# The authorize flow every framework needs, split from any framework's
 # request/result types. A framework interceptor supplies only its own glue:
 # extract (name, args), execute, detect success, render a denial. See
 # `cbac.mcp.cbac_intercept` for the MCP/LangChain adapter.
+
+
+async def authorize(
+    agent_id: str,
+    callee_name: str,
+    args: dict[str, Any],
+    user_intent: str | None = None,
+    description: str | None = None,
+    callee_type: str = "tool",
+    cfg: GuardConfig | None = None,
+) -> tuple[str, str]:
+    """Authorize one call. Every input is an argument (decision only).
+
+    For enforcement points that already hold the governance context as
+    values -- a gateway that parsed it off the wire, a job runner that read
+    it from a queue message. They have nothing to look up ambiently, and
+    routing what they already hold through a contextvar only to read it back
+    would be a detour.
+
+    Returns ``(decision, detail)``. Fail-closed: any error resolves to
+    ``"error"`` and never raises.
+
+    ``description`` is the callee's own description (schema/docstring first
+    line) used as the verb phrase of the rendered intent; without it the
+    de-snaked ``callee_name`` is the fallback. ``callee_type`` labels the
+    other end of the edge (``"tool"``, ``"agent"``, ``"mcp"``) whose trust
+    score the service updates while deciding.
+    """
+    return await _authorize(
+        agent_id,
+        render_intent(callee_name, args, description),
+        user_intent,
+        callee_name,
+        callee_type,
+        cfg or get_config(),
+    )
 
 
 async def authorize_tool_call(
@@ -229,27 +285,22 @@ async def authorize_tool_call(
     description: str | None = None,
     callee_type: str = "tool",
 ) -> tuple[str, str]:
-    """Authorize one tool call against the ambient policy (decision only).
+    """Authorize one tool call against the *ambient* policy (decision only).
 
-    Returns ``(decision, detail)``. ``decision`` is ``"allow"`` when
-    governance is off (no :func:`cbac_context`), so a caller can always
-    proceed on ``"allow"`` and short-circuit otherwise. Fail-closed: any
-    error resolves to ``"error"`` and never raises.
+    :func:`authorize` for in-process callers, which have no way to thread
+    the governance context down to the call site and read it from
+    :func:`cbac_context` instead.
 
-    ``description`` is the tool's own description (schema/docstring first
-    line) used as the verb phrase of the rendered intent; without it the
-    de-snaked ``callee_name`` is the fallback. ``callee_type`` labels the
-    other end of the edge (``"tool"``, ``"agent"``, ``"mcp"``) whose trust
-    score the service updates while deciding.
+    ``decision`` is ``"allow"`` when governance is off (no
+    :func:`cbac_context` open), so a caller can always proceed on
+    ``"allow"`` and short-circuit otherwise.
     """
     ctx = get_context()
     if ctx is None:
         return "allow", ""
-    intent = _default_intent(callee_name, args, description)
-    try:
-        return await _authorize(ctx, intent, callee_name, callee_type, get_config())
-    except Exception as exc:
-        return "error", str(exc)
+    return await authorize(
+        ctx.agent_id, callee_name, args, ctx.user_intent, description, callee_type
+    )
 
 
 # ── The decorator ─────────────────────────────────────────────────────────────
@@ -320,15 +371,17 @@ def cbac_guard(
             intent_text = (
                 action_intent(call_kwargs)
                 if action_intent
-                else _default_intent(action_name, call_kwargs, description)
+                else render_intent(action_name, call_kwargs, description)
             )
 
-            try:
-                decision, detail = await _authorize(
-                    ctx, intent_text, action_name, callee_type, get_config()
-                )
-            except Exception as exc:
-                decision, detail = "error", str(exc)
+            decision, detail = await _authorize(
+                ctx.agent_id,
+                intent_text,
+                ctx.user_intent,
+                action_name,
+                callee_type,
+                get_config(),
+            )
 
             if decision != "allow":
                 if decision == "deny" and on_deny == "raise":
