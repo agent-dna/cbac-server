@@ -1,10 +1,8 @@
 import base64
-import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import unquote
 from uuid import uuid4
 
 import structlog
@@ -14,12 +12,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import text
 
-# The prose renderer is shared with the guard on purpose: a guard, an MCP
-# gateway and this adapter must phrase the same call identically, or the policy
-# scores them differently. `cbac` pulls in none of the ML stack.
-from cbac.guard import render_intent
 from cbac_service.cbac import CBAC
 from cbac_service.db.engine import close_db, get_session
+from cbac_service.db.models import CBACDecision
+from cbac_service.db.repository import (
+    get_cbac_decision,
+    get_cbac_decision_by_hash,
+    get_cbac_decisions,
+)
 from cbac_service.logging_config import setup_logging
 
 # ── App lifecycle ──────────────────────────────────────────────────────────────
@@ -157,104 +157,117 @@ async def authorize_cbac(request: Request) -> PlainTextResponse:
     return PlainTextResponse(reason, headers={"X-CBAC-Decision": decision})
 
 
-# ── Gateways that are not ours ────────────────────────────────────────────────
+MAX_DECISION_LIMIT = 500
 
 
-def _tools_call(raw: bytes) -> tuple[str, dict[str, Any]] | str | None:
-    """Pull ``(tool_name, arguments)`` out of a JSON-RPC body.
+def _decision_json(record: CBACDecision) -> dict:
+    """Serialize one audit-log row for the wire."""
+    return {
+        "id": record.id,
+        "agent_id": record.agent_id,
+        "decision": record.decision,
+        "reason": record.reason,
+        "error_code": record.error_code,
+        "interaction_hash": record.interaction_hash,
+        "intended_action": record.intended_action,
+        "user_intent": record.user_intent,
+        "callee_name": record.callee_name,
+        "callee_type": record.callee_type,
+        "created_at": record.created_at.isoformat(),
+    }
 
-    Returns ``None`` when the request carries no tool call and should simply be
-    allowed through (an ``initialize``, a ``tools/list``, an empty session
-    GET/DELETE), or a ``str`` reason when it must be refused instead.
+
+@app.get("/cbac-decisions")
+async def list_cbac_decisions(request: Request) -> JSONResponse:
+    """Past authorization verdicts for one agent, newest first.
+
+    Every decision is here — including the ones that never reached the trust
+    fold (no callee, or an infrastructure-failure deny), which is what makes
+    this the audit log rather than ``lhi_records``.
     """
-    if not raw.strip():
-        return None  # session traffic with no body — cannot be a tool call
-    try:
-        payload = json.loads(raw)
-    except ValueError:
-        # A well-formed tools/call is always valid JSON. If this is not, we
-        # cannot say what it asks for, so we do not wave it through.
-        return "unparseable JSON-RPC body"
-    if isinstance(payload, list):
-        # Batching left the MCP spec in 2025-06-18. Authorizing one element and
-        # forwarding the rest unchecked is the failure mode to avoid.
-        return "batched JSON-RPC is not supported"
-    if not isinstance(payload, dict) or payload.get("method") != "tools/call":
-        return None
-    params = payload.get("params") or {}
-    return str(params.get("name", "")), dict(params.get("arguments") or {})
-
-
-@app.post("/ext-authz")
-async def ext_authz(request: Request) -> PlainTextResponse:
-    """External authorization, for an MCP gateway this project does not own.
-
-    Envoy, Istio, Gloo, agentgateway and Kong all speak the same shape: the
-    gateway forwards the request it is about to proxy, and enforces the status
-    code — 2xx forwards, anything else refuses. That is the entire contract, so
-    an enterprise plugs CBAC in by pointing its existing gateway here. No CBAC
-    code runs in the gateway.
-
-    Identity comes from ``X-CBAC-Agent-Id``, which the **gateway** must set
-    from the authenticated principal (a JWT claim, the mTLS SAN, the API key it
-    resolved) and must strip from the incoming client request. A client-settable
-    agent id is a client choosing its own policy.
-
-    Unlike our own gateway this sees no tool description — only the wire — so
-    the intended action reads "close issue" rather than "close an existing
-    GitHub issue". Where the gateway can hand over the description, pass it as
-    ``X-CBAC-Tool-Description`` and the prose matches again.
-    """
-    call = _tools_call(await request.body())
-    if call is None:
-        return PlainTextResponse("", headers={"X-CBAC-Decision": "allow"})
-    if isinstance(call, str):
-        return PlainTextResponse(
-            f"CBAC: {call}", status_code=403, headers={"X-CBAC-Decision": "deny"}
-        )
-
-    name, arguments = call
-    agent_id = request.headers.get("x-cbac-agent-id", "")
-    user_intent = unquote(request.headers.get("x-cbac-user-intent", ""))
-    description = request.headers.get("x-cbac-tool-description") or None
-
+    params = request.query_params
+    agent_id = params.get("agent_id", "")
     if not agent_id:
-        return PlainTextResponse(
-            "CBAC: no authenticated agent id (X-CBAC-Agent-Id) — the gateway "
-            "must set it from the authenticated principal",
-            status_code=403,
-            headers={"X-CBAC-Decision": "deny"},
-        )
-    if REQUIRE_CONTEXT and not user_intent:
-        return PlainTextResponse(
-            "CBAC: no governance context (X-CBAC-User-Intent missing) — the "
-            "MCP client must install cbac_propagate",
-            status_code=403,
-            headers={"X-CBAC-Decision": "deny"},
-        )
+        return JSONResponse({"error": "agent_id is required"}, status_code=400)
 
-    _bind_request_context({"agent_id": agent_id})
+    try:
+        limit = int(params.get("limit", "100"))
+        offset = int(params.get("offset", "0"))
+    except ValueError:
+        return JSONResponse(
+            {"error": "limit and offset must be integers"}, status_code=400
+        )
+    if limit < 1 or offset < 0:
+        return JSONResponse(
+            {"error": "limit must be >= 1 and offset >= 0"}, status_code=400
+        )
+    # Clamped rather than rejected: a caller asking for everything gets a large
+    # page, not a 400 it has to learn about.
+    limit = min(limit, MAX_DECISION_LIMIT)
+
     try:
         async with get_session() as session:
-            result = await _get_cbac().verify_cbac(
-                session=session,
-                agent_id=agent_id,
-                intended_action=render_intent(name, arguments, description),
-                user_intent=user_intent or None,
-                callee_name=name,
-                callee_type="mcp",
+            records = await get_cbac_decisions(
+                session, agent_id=agent_id, limit=limit, offset=offset
             )
-        decision, reason = result.decision, result.reason
-        logger.info("cbac decision", decision=decision, reason=reason, tool=name)
     except Exception as exc:
-        decision, reason = "error", str(exc)
-        logger.exception("ext-authz authorization failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
-    return PlainTextResponse(
-        reason,
-        status_code=200 if decision == "allow" else 403,
-        headers={"X-CBAC-Decision": decision},
+    decisions = [_decision_json(record) for record in records]
+    return JSONResponse(
+        {"agent_id": agent_id, "decisions": decisions, "count": len(decisions)}
     )
+
+
+@app.get("/cbac-decisions/{decision_id}")
+async def read_cbac_decision(decision_id: int) -> JSONResponse:
+    """One authorization verdict by id."""
+    try:
+        async with get_session() as session:
+            record = await get_cbac_decision(session, decision_id=decision_id)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    if record is None:
+        return JSONResponse({"error": f"no decision {decision_id}"}, status_code=404)
+    return JSONResponse(_decision_json(record))
+
+
+@app.get("/cbac-decisions/by-hash/{interaction_hash}")
+async def read_cbac_decision_by_hash(interaction_hash: str) -> JSONResponse:
+    """One authorization verdict by its ``interaction_hash``.
+
+    For a middleware dashboard that already holds the hash from a prior
+    ``/authorize-cbac`` call (or from streaming ``cbac_decisions`` some other
+    way) and wants the full row back without knowing the numeric ``id``.
+
+    ``interaction_hash`` is sha256 hex (64 lowercase hex chars) — rejected
+    with 400 if it isn't shaped like one, so a malformed lookup fails fast
+    instead of silently returning "not found". Not a uniqueness constraint:
+    the same interaction can be decided more than once, so this returns the
+    newest matching row — see ``get_cbac_decision_by_hash``.
+    """
+    if len(interaction_hash) != 64 or any(
+        c not in "0123456789abcdef" for c in interaction_hash.lower()
+    ):
+        return JSONResponse(
+            {"error": "interaction_hash must be 64 hex characters"}, status_code=400
+        )
+
+    try:
+        async with get_session() as session:
+            record = await get_cbac_decision_by_hash(
+                session, interaction_hash=interaction_hash.lower()
+            )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    if record is None:
+        return JSONResponse(
+            {"error": f"no decision with interaction_hash {interaction_hash}"},
+            status_code=404,
+        )
+    return JSONResponse(_decision_json(record))
 
 
 @app.post("/precompute-policy")

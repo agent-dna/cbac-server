@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ pytest.importorskip("sentence_transformers")
 
 from agentdna.types import AgentCard
 
+from cbac_service import error_codes as ec
 from cbac_service import main
 from cbac_service.cbac import CBACResult
 
@@ -126,6 +128,131 @@ def test_compute_lhi_endpoint_is_gone():
     """Trust is folded in by /authorize-cbac; there is no second call."""
     assert not hasattr(main, "compute_lhi")
     assert "/compute-lhi" not in {route.path for route in main.app.routes}
+
+
+# ── Decision audit log ────────────────────────────────────────────────────────
+
+
+def stub_query_request(**params):
+    """A Request whose only used surface is `.query_params`."""
+    return SimpleNamespace(query_params={k: str(v) for k, v in params.items()})
+
+
+def decision_row(record_id=1, **overrides):
+    fields = {
+        "id": record_id,
+        "agent_id": "did:agent",
+        "decision": "allow",
+        "reason": "Tier 1 allow",
+        "intended_action": "The agent wants to read pull requests.",
+        "user_intent": "show me the PRs",
+        "callee_name": "github_tool",
+        "callee_type": "tool",
+        "error_code": ec.TIER1_GAP_ALLOW,
+        # Per-row unique in the real table (uuid4-salted), so vary it by id.
+        "interaction_hash": f"{record_id:064x}",
+        "created_at": datetime(2026, 8, 17, 9, 14, 22, tzinfo=timezone.utc),
+    }
+    return SimpleNamespace(**{**fields, **overrides})
+
+
+def install_repository(monkeypatch, calls=None, records=(), one=None):
+    @asynccontextmanager
+    async def _fake_get_session():
+        yield SimpleNamespace()
+
+    async def fake_get_cbac_decisions(session, agent_id, limit, offset):
+        if calls is not None:
+            calls.append({"agent_id": agent_id, "limit": limit, "offset": offset})
+        return list(records)
+
+    async def fake_get_cbac_decision(session, decision_id):
+        return one
+
+    monkeypatch.setattr(main, "get_session", _fake_get_session)
+    monkeypatch.setattr(main, "get_cbac_decisions", fake_get_cbac_decisions)
+    monkeypatch.setattr(main, "get_cbac_decision", fake_get_cbac_decision)
+
+
+def test_list_decisions_returns_serialized_rows(monkeypatch):
+    install_repository(monkeypatch, records=[decision_row(2), decision_row(1)])
+    response = asyncio.run(
+        main.list_cbac_decisions(stub_query_request(agent_id="did:agent"))
+    )
+
+    payload = json.loads(response.body)
+    assert payload["agent_id"] == "did:agent"
+    assert payload["count"] == 2
+    assert [d["id"] for d in payload["decisions"]] == [2, 1]  # newest first
+    assert payload["decisions"][0]["created_at"] == "2026-08-17T09:14:22+00:00"
+    assert payload["decisions"][0]["reason"] == "Tier 1 allow"
+
+
+def test_list_decisions_defaults_and_forwards_paging(monkeypatch):
+    calls = []
+    install_repository(monkeypatch, calls=calls)
+    asyncio.run(main.list_cbac_decisions(stub_query_request(agent_id="did:agent")))
+    asyncio.run(
+        main.list_cbac_decisions(
+            stub_query_request(agent_id="did:agent", limit=10, offset=20)
+        )
+    )
+
+    assert calls == [
+        {"agent_id": "did:agent", "limit": 100, "offset": 0},
+        {"agent_id": "did:agent", "limit": 10, "offset": 20},
+    ]
+
+
+def test_list_decisions_clamps_limit(monkeypatch):
+    """An oversized page is clamped, not rejected — a caller asking for
+    everything gets a large page rather than a 400 to learn about."""
+    calls = []
+    install_repository(monkeypatch, calls=calls)
+    asyncio.run(
+        main.list_cbac_decisions(stub_query_request(agent_id="did:agent", limit=100000))
+    )
+
+    assert calls[0]["limit"] == main.MAX_DECISION_LIMIT
+
+
+def test_list_decisions_requires_agent_id(monkeypatch):
+    install_repository(monkeypatch)
+    response = asyncio.run(main.list_cbac_decisions(stub_query_request()))
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == "agent_id is required"
+
+
+def test_list_decisions_rejects_bad_paging(monkeypatch):
+    install_repository(monkeypatch)
+    bad_type = asyncio.run(
+        main.list_cbac_decisions(stub_query_request(agent_id="did:agent", limit="abc"))
+    )
+    out_of_range = asyncio.run(
+        main.list_cbac_decisions(stub_query_request(agent_id="did:agent", offset=-1))
+    )
+
+    assert bad_type.status_code == 400
+    assert "integers" in json.loads(bad_type.body)["error"]
+    assert out_of_range.status_code == 400
+
+
+def test_read_decision_returns_the_row(monkeypatch):
+    install_repository(monkeypatch, one=decision_row(42, decision="deny"))
+    response = asyncio.run(main.read_cbac_decision(42))
+
+    payload = json.loads(response.body)
+    assert payload["id"] == 42
+    assert payload["decision"] == "deny"
+
+
+def test_read_decision_404s_when_absent(monkeypatch):
+    install_repository(monkeypatch, one=None)
+    response = asyncio.run(main.read_cbac_decision(999))
+
+    assert response.status_code == 404
+    assert "999" in json.loads(response.body)["error"]
 
 
 def _recording_precompute(calls, result=7):

@@ -206,7 +206,7 @@ def scores(tmp_path_factory):
             for category, user_intent, action in EVAL_CASES:
                 _, intent_score = asyncio.run(cbac._check1_drift(user_intent, action))
                 hhem = cbac.hallucination_score(user_intent, action)
-                decision, _, policy_score = asyncio.run(
+                decision, _, _error_code, policy_score = asyncio.run(
                     cbac._tiered_decision(None, "did:agent", action)
                 )
                 results.setdefault(category, []).append(

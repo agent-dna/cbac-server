@@ -37,6 +37,9 @@ app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
   - **`POST /authorize-cbac`** — main decision gate. Also folds the decision
     into the caller→callee trust score, so it is the *only* call a guard makes.
   - **`POST /precompute-policy`** — explicitly trigger embedding precomputation.
+  - **`GET /cbac-decisions?agent_id=&limit=&offset=`** — an agent's decision
+    history, newest first.
+  - **`GET /cbac-decisions/{id}`** — one decision by id.
   - **`GET /health`** — DB connectivity check.
 - Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`).
 
@@ -49,7 +52,9 @@ Guard (cbac/) --HTTP--> cbac_service (FastAPI)
                                 ├── pgvector 0.8.6 (semantic search)
                                 ├── pg_textsearch 1.4.0 (BM25 keyword search)
                                 ├── policy_chunks table (embeddings + text)
-                                └── policy_meta table (cache invalidation)
+                                ├── policy_meta table (cache invalidation)
+                                ├── cbac_decisions table (audit log)
+                                └── lhi_records table (trust history)
 ```
 
 ## Database
@@ -72,6 +77,23 @@ The service uses **PostgreSQL 18** with two extensions:
 - `policy_hash` — compared against on-chain hash at runtime
 - `encoder_model` / `nli_model` — detect if models changed
 - `chunk_count` / `cached_at` — operational metadata
+
+**`cbac_decisions`** — one row per verdict, the **audit log**:
+- `agent_id` / `decision` / `reason` — who, what, why
+- `intended_action` — the *flattened* action text, i.e. what the scorers saw
+- `user_intent` / `callee_name` / `callee_type` — context; NULL when not supplied
+- `created_at`
+
+**`lhi_records`** — one row per decision, the **trust history** (see the LHI
+section below).
+
+⚠️ **These two are not interchangeable, and the difference is easy to get
+wrong.** `cbac_decisions` is *complete*: every verdict `verify_cbac` reaches is
+recorded, including the infrastructure-failure denies and calls with no callee.
+`lhi_records` is deliberately *skipped* in exactly those cases (no
+`callee_name`, no measured component, the infra-failure early returns), because
+a trust score must not be moved by things that are not evidence about the agent.
+So only `cbac_decisions` can answer "what did we decide, and why".
 
 ### Indexes
 - `policy_chunks_embedding_idx` — HNSW (vector_cosine_ops)
@@ -147,7 +169,18 @@ Class `CBAC`. On each request:
    decision — a failed trust update is logged, not raised. Skipped when no
    `callee_name` was supplied, or when no component was measured. The early
    returns *above* the decision (policy lookup down, no policy, no chunks) are
-   infrastructure failures, not evidence about the agent, and record nothing.
+   infrastructure failures, not evidence about the agent, and fold no trust.
+
+8. **Decision recorded** (`_record_decision` → `insert_cbac_decision`): the
+   verdict plus its action context is appended to `cbac_decisions`. Unlike the
+   trust fold this has **no skip conditions** — every path is audited, including
+   the infra-failure denies above. Also never gates: failing to write down what
+   was decided must not change what was decided.
+
+`verify_cbac` is a thin wrapper that calls `_decide` (the pipeline above) and
+then records. `_decide` has seven return paths and the wrapper exists so the
+audit write happens in exactly one place — threading it through each return is
+how a path silently stops being audited.
 
 Decisions are `"allow" | "deny" | "advise"` and the pipeline is **fail-closed**
 (any error → `deny`).

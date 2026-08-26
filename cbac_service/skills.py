@@ -43,6 +43,32 @@ class CardCheck:
     reasons: list[str] = field(default_factory=list)
 
 
+VALID_LLM_DECISIONS = ("allow", "deny", "advise")
+
+
+@dataclass
+class LLMVerdict:
+    """Structured Tier-3 output an ``llm_backend`` callable must return.
+
+    Replaces free-text keyword matching (checking for "deny"/"allow" as
+    substrings anywhere in a response — which misfires on a negated mention
+    like "not prohibited," or a response that says "I'd normally deny this,
+    but..." before concluding allow). An ``llm_backend`` is expected to force
+    its underlying LLM into returning exactly this shape — e.g. via a
+    tool-call/structured-output API — so ``_tiered_decision`` reads
+    ``decision`` directly instead of guessing from prose.
+
+    ``decision`` must be one of :data:`VALID_LLM_DECISIONS`; anything else is
+    treated as malformed and resolves to ``"advise"`` rather than raising —
+    a misbehaving backend degrades to "caller must decide," the same
+    fail-open-to-a-human posture as "no backend configured at all," not a
+    hard failure.
+    """
+
+    decision: str  # "allow" | "deny" | "advise"
+    reason: str
+
+
 @dataclass
 class CBACResult:
     """Overall CBAC decision after walking the full chain."""
@@ -56,6 +82,12 @@ class CBACResult:
     # Post-decision LHI trust for the (agent → callee) edge. None when no
     # trust update ran — see CBAC._fold_trust for the skip conditions.
     trust: float | None = None
+    # Numeric identifier for exactly which layer/condition produced `reason`
+    # — see cbac_service.error_codes. Machine-stable where `reason` (free
+    # text) is not; every construction site in cbac.py sets this explicitly,
+    # so `None` here would mean a return path forgot to, not that no
+    # decision was reached.
+    error_code: int | None = None
 
 
 def parse_skill_md(text: str) -> SkillsCard:
