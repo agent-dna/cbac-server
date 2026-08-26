@@ -65,7 +65,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 # directories up from examples/github_agent_workflow/.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cbac import cbac_context, configure
+from cbac import cbac_context
 from cbac.mcp import cbac_propagate
 
 load_dotenv()
@@ -323,8 +323,6 @@ def _mcp_client(labelled: bool = True, url: str = GATEWAY_URL) -> MultiServerMCP
 
 
 async def run(request: str) -> None:
-    configure(cbac_url=CBAC_URL, cbac_timeout=CBAC_TIMEOUT)
-
     tools = [
         *await _mcp_client().get_tools(),  # decided at the gateway
         StructuredTool.from_function(coroutine=draft_summary),  # in-process, not

@@ -47,8 +47,8 @@ from fastmcp.server.middleware import Middleware
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cbac import cbac_context, configure
-from cbac.guard import authorize_tool_call
+from cbac import configure, get_config
+from cbac.guard import authorize
 from cbac.mcp import context_from_headers, denial_body
 
 load_dotenv()
@@ -70,6 +70,8 @@ CBAC_TIMEOUT = float(os.environ.get("CBAC_TIMEOUT", "600"))
 # trust-boundary note in CBACMiddleware.
 AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
 REQUIRE_CONTEXT = os.environ.get("CBAC_REQUIRE_CONTEXT", "true").lower() == "true"
+
+configure(cbac_url=CBAC_URL, cbac_timeout=CBAC_TIMEOUT)
 
 
 class CBACMiddleware(Middleware):
@@ -116,10 +118,15 @@ class CBACMiddleware(Middleware):
                 )
             )
 
-        with cbac_context(agent_id=self._agent_id, user_intent=user_intent):
-            decision, detail = await authorize_tool_call(
-                callee_name, args, description, callee_type="mcp"
-            )
+        decision, detail = await authorize(
+            self._agent_id,
+            callee_name,
+            args,
+            user_intent,
+            description,
+            callee_type="mcp",
+            cfg=get_config(),
+        )
 
         if decision != "allow":
             raise error(denial_body(decision, detail))
@@ -228,7 +235,6 @@ gateway.add_middleware(CBACMiddleware(AGENT_ID, require_context=REQUIRE_CONTEXT)
 
 
 if __name__ == "__main__":
-    configure(cbac_url=CBAC_URL, cbac_timeout=CBAC_TIMEOUT)
     print(f"[gateway] {GATEWAY_HOST}:{GATEWAY_PORT} -> {UPSTREAM_URL} (github)")
     print(f"[gateway] {GATEWAY_HOST}:{GATEWAY_PORT} -> {THIRDPARTY_URL} (deepwiki)")
     print(
