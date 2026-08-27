@@ -14,11 +14,12 @@ from sqlalchemy import text
 
 from cbac_service.cbac import CBAC
 from cbac_service.db.engine import close_db, get_session
-from cbac_service.db.models import CBACDecision
+from cbac_service.db.models import CBACDecision, LHIRecord
 from cbac_service.db.repository import (
     get_cbac_decision,
     get_cbac_decision_by_hash,
     get_cbac_decisions,
+    get_latest_trust_for_agents,
 )
 from cbac_service.logging_config import setup_logging
 
@@ -268,6 +269,64 @@ async def read_cbac_decision_by_hash(interaction_hash: str) -> JSONResponse:
             status_code=404,
         )
     return JSONResponse(_decision_json(record))
+
+
+MAX_LHI_AGENTS = 200
+
+
+def _lhi_record_json(record: LHIRecord) -> dict:
+    """Serialize one trust-history row for the wire — the edge fields
+    (agent_id) are omitted since the caller already keys the response by them."""
+    return {
+        "callee_name": record.callee_name,
+        "callee_type": record.callee_type,
+        "intent_score": record.intent_score,
+        "policy_score": record.policy_score,
+        "hallucination_score": record.hallucination_score,
+        "trust": record.trust,
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+@app.post("/lhi-scores")
+async def read_lhi_scores(request: Request) -> JSONResponse:
+    """Current trust for a batch of agents, one entry per caller→callee edge.
+
+    Trust is tracked per (agent_id, callee_name, callee_type) edge (see the
+    LHI section in CLAUDE.md), not per agent, so an agent with several
+    callees comes back with several edges. An agent with no history yet is
+    still a key in the response, mapped to an empty list, rather than
+    omitted — the caller doesn't have to distinguish "no history" from
+    "didn't ask".
+    """
+    body = await request.json()
+    agent_ids = body.get("agent_ids")
+    if not isinstance(agent_ids, list) or not agent_ids:
+        return JSONResponse(
+            {"error": "agent_ids must be a non-empty list"}, status_code=400
+        )
+    if not all(isinstance(a, str) and a for a in agent_ids):
+        return JSONResponse(
+            {"error": "agent_ids must be a list of non-empty strings"},
+            status_code=400,
+        )
+    if len(agent_ids) > MAX_LHI_AGENTS:
+        return JSONResponse(
+            {"error": f"agent_ids must have at most {MAX_LHI_AGENTS} entries"},
+            status_code=400,
+        )
+
+    try:
+        async with get_session() as session:
+            records = await get_latest_trust_for_agents(session, agent_ids=agent_ids)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    agents: dict[str, list[dict]] = {agent_id: [] for agent_id in agent_ids}
+    for record in records:
+        agents[record.agent_id].append(_lhi_record_json(record))
+
+    return JSONResponse({"agents": agents})
 
 
 @app.post("/precompute-policy")

@@ -129,7 +129,7 @@ class CBACDecision(Base):
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
     decision: Mapped[str] = mapped_column(
         String, nullable=False
-    )  # 'allow' | 'deny' | 'advise'
+    )  # 'allow' | 'deny' (historical rows may carry 'advise', retired)
     # Text, not String: a Tier-2 reason embeds the matched policy chunk verbatim.
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     # The *flattened* action text — what the scorers actually saw, so the row

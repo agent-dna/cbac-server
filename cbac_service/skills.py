@@ -59,10 +59,11 @@ class LLMVerdict:
     ``decision`` directly instead of guessing from prose.
 
     ``decision`` must be one of :data:`VALID_LLM_DECISIONS`; anything else is
-    treated as malformed and resolves to ``"advise"`` rather than raising —
-    a misbehaving backend degrades to "caller must decide," the same
-    fail-open-to-a-human posture as "no backend configured at all," not a
-    hard failure.
+    treated as malformed and resolves to ``"deny"`` rather than raising —
+    a misbehaving backend degrades the same way "no backend configured at
+    all" does, not a hard failure. A backend that itself returns
+    ``"advise"`` is folded to ``"deny"`` too: the pipeline has no
+    caller-must-decide state.
     """
 
     decision: str  # "allow" | "deny" | "advise"
@@ -73,7 +74,7 @@ class LLMVerdict:
 class CBACResult:
     """Overall CBAC decision after walking the full chain."""
 
-    decision: str  # "allow" | "deny" | "advise"
+    decision: str  # "allow" | "deny"
     reason: str = ""
     trace: list[CardCheck] = field(default_factory=list)
     hallucination_score: float | None = None

@@ -255,6 +255,119 @@ def test_read_decision_404s_when_absent(monkeypatch):
     assert "999" in json.loads(response.body)["error"]
 
 
+# ── LHI trust scores ──────────────────────────────────────────────────────────
+
+
+def lhi_row(
+    agent_id="did:agent", callee_name="github_tool", callee_type="tool", **overrides
+):
+    fields = {
+        "agent_id": agent_id,
+        "callee_name": callee_name,
+        "callee_type": callee_type,
+        "intent_score": 0.9,
+        "policy_score": 0.8,
+        "hallucination_score": 0.95,
+        "trust": 0.87,
+        "created_at": datetime(2026, 8, 17, 9, 14, 22, tzinfo=timezone.utc),
+    }
+    return SimpleNamespace(**{**fields, **overrides})
+
+
+def install_lhi_repository(monkeypatch, calls=None, records=()):
+    @asynccontextmanager
+    async def _fake_get_session():
+        yield SimpleNamespace()
+
+    async def fake_get_latest_trust_for_agents(session, agent_ids):
+        if calls is not None:
+            calls.append(list(agent_ids))
+        return list(records)
+
+    monkeypatch.setattr(main, "get_session", _fake_get_session)
+    monkeypatch.setattr(
+        main, "get_latest_trust_for_agents", fake_get_latest_trust_for_agents
+    )
+
+
+def test_lhi_scores_groups_edges_by_agent(monkeypatch):
+    install_lhi_repository(
+        monkeypatch,
+        records=[
+            lhi_row("did:a", callee_name="github_tool"),
+            lhi_row("did:a", callee_name="slack_tool", trust=0.5),
+            lhi_row("did:b"),
+        ],
+    )
+    response = asyncio.run(
+        main.read_lhi_scores(stub_request({"agent_ids": ["did:a", "did:b"]}))
+    )
+
+    payload = json.loads(response.body)
+    assert {e["callee_name"] for e in payload["agents"]["did:a"]} == {
+        "github_tool",
+        "slack_tool",
+    }
+    assert len(payload["agents"]["did:b"]) == 1
+    assert payload["agents"]["did:b"][0]["trust"] == 0.87
+
+
+def test_lhi_scores_includes_agents_with_no_history(monkeypatch):
+    """An agent with no trust record yet is still a key, mapped to []."""
+    install_lhi_repository(monkeypatch, records=[lhi_row("did:a")])
+    response = asyncio.run(
+        main.read_lhi_scores(stub_request({"agent_ids": ["did:a", "did:no-history"]}))
+    )
+
+    payload = json.loads(response.body)
+    assert payload["agents"]["did:no-history"] == []
+
+
+def test_lhi_scores_forwards_requested_ids(monkeypatch):
+    calls = []
+    install_lhi_repository(monkeypatch, calls=calls)
+    asyncio.run(main.read_lhi_scores(stub_request({"agent_ids": ["did:a", "did:b"]})))
+
+    assert calls == [["did:a", "did:b"]]
+
+
+def test_lhi_scores_rejects_missing_or_empty_list(monkeypatch):
+    install_lhi_repository(monkeypatch)
+    missing = asyncio.run(main.read_lhi_scores(stub_request({})))
+    empty = asyncio.run(main.read_lhi_scores(stub_request({"agent_ids": []})))
+    not_a_list = asyncio.run(
+        main.read_lhi_scores(stub_request({"agent_ids": "did:agent"}))
+    )
+
+    for response in (missing, empty, not_a_list):
+        assert response.status_code == 400
+        assert "agent_ids" in json.loads(response.body)["error"]
+
+
+def test_lhi_scores_rejects_non_string_entries(monkeypatch):
+    install_lhi_repository(monkeypatch)
+    response = asyncio.run(
+        main.read_lhi_scores(stub_request({"agent_ids": ["did:a", 42]}))
+    )
+
+    assert response.status_code == 400
+    assert "agent_ids" in json.loads(response.body)["error"]
+
+
+def test_lhi_scores_rejects_oversized_batch(monkeypatch):
+    install_lhi_repository(monkeypatch)
+    response = asyncio.run(
+        main.read_lhi_scores(
+            stub_request(
+                {"agent_ids": [f"did:{i}" for i in range(main.MAX_LHI_AGENTS + 1)]}
+            )
+        )
+    )
+
+    assert response.status_code == 400
+    assert str(main.MAX_LHI_AGENTS) in json.loads(response.body)["error"]
+
+
 def _recording_precompute(calls, result=7):
     async def precompute_policy(session, agent_id, policy):
         calls.append({"agent_id": agent_id, "policy": policy})

@@ -41,10 +41,12 @@ TIER2_ENTAILMENT_ALLOW = 3302  # allow — entailment >= ENTAILMENT_THRESHOLD
 TIER2_CONTRADICTION_DENY = 3303  # deny  — contradiction >= CONTRADICTION_THRESHOLD
 
 # ── 3400s: Tier 3 — optional LLM backend ─────────────────────────────────────
-TIER3_NO_BACKEND_ADVISE = (
-    3401  # advise — Tier 1/2 inconclusive, no llm_backend configured
-)
-TIER3_LLM_ERROR_ADVISE = 3402  # advise — llm_backend() raised
+# 3401/3402/3408/3409 used to read ADVISE — the pipeline no longer has a
+# caller-must-decide state, so each of these now resolves to deny. Renamed to
+# match; the numeric codes are unchanged, so a historical row bearing the old
+# name's number still means what it meant when it was written.
+TIER3_NO_BACKEND_DENY = 3401  # deny — Tier 1/2 inconclusive, no llm_backend configured
+TIER3_LLM_ERROR_DENY = 3402  # deny — llm_backend() raised
 
 # 3403-3405 are RETIRED, not reusable: the free-text keyword-matching Tier 3
 # path they described (checking for "deny"/"allow" as bare substrings
@@ -56,8 +58,10 @@ TIER3_LLM_KEYWORD_DENY = 3403  # RETIRED — deny-keyword substring matched
 TIER3_LLM_KEYWORD_ALLOW = 3404  # RETIRED — allow-keyword substring matched
 TIER3_LLM_INCONCLUSIVE_ADVISE = 3405  # RETIRED — neither keyword list matched
 
-TIER3_LLM_ALLOW = 3406  # allow  — backend returned LLMVerdict(decision="allow", ...)
-TIER3_LLM_DENY = 3407  # deny   — backend returned LLMVerdict(decision="deny", ...)
-TIER3_LLM_ADVISE = 3408  # advise — backend returned LLMVerdict(decision="advise", ...)
-TIER3_LLM_MALFORMED_ADVISE = 3409  # advise — backend returned something that isn't a
+TIER3_LLM_ALLOW = 3406  # allow — backend returned LLMVerdict(decision="allow", ...)
+TIER3_LLM_DENY = 3407  # deny  — backend returned LLMVerdict(decision="deny", ...)
+TIER3_LLM_ADVISE_DENY = (
+    3408  # deny — backend returned LLMVerdict(decision="advise", ...)
+)
+TIER3_LLM_MALFORMED_DENY = 3409  # deny — backend returned something that isn't a
 # valid LLMVerdict, or an unrecognised `decision` value
