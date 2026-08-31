@@ -102,9 +102,9 @@ developer can delete is not a control. So the demo splits the job:
   either forwards the call upstream or returns a denial.
 
 Delete `cbac_propagate` and calls still go through the gateway — they just
-arrive with nothing to authorize, and the gateway denies them (fail-closed,
-`CBAC_REQUIRE_CONTEXT=true`). `python agent_check.py` proves this: probe 3 is a
-client with the interceptor removed.
+arrive with no user intent to check them against, so they are judged on policy
+alone and a forbidden one is still denied. `python agent_check.py` proves this:
+probe 2 is a client with the interceptor removed.
 
 Two more things fall out of the split:
 
@@ -155,11 +155,12 @@ knows what the user typed. CBAC treats it as *evidence* (a drift signal), never
 as identity, so a client that lies about it still gets its action scored
 against the policy.
 
-`X-CBAC-Agent-Id` decides *whose policy applies*, which is exactly what a
-compromised client would lie about. The gateway therefore **pins** it
-(`CBAC_AGENT_ID`) rather than reading the header. A multi-tenant gateway maps
-its authenticated principal — OAuth subject, mTLS SAN, API key — to an agent id
-at the same spot.
+`X-CBAC-Agent-Id` decides *whose policy applies*. The gateway reads it off the
+call and falls back to `CBAC_AGENT_ID` when the call carries none — fine for a
+demo, where the only client is the agent next door. A compromised client is
+exactly what would lie about this header, so a gateway that must not take the
+caller's word for it maps its authenticated principal — OAuth subject, mTLS
+SAN, API key — to an agent id in the two lines where the hooks read the header.
 
 ## Files
 

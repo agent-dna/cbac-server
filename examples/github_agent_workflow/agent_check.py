@@ -111,8 +111,8 @@ async def check() -> None:
 
     1. straight through the gateway — denied by the policy.
     2. from a client with **no** ``cbac_propagate``, the developer who
-       "forgot" the CBAC wiring — denied: the gateway is fail-closed on a
-       call with no governance context.
+       "forgot" the CBAC wiring — still denied: the call arrives with no
+       user intent to check drift against, so the policy decides it alone.
     3. is not a call. It lists the MCP server's tools **directly**, to show
        that the server answers anyone who can reach it: it carries no check
        of its own, and is not supposed to. Keeping it unroutable is the
@@ -213,8 +213,7 @@ async def check() -> None:
     assert _was_blocked(resource), f"forbidden resource was read: {resource}"
     assert "Review the open pull requests" in prompt, f"prompt did not run: {prompt}"
     print("\nOK — permitted calls relayed, forbidden ones blocked at the gateway:")
-    print("     by policy, and by the fail-closed check on a call that arrived")
-    print("     with no governance context. Tools and resources alike, and the")
+    print("     by policy, labelled or not. Tools and resources alike, and the")
     print("     third-party server on the same policy as the local one.")
 
 
