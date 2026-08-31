@@ -464,13 +464,13 @@ class CBAC:
         # Tier 3: LLM judgment (optional).
         if self._llm_backend is None:
             return (
-                "advise",
+                "deny",
                 (
                     f"Tier 1/2 inconclusive (gap={gap:+.3f}, "
                     f"entailment={entailment:.2f}, contradiction={contradiction:.2f}); "
-                    "no LLM backend configured — caller must decide"
+                    "no LLM backend configured"
                 ),
-                ec.TIER3_NO_BACKEND_ADVISE,
+                ec.TIER3_NO_BACKEND_DENY,
                 None,
             )
 
@@ -481,28 +481,33 @@ class CBAC:
         try:
             verdict = await self._llm_backend(intent_text, policy_text)
         except Exception as e:
-            return ("advise", f"Tier 3 LLM error: {e}", ec.TIER3_LLM_ERROR_ADVISE, None)
+            return ("deny", f"Tier 3 LLM error: {e}", ec.TIER3_LLM_ERROR_DENY, None)
 
         # `llm_backend` is contracted to return an LLMVerdict (see skills.py),
         # not free text — a misbehaving backend (wrong type, or a decision
-        # outside the known three) degrades to "caller must decide" rather
-        # than raising or silently guessing from prose.
+        # outside the known three) degrades to "deny" rather than raising or
+        # silently guessing from prose.
         decision = getattr(verdict, "decision", None)
         reason_text = getattr(verdict, "reason", None)
         if not isinstance(verdict, LLMVerdict) or decision not in VALID_LLM_DECISIONS:
             return (
-                "advise",
+                "deny",
                 f"Tier 3 LLM returned an unrecognised verdict: {verdict!r}",
-                ec.TIER3_LLM_MALFORMED_ADVISE,
+                ec.TIER3_LLM_MALFORMED_DENY,
                 None,
             )
 
         code = {
             "allow": ec.TIER3_LLM_ALLOW,
             "deny": ec.TIER3_LLM_DENY,
-            "advise": ec.TIER3_LLM_ADVISE,
+            "advise": ec.TIER3_LLM_ADVISE_DENY,
         }[decision]
-        return (decision, f"Tier 3 LLM ({decision}): {reason_text}", code, None)
+        # A backend that itself returns "advise" is folded to deny too — the
+        # pipeline no longer has a caller-must-decide state; `decision` (not
+        # `final_decision`) still appears in the reason so the audit log shows
+        # what the backend actually said.
+        final_decision = "deny" if decision == "advise" else decision
+        return (final_decision, f"Tier 3 LLM ({decision}): {reason_text}", code, None)
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -663,7 +668,7 @@ class CBAC:
         ``intended_action`` text and denies immediately on a strong
         contradiction (``CONTRADICTION_THRESHOLD``).
 
-        Once a decision is *reached* — allow, deny or advise alike — its
+        Once a decision is *reached* — allow or deny alike — its
         component scores are folded into the (agent → callee) trust score via
         :meth:`_fold_trust`, and the result carries the new ``trust``. All three
         components are known at this point, so there is nothing left to wait for
@@ -692,7 +697,7 @@ class CBAC:
 
         Returns
         -------
-        CBACResult with ``decision`` in ``{"allow", "deny", "advise"}``.
+        CBACResult with ``decision`` in ``{"allow", "deny"}``.
         Fail-closed: any unrecoverable error resolves to ``deny``.
         """
         intent_text = _intended_action_text(intended_action)

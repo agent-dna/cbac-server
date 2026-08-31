@@ -52,7 +52,13 @@ app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
   - **`GET /cbac/v1/decisions?agent_id=&limit=&offset=`** — an agent's decision
     history, newest first.
   - **`GET /cbac/v1/decisions/{id}`** — one decision by id.
-  - **`GET /health`** — DB connectivity check.
+  - **`GET /cbac/v1/decisions/by-hash/{interaction_hash}`** — one decision by
+    its interaction hash.
+  - **`POST /cbac/v1/lhi-scores`** — current trust for a batch of agents
+    (`{"agent_ids": [...]}`), one entry per caller→callee edge. A POST for a
+    read because the id batch is the body.
+  - **`GET /health`** — DB connectivity check. Unversioned on purpose: probes
+    are wired once at deploy time and must not track API versions.
 - Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`).
 
 ## Architecture
@@ -171,7 +177,9 @@ Class `CBAC`. On each request:
    cross-encoder. Entailment ≥ 0.55 → allow, contradiction ≥ 0.60 → deny.
 
 5. **Tier 3 — LLM backend** (optional): If configured, sends intent + full
-   policy text to an LLM for judgment. Otherwise returns `"advise"`.
+   policy text to an LLM for judgment. Otherwise returns `"deny"`. A
+   configured backend that itself returns `"advise"` is also folded to
+   `"deny"` — the pipeline has no caller-must-decide state.
 
 6. **Hallucination score** (HHEM): Attached after the decision, never gates it.
 
@@ -194,8 +202,8 @@ then records. `_decide` has seven return paths and the wrapper exists so the
 audit write happens in exactly one place — threading it through each return is
 how a path silently stops being audited.
 
-Decisions are `"allow" | "deny" | "advise"` and the pipeline is **fail-closed**
-(any error → `deny`).
+Decisions are `"allow" | "deny"` and the pipeline is **fail-closed** (any
+error, or an inconclusive/misbehaving Tier 3, → `deny`).
 
 ## Scoring attached to a decision
 
@@ -214,8 +222,8 @@ Decisions are `"allow" | "deny" | "advise"` and the pipeline is **fail-closed**
   post-execution step and no `/compute-lhi` endpoint: every component is known
   the moment a decision is reached, so a guard makes exactly **one** HTTP call
   per action and no score ever round-trips through the client. **Every decision
-  records** — allow, deny and advise alike — so an agent probing forbidden
-  actions loses trust instead of keeping a pristine record.
+  records** — allow and deny alike — so an agent probing forbidden actions
+  loses trust instead of keeping a pristine record.
 
   The mean **renormalizes over the observed components** (`s = Σ wᵢxᵢ / Σ wᵢ`)
   rather than skipping records with a missing one: the components are not

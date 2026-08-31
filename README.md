@@ -4,9 +4,8 @@ Context Based Access Control for Apps and Tools.
 
 A standalone FastAPI decision service that answers one question per agent action:
 **should this agent be allowed to do this?** A guard calls it over HTTP and gets
-back `allow` / `deny` / `advise`. Reaching a decision also folds the component
-scores into the caller→callee trust score, so a guard makes exactly one call per
-action.
+back `allow` / `deny`. Reaching a decision also folds the component scores into
+the caller→callee trust score, so a guard makes exactly one call per action.
 
 ## Layout
 
@@ -162,6 +161,7 @@ same envelope with HTTP 422 and the field errors under `data.errors`.
 | `GET` | `/cbac/v1/decisions/{id}` | One decision by id |
 | `GET` | `/cbac/v1/decisions/by-hash/{interaction_hash}` | One decision by its interaction hash |
 | `POST` | `/cbac/v1/policies/precompute` | Explicitly trigger policy embedding precomputation |
+| `POST` | `/cbac/v1/lhi-scores` | Current trust for a batch of agents (`{"agent_ids": [...]}`), one entry per caller→callee edge |
 | `GET` | `/health` | Database connectivity check. Unversioned on purpose — probes are wired once and must not track API versions |
 
 ## How a decision is made
@@ -178,12 +178,13 @@ inconclusive:
 4. **Tier 2 — NLI entailment** — hybrid search (pgvector + BM25, RRF-fused) picks
    the best allowed chunk, then a cross-encoder judges entailment.
 5. **Tier 3 — LLM** (optional) — if configured, sends intent + policy to an LLM.
-   Otherwise returns `advise`.
+   Otherwise returns `deny`. A configured backend that itself returns `advise`
+   is also folded to `deny`.
 
 A hallucination score (HHEM) is attached to the result but never gates it. Once a
 decision is reached, its component scores fold into the stored trust value for
-that caller→callee edge. The pipeline is **fail-closed**: any error becomes a
-`deny`.
+that caller→callee edge. The pipeline is **fail-closed**: any error, or an
+inconclusive/misbehaving Tier 3, becomes a `deny`.
 
 ## Architecture Notes
 

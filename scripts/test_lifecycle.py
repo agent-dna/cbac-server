@@ -73,7 +73,6 @@ async def run_lifecycle():
             await delete_policy_chunks(session, AGENT_ID)
             print("\n✓ DB initialized\n")
 
-
         print("Step 1: Parse & chunk policy")
         from unittest.mock import MagicMock
 
@@ -86,7 +85,6 @@ async def run_lifecycle():
         for i, c in enumerate(chunks):
             print(f"    [{i}] {c[:80]}{'...' if len(c) > 80 else ''}")
 
-
         print("\n Step 2: NLI classification ")
         allowed_chunks, forbidden_chunks = cbac._classify_chunks(chunks)
         print(f"  Allowed:   {len(allowed_chunks)} chunks")
@@ -96,14 +94,14 @@ async def run_lifecycle():
         for c in forbidden_chunks[:3]:
             print(f"    [F] {c[:70]}")
 
-
         print("\n Step 3: Encode embeddings ")
         encoder = cbac._get_encoder()
         all_chunks = allowed_chunks + forbidden_chunks
-        chunk_types = ["allowed"] * len(allowed_chunks) + ["forbidden"] * len(forbidden_chunks)
+        chunk_types = ["allowed"] * len(allowed_chunks) + ["forbidden"] * len(
+            forbidden_chunks
+        )
         embeddings = np.asarray(encoder.encode(all_chunks, normalize_embeddings=True))
         print(f"  Encoded {len(all_chunks)} chunks → shape {embeddings.shape}")
-
 
         print("\n Step 4: Store in Postgres ")
         policy_hash = _policy_hash(SAMPLE_POLICY)
@@ -113,7 +111,6 @@ async def run_lifecycle():
             )
         print(f"  Stored {count} chunks (hash: {policy_hash[:16]}...)")
 
-
         print("\n Step 5: Vector search ")
         test_queries = [
             ("read github issues", "allowed"),
@@ -121,13 +118,18 @@ async def run_lifecycle():
             ("search code in repos", "allowed"),
         ]
         for query, expected_type in test_queries:
-            query_vec = np.asarray(encoder.encode([query], normalize_embeddings=True)[0])
+            query_vec = np.asarray(
+                encoder.encode([query], normalize_embeddings=True)[0]
+            )
             async with get_session() as session:
                 results = await vector_search(session, AGENT_ID, query_vec, top_k=3)
             top = results[0] if results else None
             status = "✓" if top and top.chunk_type == expected_type else "✗"
-            print(f"  {status} \"{query}\" → [{top.chunk_type}] {top.chunk_text[:50]}... (score={top.score:.4f})" if top else f"  ✗ \"{query}\" → no results")
-
+            print(
+                f'  {status} "{query}" → [{top.chunk_type}] {top.chunk_text[:50]}... (score={top.score:.4f})'
+                if top
+                else f'  ✗ "{query}" → no results'
+            )
 
         print("\n Step 6: BM25 keyword search ")
         bm25_queries = ["GitHub issues", "credentials secrets", "branch protection"]
@@ -136,20 +138,20 @@ async def run_lifecycle():
                 results = await bm25_search(session, AGENT_ID, query, top_k=3)
             top = results[0] if results else None
             if top:
-                print(f"  \"{query}\" → [{top.chunk_type}] score={top.score:.4f} | {top.chunk_text[:50]}...")
+                print(
+                    f'  "{query}" → [{top.chunk_type}] score={top.score:.4f} | {top.chunk_text[:50]}...'
+                )
             else:
-                print(f"  \"{query}\" → no BM25 results")
-
+                print(f'  "{query}" → no BM25 results')
 
         print("\n Step 7: Hybrid search (RRF) ")
         query = "read github issues"
         query_vec = np.asarray(encoder.encode([query], normalize_embeddings=True)[0])
         async with get_session() as session:
             results = await hybrid_search(session, AGENT_ID, query_vec, query, top_k=5)
-        print(f"  Query: \"{query}\"")
+        print(f'  Query: "{query}"')
         for r in results:
             print(f"    [{r.chunk_type}] rrf={r.score:.6f} | {r.chunk_text[:60]}...")
-
 
         print("\n Step 8: Tiered decision pipeline ")
         test_intents = [
@@ -160,16 +162,22 @@ async def run_lifecycle():
         ]
         for intent, expectation in test_intents:
             async with get_session() as session:
-                decision, reason, _error_code, policy_score = await cbac._tiered_decision(
-                    session, AGENT_ID, intent
-                )
-            icon = "✓" if ("allow" in expectation and decision == "allow") or \
-                         ("deny" in expectation and decision == "deny") else "?"
-            print(f"  {icon} \"{intent}\"")
+                (
+                    decision,
+                    reason,
+                    _error_code,
+                    policy_score,
+                ) = await cbac._tiered_decision(session, AGENT_ID, intent)
+            icon = (
+                "✓"
+                if ("allow" in expectation and decision == "allow")
+                or ("deny" in expectation and decision == "deny")
+                else "?"
+            )
+            print(f'  {icon} "{intent}"')
             score_str = f"{policy_score:.4f}" if policy_score is not None else "N/A"
             print(f"      → {decision} (score={score_str}) | {reason[:80]}")
 
-        
         print("\n Cleanup ")
         async with get_session() as session:
             await delete_policy_chunks(session, AGENT_ID)

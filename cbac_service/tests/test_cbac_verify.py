@@ -35,7 +35,7 @@ def make_verify_cbac(
 ):
     """CBAC instance with the policy pipeline stubbed out (no NLI/encoder model
     load), so it deterministically falls through Tier 1/2/3 to Tier 3's
-    no-backend "advise" — leaving `hallucination_score` as the only real model
+    no-backend "deny" — leaving `hallucination_score` as the only real model
     call, which is the thing under test here.
     """
     cbac = CBAC(provenance=_make_provenance(tmp_path, policy_text))
@@ -86,7 +86,7 @@ def test_hallucination_score_attached_when_reached(
             user_intent="Please show me the pull requests",
         )
     )
-    assert result.decision == "advise"
+    assert result.decision == "deny"
     assert result.hallucination_score is not None
     assert 0.0 <= result.hallucination_score <= 1.0
     # Check-1 always runs when user_intent is supplied, so intent_score is set...
@@ -109,7 +109,7 @@ def test_hallucination_score_none_without_user_intent(
             user_intent=None,
         )
     )
-    assert result.decision == "advise"
+    assert result.decision == "deny"
     assert result.hallucination_score is None
     assert result.intent_score is None
 
@@ -131,7 +131,7 @@ def test_hallucination_scoring_failure_does_not_change_decision(
             user_intent="Please show me the pull requests",
         )
     )
-    assert result.decision == "advise"
+    assert result.decision == "deny"
     assert result.hallucination_score is None
 
 
@@ -194,7 +194,7 @@ def test_hallucination_score_not_computed_on_early_hard_fail(
 
 
 def test_reached_decision_folds_trust(rows, decisions, tmp_path, monkeypatch):
-    """A decision — here the Tier-3 'advise' gray zone — writes one row and
+    """A decision — here the Tier-3 no-backend gray zone — writes one row and
     stamps the resulting trust onto the result. No second call needed."""
     cbac = make_verify_cbac(tmp_path, monkeypatch)
     result = asyncio.run(
@@ -206,7 +206,7 @@ def test_reached_decision_folds_trust(rows, decisions, tmp_path, monkeypatch):
             **CALLEE,
         )
     )
-    assert result.decision == "advise"
+    assert result.decision == "deny"
     assert result.trust is not None
     assert 0.0 <= result.trust <= 1.0
     assert len(rows) == 1
@@ -253,7 +253,7 @@ def test_no_callee_name_folds_no_trust_but_is_audited(
             session=None, agent_id=AGENT_ID, intended_action="read pull requests"
         )
     )
-    assert result.decision == "advise"
+    assert result.decision == "deny"
     assert result.trust is None
     assert rows == []
     assert len(decisions) == 1
@@ -296,7 +296,7 @@ def test_trust_failure_does_not_change_decision(rows, decisions, tmp_path, monke
             **CALLEE,
         )
     )
-    assert result.decision == "advise"
+    assert result.decision == "deny"
     assert result.trust is None
 
 
@@ -415,6 +415,6 @@ def test_record_failure_does_not_change_decision(
         )
     )
 
-    assert result.decision == "advise"
+    assert result.decision == "deny"
     assert result.trust is not None  # trust fold still happened
     assert decisions == []

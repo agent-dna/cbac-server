@@ -6,9 +6,14 @@ touches the database or the decision pipeline — the pipeline's own types live
 in ``skills.py``.
 """
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
+
+# One request may not ask about more agents than this. A batch read fans out to
+# one indexed query, so the ceiling is about bounding the response, not the
+# lookup.
+MAX_LHI_AGENTS = 200
 
 
 class AuthorizeRequest(BaseModel):
@@ -40,3 +45,17 @@ class PrecomputePolicyRequest(BaseModel):
 
     agent_id: str
     policy: str | None = None
+
+
+class LHIScoresRequest(BaseModel):
+    """Ask for the current trust of a batch of agents.
+
+    A batch rather than one id per call because the caller is typically a
+    dashboard rendering a whole fleet, and per-agent round trips are what it
+    is trying to avoid.
+    """
+
+    agent_ids: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1)]],
+        Field(min_length=1, max_length=MAX_LHI_AGENTS),
+    ]

@@ -16,13 +16,18 @@ from sqlalchemy import text
 
 from cbac_service.cbac import CBAC
 from cbac_service.db.engine import close_db, get_session
-from cbac_service.db.models import CBACDecision
+from cbac_service.db.models import CBACDecision, LHIRecord
 from cbac_service.db.repository import (
     get_cbac_decision,
     get_cbac_decision_by_hash,
     get_cbac_decisions,
+    get_latest_trust_for_agents,
 )
-from cbac_service.entity import AuthorizeRequest, PrecomputePolicyRequest
+from cbac_service.entity import (
+    AuthorizeRequest,
+    LHIScoresRequest,
+    PrecomputePolicyRequest,
+)
 from cbac_service.logging_config import setup_logging
 from cbac_service.skills import render_intent
 
@@ -348,6 +353,53 @@ async def read_cbac_decision_by_hash(interaction_hash: str) -> JSONResponse:
             status_code=404,
         )
     return api_response(data=_decision_json(record))
+
+
+def _lhi_record_json(record: LHIRecord) -> dict:
+    """Serialize one trust-history row for the wire — the edge fields
+    (agent_id) are omitted since the caller already keys the response by them."""
+    return {
+        "callee_name": record.callee_name,
+        "callee_type": record.callee_type,
+        "intent_score": record.intent_score,
+        "policy_score": record.policy_score,
+        "hallucination_score": record.hallucination_score,
+        "trust": record.trust,
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+@router.post("/lhi-scores")
+async def read_lhi_scores(body: LHIScoresRequest) -> JSONResponse:
+    """Current trust for a batch of agents, one entry per caller→callee edge.
+
+    Trust is tracked per (agent_id, callee_name, callee_type) edge (see the
+    LHI section in CLAUDE.md), not per agent, so an agent with several
+    callees comes back with several edges. An agent with no history yet is
+    still a key in the response, mapped to an empty list, rather than
+    omitted — the caller doesn't have to distinguish "no history" from
+    "didn't ask".
+
+    A POST for what is a read because the batch of ids is the request body;
+    a fleet dashboard's id list does not belong in a query string.
+    """
+    try:
+        async with get_session() as session:
+            records = await get_latest_trust_for_agents(
+                session, agent_ids=body.agent_ids
+            )
+    except Exception as exc:
+        return api_response(message=str(exc), success=False, status_code=500)
+
+    agents: dict[str, list[dict]] = {agent_id: [] for agent_id in body.agent_ids}
+    for record in records:
+        agents[record.agent_id].append(_lhi_record_json(record))
+
+    edges = sum(len(v) for v in agents.values())
+    return api_response(
+        data={"agents": agents},
+        message=f"{edges} trust edge(s) across {len(agents)} agent(s)",
+    )
 
 
 @router.post("/policies/precompute")

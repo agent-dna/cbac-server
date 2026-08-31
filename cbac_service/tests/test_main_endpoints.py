@@ -15,7 +15,12 @@ from fastapi.testclient import TestClient
 from cbac_service import error_codes as ec
 from cbac_service import main
 from cbac_service.cbac import CBACResult
-from cbac_service.entity import AuthorizeRequest, PrecomputePolicyRequest
+from cbac_service.entity import (
+    MAX_LHI_AGENTS,
+    AuthorizeRequest,
+    LHIScoresRequest,
+    PrecomputePolicyRequest,
+)
 
 
 def stub_request(body):
@@ -399,6 +404,101 @@ def test_read_decision_404s_when_absent(monkeypatch):
     assert response.status_code == 404
     assert envelope(response)["success"] is False
     assert "999" in envelope(response)["message"]
+
+
+# ── LHI trust scores ──────────────────────────────────────────────────────────
+
+
+def lhi_row(
+    agent_id="did:agent", callee_name="github_tool", callee_type="tool", **overrides
+):
+    fields = {
+        "agent_id": agent_id,
+        "callee_name": callee_name,
+        "callee_type": callee_type,
+        "intent_score": 0.9,
+        "policy_score": 0.8,
+        "hallucination_score": 0.95,
+        "trust": 0.87,
+        "created_at": datetime(2026, 8, 17, 9, 14, 22, tzinfo=timezone.utc),
+    }
+    return SimpleNamespace(**{**fields, **overrides})
+
+
+def install_lhi_repository(monkeypatch, calls=None, records=()):
+    @asynccontextmanager
+    async def _fake_get_session():
+        yield SimpleNamespace()
+
+    async def fake_get_latest_trust_for_agents(session, agent_ids):
+        if calls is not None:
+            calls.append(list(agent_ids))
+        return list(records)
+
+    monkeypatch.setattr(main, "get_session", _fake_get_session)
+    monkeypatch.setattr(
+        main, "get_latest_trust_for_agents", fake_get_latest_trust_for_agents
+    )
+
+
+def test_lhi_scores_groups_edges_by_agent(monkeypatch):
+    install_lhi_repository(
+        monkeypatch,
+        records=[
+            lhi_row("did:a", callee_name="github_tool"),
+            lhi_row("did:a", callee_name="slack_tool", trust=0.5),
+            lhi_row("did:b"),
+        ],
+    )
+    response = asyncio.run(
+        main.read_lhi_scores(LHIScoresRequest(agent_ids=["did:a", "did:b"]))
+    )
+
+    payload = envelope(response)["data"]
+    assert {e["callee_name"] for e in payload["agents"]["did:a"]} == {
+        "github_tool",
+        "slack_tool",
+    }
+    assert len(payload["agents"]["did:b"]) == 1
+    assert payload["agents"]["did:b"][0]["trust"] == 0.87
+
+
+def test_lhi_scores_includes_agents_with_no_history(monkeypatch):
+    """An agent with no trust record yet is still a key, mapped to []."""
+    install_lhi_repository(monkeypatch, records=[lhi_row("did:a")])
+    response = asyncio.run(
+        main.read_lhi_scores(LHIScoresRequest(agent_ids=["did:a", "did:no-history"]))
+    )
+
+    assert envelope(response)["data"]["agents"]["did:no-history"] == []
+
+
+def test_lhi_scores_forwards_requested_ids(monkeypatch):
+    calls = []
+    install_lhi_repository(monkeypatch, calls=calls)
+    asyncio.run(main.read_lhi_scores(LHIScoresRequest(agent_ids=["did:a", "did:b"])))
+
+    assert calls == [["did:a", "did:b"]]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},  # agent_ids is required
+        {"agent_ids": []},  # ...and must not be empty
+        {"agent_ids": "did:agent"},  # ...and must be a list, not a string
+        {"agent_ids": ["did:a", 42]},  # entries must be strings
+        {"agent_ids": ["did:a", ""]},  # ...and not blank
+        {"agent_ids": [f"did:{i}" for i in range(MAX_LHI_AGENTS + 1)]},  # too many
+    ],
+)
+def test_lhi_scores_rejects_bad_batch(body):
+    """Schema-enforced now, so this goes over the real request path — and the
+    engine is deliberately not stubbed: nothing may reach it."""
+    response = TestClient(main.app).post(f"{main.API_PREFIX}/lhi-scores", json=body)
+
+    assert response.status_code == 422
+    assert response.json()["success"] is False
 
 
 def _recording_precompute(calls, result=7):

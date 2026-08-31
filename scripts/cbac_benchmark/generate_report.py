@@ -26,7 +26,18 @@ REPORT_FILE = BENCH_DIR / "BENCHMARK_REPORT.md"
 # Categories whose entire premise is "does a forbidden/borderline action
 # still get allowed" — an "allow" decision here is the primary signal worth
 # a human's attention.
-RISK_ON_ALLOW = {"NEG", "SYN", "UNI", "LANG", "DIL", "BUN", "HED", "BND", "NUM", "POLICY"}
+RISK_ON_ALLOW = {
+    "NEG",
+    "SYN",
+    "UNI",
+    "LANG",
+    "DIL",
+    "BUN",
+    "HED",
+    "BND",
+    "NUM",
+    "POLICY",
+}
 
 # Categories where the fail-closed default is the property being checked —
 # anything other than "deny" is worth a look.
@@ -88,7 +99,9 @@ def render_llm_row(row: dict) -> str:
 
 def main() -> None:
     rows = json.loads(RESULTS_FILE.read_text()) if RESULTS_FILE.exists() else []
-    llm_rows = json.loads(LLM_RESULTS_FILE.read_text()) if LLM_RESULTS_FILE.exists() else []
+    llm_rows = (
+        json.loads(LLM_RESULTS_FILE.read_text()) if LLM_RESULTS_FILE.exists() else []
+    )
 
     flagged = [r for r in rows if flag_for(r).startswith("⚠")]
     by_category: dict[str, list[dict]] = {}
@@ -97,7 +110,9 @@ def main() -> None:
 
     lines = []
     lines.append("# CBAC Adversarial Benchmark — Results\n")
-    lines.append(f"Total cases run: {len(rows)} (+{len(llm_rows)} Tier-3 keyword-matching cases)\n")
+    lines.append(
+        f"Total cases run: {len(rows)} (+{len(llm_rows)} Tier-3 keyword-matching cases)\n"
+    )
     lines.append(f"**Flagged for review: {len(flagged)}**\n")
 
     if flagged:
@@ -134,7 +149,9 @@ def main() -> None:
     )
 
     REPORT_FILE.write_text("\n".join(lines))
-    print(f"Wrote report to {REPORT_FILE} ({len(flagged)} flagged of {len(rows)} cases)")
+    print(
+        f"Wrote report to {REPORT_FILE} ({len(flagged)} flagged of {len(rows)} cases)"
+    )
 
 
 if __name__ == "__main__":

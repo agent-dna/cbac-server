@@ -70,7 +70,9 @@ def build_gray_zone_cbac(llm_backend) -> CBAC:
         "contradiction": 0.0,
     }
 
-    async def _search(session, agent_id, intent_vec, *args, chunk_type="allowed", **kwargs):
+    async def _search(
+        session, agent_id, intent_vec, *args, chunk_type="allowed", **kwargs
+    ):
         # Equal scores both sides -> Tier 1 gap == 0 -> escalates to Tier 2.
         return [SimpleNamespace(score=0.5, chunk_text=f"{chunk_type} chunk")]
 
@@ -128,7 +130,9 @@ async def run() -> None:
         decision, reason, error_code, policy_score = await cbac._tiered_decision(
             session=None, agent_id="benchmark:llm-tier3", intent_text="the request text"
         )
-        print(f"[{case_id}] backend={backend_desc}\n  -> decision={decision} | {reason} | error_code={error_code}")
+        print(
+            f"[{case_id}] backend={backend_desc}\n  -> decision={decision} | {reason} | error_code={error_code}"
+        )
         results.append(
             {
                 "id": case_id,

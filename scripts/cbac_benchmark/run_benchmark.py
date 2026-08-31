@@ -122,7 +122,9 @@ async def run() -> None:
     # DETERM-02 needs a second, cosmetically-different copy of whichever
     # policy DETERM-01 uses, registered under its own agent_id.
     determ01 = next(c for c in cases if c["id"] == "DETERM-01")
-    determ_variant_agent = agent_id_for_policy(determ01["policy_file"]) + "::reformatted"
+    determ_variant_agent = (
+        agent_id_for_policy(determ01["policy_file"]) + "::reformatted"
+    )
     policy_by_agent[determ_variant_agent] = reformatted_variant(
         policy_texts[determ01["policy_file"]]
     )
@@ -164,7 +166,9 @@ async def run() -> None:
                     callee_type="tool",
                 )
 
-            print(f"[{case['id']:16s}] {case['category']:6s} -> {result.decision:6s} | {result.reason[:90]}")
+            print(
+                f"[{case['id']:16s}] {case['category']:6s} -> {result.decision:6s} | {result.reason[:90]}"
+            )
 
             results.append(
                 {
@@ -194,10 +198,13 @@ async def run() -> None:
                 "id": "DETERM-02",
                 "category": "DETERM",
                 "policy_file": determ01["policy_file"] + " (reformatted)",
-                "hypothesis": next(c for c in cases if c["id"] == "DETERM-02")["hypothesis"].strip(),
+                "hypothesis": next(c for c in cases if c["id"] == "DETERM-02")[
+                    "hypothesis"
+                ].strip(),
                 **asdict(variant_result),
                 "compare_to": "DETERM-01",
-                "same_decision_as_original": variant_result.decision == original["decision"],
+                "same_decision_as_original": variant_result.decision
+                == original["decision"],
             }
         )
 

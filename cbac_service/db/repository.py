@@ -239,6 +239,34 @@ async def insert_lhi_record(
     return record
 
 
+async def get_latest_trust_for_agents(
+    session: AsyncSession,
+    agent_ids: Sequence[str],
+) -> Sequence[LHIRecord]:
+    """Latest trust record per (agent_id, callee_name, callee_type) edge, for
+    a batch of agents in one round trip.
+
+    Trust is tracked per edge, not per agent — an agent with several callees
+    comes back with several rows. An agent with no history at all is simply
+    absent from the result; the caller fills in the gap.
+    """
+    if not agent_ids:
+        return []
+    stmt = (
+        select(LHIRecord)
+        .distinct(LHIRecord.agent_id, LHIRecord.callee_name, LHIRecord.callee_type)
+        .where(LHIRecord.agent_id.in_(agent_ids))
+        .order_by(
+            LHIRecord.agent_id,
+            LHIRecord.callee_name,
+            LHIRecord.callee_type,
+            LHIRecord.id.desc(),
+        )
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
 async def get_trust_history(
     session: AsyncSession,
     agent_id: str,
