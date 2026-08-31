@@ -1,8 +1,6 @@
-import base64
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from uuid import uuid4
 
 import structlog
@@ -43,54 +41,21 @@ _cbac: CBAC | None = None
 REQUIRE_CONTEXT = os.environ.get("CBAC_REQUIRE_CONTEXT", "true").lower() == "true"
 
 
-# TODO:- Remove it.
-class _LocalPolicyProvenance:
-    """Policy source backed by ``<dir>/{agent_id}.md`` instead of the chain.
-
-    Enabled by ``CBAC_LOCAL_POLICY_DIR``. Lets the service decide against a
-    policy file with no Provenance Layer key — which is what ``examples/``
-    needs to be runnable. Card writes are no-ops; LHI records still persist
-    to Postgres, they just are not mirrored on-chain.
-
-    ponytail: duck-types the four ``Provenance`` members ``CBAC`` actually
-    calls, rather than subclassing it.
-    """
-
-    def __init__(self, directory: Path) -> None:
-        self._dir = directory
-
-    def get_latest_provenance_record(self, actor_id: str) -> dict[str, Any]:
-        """Return an AgentCard-shaped dict whose policy is the file's text."""
-        text = (self._dir / f"{actor_id}.md").read_text(encoding="utf-8")
-        return {
-            "type": "agent",
-            "id": actor_id,
-            "metadata": {},
-            "policy": base64.b64encode(text.encode()).decode(),
-        }
-
-    def create_new_provenance_card(self, card_id: str, card_info: Any) -> None:
-        return None
-
-    def append_to_provenance_card(self, card_id: str, card_info: Any) -> None:
-        return None
-
-
-def _make_provenance() -> Provenance:
-    local_dir = os.environ.get("CBAC_LOCAL_POLICY_DIR")
-    if local_dir:
-        logger.info("using local policy directory", directory=local_dir)
-        return cast(Provenance, _LocalPolicyProvenance(Path(local_dir)))
-    return Provenance(
-        name="cbac-service",
-        api_key=os.environ.get("AGENTDNA_API_KEY", ""),
-    )
-
-
 def _get_cbac() -> CBAC:
+    """The decision engine, built on first use.
+
+    Policy always comes from the Provenance Layer. A harness that has to decide
+    against policy from somewhere else assigns its own engine to ``_cbac``
+    before the first request
+    """
     global _cbac
     if _cbac is None:
-        _cbac = CBAC(provenance=_make_provenance())
+        _cbac = CBAC(
+            provenance=Provenance(
+                name="cbac-service",
+                api_key=os.environ.get("AGENTDNA_API_KEY", ""),
+            )
+        )
     return _cbac
 
 

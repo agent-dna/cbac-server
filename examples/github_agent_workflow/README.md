@@ -168,6 +168,8 @@ agent.py                    the agent + the (CBAC-unaware) MCP server
 agent_check.py              drives every path directly and asserts — no LLM
 gateway.py                  the CBAC gateway — the enforcement point, fronting
                             github-mcp and the public mcp.deepwiki.com
+service.py                  the CBAC decision service, started against the
+                            policy files below instead of the Provenance Layer
 policies/github-worker.md   the policy CBAC decides against
 requirements.txt
 .env.sample
@@ -184,13 +186,19 @@ cd cbac_service && docker compose up -d && alembic upgrade head && cd ..
 
 DATABASE_URL="postgresql+asyncpg://cbac_user:cbac_pass@localhost:5432/cbac" \
 HYBRID_SEARCH_ENABLED=true \
-CBAC_LOCAL_POLICY_DIR=$PWD/examples/github_agent_workflow/policies \
-  uv run uvicorn cbac_service.main:app --port 8767
+  uv run python examples/github_agent_workflow/service.py
 ```
 
-`CBAC_LOCAL_POLICY_DIR` is what makes this demo standalone: the service reads
-`<dir>/{agent_id}.md` instead of resolving the policy from the Provenance
-Layer. Leave it unset and the service behaves exactly as it does in production.
+`service.py` is what makes this demo standalone. It starts the real
+`cbac_service` app — same pipeline, same endpoints, same Postgres — with one
+substitution: policy is read from `policies/{agent_id}.md` instead of resolved
+from the Provenance Layer, which would need an API key and a registered actor
+id. The substitution lives in the demo, not in the service: run
+`uvicorn cbac_service.main:app` directly and you get the production behaviour,
+because that is the only policy source the service itself knows.
+
+Run it from the **repo root** with the root venv — the service's ML
+dependencies live there, not in this directory's venv.
 
 `HYBRID_SEARCH_ENABLED=true` turns on Tier 2's BM25 fusion. The compose image
 is built from `Dockerfile.postgres` and ships `pg_textsearch`, so it works;

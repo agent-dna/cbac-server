@@ -89,7 +89,7 @@ THIRDPARTY_REPO = os.environ.get(
 
 CBAC_URL = os.environ.get("CBAC_URL", "http://127.0.0.1:8767")
 # Whose policy is checked. Matches policies/<CBAC_AGENT_ID>.md when the service
-# runs with CBAC_LOCAL_POLICY_DIR; an on-chain actor id otherwise.
+# runs from service.py; an on-chain actor id otherwise.
 CBAC_AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
 # A cold service loads three transformer models on the first request.
 CBAC_TIMEOUT = float(os.environ.get("CBAC_TIMEOUT", "600"))
