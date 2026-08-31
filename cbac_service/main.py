@@ -8,8 +8,10 @@ from uuid import uuid4
 import structlog
 import uvicorn
 from agentdna.provenance import Provenance
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import APIRouter, FastAPI, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from cbac_service.cbac import CBAC
@@ -20,7 +22,9 @@ from cbac_service.db.repository import (
     get_cbac_decision_by_hash,
     get_cbac_decisions,
 )
+from cbac_service.entity import AuthorizeRequest, PrecomputePolicyRequest
 from cbac_service.logging_config import setup_logging
+from cbac_service.skills import render_intent
 
 # ── App lifecycle ──────────────────────────────────────────────────────────────
 
@@ -85,13 +89,36 @@ def _get_cbac() -> CBAC:
     return _cbac
 
 
-def _bind_request_context(body: dict) -> None:
+def _bind_request_context(agent_id: str) -> None:
     """Bind the request identity so every log line from the decision pipeline
     below carries it without threading it through the call chain."""
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(
         request_id=uuid4().hex[:12],
-        agent_id=body.get("agent_id", ""),
+        agent_id=agent_id,
+    )
+
+
+# ── Wire format ────────────────────────────────────────────────────────────────
+
+
+def api_response(
+    data: Any = None,
+    message: str = "",
+    success: bool = True,
+    status_code: int = 200,
+) -> JSONResponse:
+    """Every response this service sends: ``{success, message, data}``.
+
+    ``success`` says the request was *processed*, never what the answer was. On
+    ``/authorize`` in particular a deny is a perfectly successful call — the
+    verdict is ``data.decision``, and reading ``success`` as "allowed" would
+    invert the gate. ``message`` is prose for a human; ``data`` is what a
+    program reads.
+    """
+    return JSONResponse(
+        {"success": success, "message": message, "data": data},
+        status_code=status_code,
     )
 
 
@@ -104,43 +131,89 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+API_PREFIX = "/cbac/v1"
+router = APIRouter(prefix=API_PREFIX)
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
+@app.exception_handler(RequestValidationError)
+async def on_validation_error(request: Request, exc: RequestValidationError):
+    """Malformed bodies and query params answer in the same envelope as
+    everything else, rather than in FastAPI's own error shape."""
+    return api_response(
+        # jsonable_encoder because an error's ``ctx`` can hold the original
+        # exception object, which json.dumps cannot serialize.
+        data={"errors": jsonable_encoder(exc.errors())},
+        message="request validation failed",
+        success=False,
+        status_code=422,
+    )
+
+
 @app.get("/health")
-async def health():
+async def health() -> JSONResponse:
     """Basic healthcheck — verifies DB connectivity."""
     try:
         async with get_session() as session:
             await session.execute(text("SELECT 1"))
-        return JSONResponse({"status": "ok"})
+        return api_response(data={"status": "ok"}, message="ok")
     except Exception as exc:
-        return JSONResponse({"status": "error", "detail": str(exc)}, status_code=503)
+        return api_response(
+            data={"status": "error"},
+            message=str(exc),
+            success=False,
+            status_code=503,
+        )
 
 
-@app.post("/authorize-cbac")
-async def authorize_cbac(request: Request) -> PlainTextResponse:
+def _intended_action(body: AuthorizeRequest) -> Any:
+    """The action text to score, rendered here unless the caller pre-rendered it.
+
+    An enforcement point sends mechanical facts — ``callee_name``,
+    ``arguments``, ``callee_description`` — and this phrases them, so every PEP
+    asks about the same call in the same words no matter what protocol it
+    speaks or language it is written in. The tiers score prose, so the wording
+    is part of the decision and belongs next to the models it was tuned for.
+
+    ``intended_action`` wins when supplied, and is the whole body a caller
+    needs: it covers both a caller with phrasing of its own
+    (``cbac_guard(action_intent=...)``) and a bare probe like the ``curl``
+    examples, which have a sentence and nothing to render from.
+    """
+    if body.intended_action is not None or not body.callee_name:
+        return body.intended_action
+    return render_intent(body.callee_name, body.arguments, body.callee_description)
+
+
+@router.post("/authorize")
+async def authorize_cbac(body: AuthorizeRequest) -> JSONResponse:
     """Decide whether an agent may perform an intended action.
 
-    The body carries the reason and ``X-CBAC-Decision`` the verdict — that is
-    the whole wire contract. The component scores stay server-side: reaching a
-    decision also folds them into the (agent → callee) trust score, so there is
-    no second call for the caller to make and no score to round-trip.
+    ``data.decision`` is the verdict — ``"allow" | "deny" | "advise" |
+    "error"`` — and ``message`` is the reason behind it. The component scores
+    stay server-side: reaching a decision also folds them into the (agent →
+    callee) trust score, so there is no second call for the caller to make and
+    no score to round-trip.
+
+    Always HTTP 200, including the fail-closed ``"error"`` verdict, because a
+    decision *was* reached and the caller acts on it. A 5xx would invite the
+    retry that a decision must not have: the trust fold is not idempotent, so
+    a retried call counts the same evidence twice.
     """
-    body = await request.json()
-    _bind_request_context(body)
+    _bind_request_context(body.agent_id)
 
     try:
         async with get_session() as session:
             result = await _get_cbac().verify_cbac(
                 session=session,
-                agent_id=body.get("agent_id", ""),
-                intended_action=body.get("intended_action"),
-                user_intent=body.get("user_intent"),
-                callee_name=body.get("callee_name", ""),
-                callee_type=body.get("callee_type", "tool"),
+                agent_id=body.agent_id,
+                intended_action=_intended_action(body),
+                user_intent=body.user_intent,
+                callee_name=body.callee_name,
+                callee_type=body.callee_type,
             )
-        decision, reason = result.decision, result.reason
+        decision, reason, error_code = result.decision, result.reason, result.error_code
         logger.info(
             "cbac decision",
             decision=decision,
@@ -151,10 +224,19 @@ async def authorize_cbac(request: Request) -> PlainTextResponse:
             trust=result.trust,
         )
     except Exception as exc:
-        decision, reason = "error", str(exc)
+        decision, reason, error_code = "error", str(exc), None
         logger.exception("cbac authorization failed")
 
-    return PlainTextResponse(reason, headers={"X-CBAC-Decision": decision})
+    response = api_response(
+        data={"decision": decision, "error_code": error_code},
+        message=reason,
+        # The gate ran and answered; the answer itself lives in data.decision.
+        success=decision != "error",
+    )
+    # Also a header, so a proxy or access log can route on the verdict without
+    # parsing a body. The body stays authoritative.
+    response.headers["X-CBAC-Decision"] = decision
+    return response
 
 
 MAX_DECISION_LIMIT = 500
@@ -177,32 +259,20 @@ def _decision_json(record: CBACDecision) -> dict:
     }
 
 
-@app.get("/cbac-decisions")
-async def list_cbac_decisions(request: Request) -> JSONResponse:
+@router.get("/decisions")
+async def list_cbac_decisions(
+    agent_id: str = Query(..., min_length=1),
+    limit: int = Query(100, ge=1),
+    offset: int = Query(0, ge=0),
+) -> JSONResponse:
     """Past authorization verdicts for one agent, newest first.
 
     Every decision is here — including the ones that never reached the trust
     fold (no callee, or an infrastructure-failure deny), which is what makes
     this the audit log rather than ``lhi_records``.
     """
-    params = request.query_params
-    agent_id = params.get("agent_id", "")
-    if not agent_id:
-        return JSONResponse({"error": "agent_id is required"}, status_code=400)
-
-    try:
-        limit = int(params.get("limit", "100"))
-        offset = int(params.get("offset", "0"))
-    except ValueError:
-        return JSONResponse(
-            {"error": "limit and offset must be integers"}, status_code=400
-        )
-    if limit < 1 or offset < 0:
-        return JSONResponse(
-            {"error": "limit must be >= 1 and offset >= 0"}, status_code=400
-        )
     # Clamped rather than rejected: a caller asking for everything gets a large
-    # page, not a 400 it has to learn about.
+    # page, not a 422 it has to learn about.
     limit = min(limit, MAX_DECISION_LIMIT)
 
     try:
@@ -211,34 +281,41 @@ async def list_cbac_decisions(request: Request) -> JSONResponse:
                 session, agent_id=agent_id, limit=limit, offset=offset
             )
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return api_response(message=str(exc), success=False, status_code=500)
 
     decisions = [_decision_json(record) for record in records]
-    return JSONResponse(
-        {"agent_id": agent_id, "decisions": decisions, "count": len(decisions)}
+    return api_response(
+        data={
+            "agent_id": agent_id,
+            "decisions": decisions,
+            "count": len(decisions),
+        },
+        message=f"{len(decisions)} decision(s) for {agent_id}",
     )
 
 
-@app.get("/cbac-decisions/{decision_id}")
+@router.get("/decisions/{decision_id}")
 async def read_cbac_decision(decision_id: int) -> JSONResponse:
     """One authorization verdict by id."""
     try:
         async with get_session() as session:
             record = await get_cbac_decision(session, decision_id=decision_id)
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return api_response(message=str(exc), success=False, status_code=500)
 
     if record is None:
-        return JSONResponse({"error": f"no decision {decision_id}"}, status_code=404)
-    return JSONResponse(_decision_json(record))
+        return api_response(
+            message=f"no decision {decision_id}", success=False, status_code=404
+        )
+    return api_response(data=_decision_json(record))
 
 
-@app.get("/cbac-decisions/by-hash/{interaction_hash}")
+@router.get("/decisions/by-hash/{interaction_hash}")
 async def read_cbac_decision_by_hash(interaction_hash: str) -> JSONResponse:
     """One authorization verdict by its ``interaction_hash``.
 
     For a middleware dashboard that already holds the hash from a prior
-    ``/authorize-cbac`` call (or from streaming ``cbac_decisions`` some other
+    ``/cbac/v1/authorize`` call (or from streaming ``cbac_decisions`` some other
     way) and wants the full row back without knowing the numeric ``id``.
 
     ``interaction_hash`` is sha256 hex (64 lowercase hex chars) — rejected
@@ -250,8 +327,10 @@ async def read_cbac_decision_by_hash(interaction_hash: str) -> JSONResponse:
     if len(interaction_hash) != 64 or any(
         c not in "0123456789abcdef" for c in interaction_hash.lower()
     ):
-        return JSONResponse(
-            {"error": "interaction_hash must be 64 hex characters"}, status_code=400
+        return api_response(
+            message="interaction_hash must be 64 hex characters",
+            success=False,
+            status_code=400,
         )
 
     try:
@@ -260,44 +339,44 @@ async def read_cbac_decision_by_hash(interaction_hash: str) -> JSONResponse:
                 session, interaction_hash=interaction_hash.lower()
             )
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return api_response(message=str(exc), success=False, status_code=500)
 
     if record is None:
-        return JSONResponse(
-            {"error": f"no decision with interaction_hash {interaction_hash}"},
+        return api_response(
+            message=f"no decision with interaction_hash {interaction_hash}",
+            success=False,
             status_code=404,
         )
-    return JSONResponse(_decision_json(record))
+    return api_response(data=_decision_json(record))
 
 
-@app.post("/precompute-policy")
-async def precompute_policy(request: Request) -> JSONResponse:
+@router.post("/policies/precompute")
+async def precompute_policy(body: PrecomputePolicyRequest) -> JSONResponse:
     """Precompute and cache policy embeddings for an agent.
 
     Call this after deploying or updating an agent's policy card. Supply
     ``policy`` (the decoded policy text) to embed that instead of reading the
     agent's card from the Provenance Layer.
     """
-    body = await request.json()
-    agent_id = body.get("agent_id", "")
-    policy = body.get("policy")
-
-    if not agent_id:
-        return JSONResponse({"error": "agent_id is required"}, status_code=400)
-    if policy is not None and not isinstance(policy, str):
-        return JSONResponse({"error": "policy must be a string"}, status_code=400)
+    _bind_request_context(body.agent_id)
 
     try:
         async with get_session() as session:
             count = await _get_cbac().index_policy(
                 session=session,
-                agent_id=agent_id,
-                policy=policy,
+                agent_id=body.agent_id,
+                policy=body.policy,
             )
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return api_response(message=str(exc), success=False, status_code=500)
 
-    return JSONResponse({"agent_id": agent_id, "chunks_stored": count})
+    return api_response(
+        data={"agent_id": body.agent_id, "chunks_stored": count},
+        message=f"indexed {count} chunk(s) for {body.agent_id}",
+    )
+
+
+app.include_router(router)
 
 
 if __name__ == "__main__":

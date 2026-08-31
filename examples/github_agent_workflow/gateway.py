@@ -11,7 +11,7 @@ this depends on the agent, the framework, or the upstream server cooperating:
     agent ──MCP──> gateway (PEP) ──MCP──┤     (local stand-in)
                       │                 └─> mcp.deepwiki.com
                       │                       (real third party)
-                      └── POST /authorize-cbac  (CBAC decision service)
+                      └── POST /cbac/v1/authorize  (CBAC decision service)
 
 Why here and not in the agent process: an interceptor inside the agent is
 opt-in, and a security control the developer can delete is not a control. The

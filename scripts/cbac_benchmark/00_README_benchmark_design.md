@@ -74,4 +74,4 @@ Each entry in `intents.yaml` has: `id`, `category`, `policy_file`,
 
 This corpus assumes a `cbac-server` instance with these policies loaded per
 agent (one agent per fixture is simplest) and calls `verify_cbac` or
-`POST /authorize-cbac` 
+`POST /cbac/v1/authorize` 

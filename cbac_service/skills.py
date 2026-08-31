@@ -175,6 +175,42 @@ def _collect_text(obj: Any, *, include_keys: bool = True, _depth: int = 0) -> st
     return str(obj)
 
 
+def _action_summary(action_name: str, description: str | None = None) -> str:
+    """Verb-only prose for the intended action: "The agent wants to <verb>."
+
+    The verb phrase is the callee's own description (schema or docstring first
+    line) when available, else the de-snaked callee name. This is the prefix of
+    :func:`render_intent`'s full rendering; kept as its own function so a
+    verb-only view stays available to callers that want one.
+    """
+    verb = (description or action_name.replace("_", " ")).strip().rstrip(".")
+    return f"The agent wants to {verb[:1].lower()}{verb[1:]}."
+
+
+def render_intent(
+    action_name: str, kwargs: dict[str, Any], description: str | None = None
+) -> str:
+    """Render a call as the prose the scorers see: "The agent wants to <verb>,
+    with k = v, …".
+
+    Server-side because the phrasing *is* part of the decision function: the
+    tiers score prose, so two enforcement points that word the same call
+    differently get different verdicts. Keeping it here means an enforcement
+    point supplies only mechanical facts — callee name, arguments, description
+    — and the wording is versioned alongside the models tuned against it. An
+    enforcement point in another language needs no port of this.
+
+    NLI and the policy tiers score natural language far better than raw
+    ``tool k=v`` call syntax — snake_case names hide their verb from the NLI
+    model (measured: a direct "close" vs "do not close" contradiction scored
+    0.01 on call syntax, 0.95 as prose).
+    """
+    text = _action_summary(action_name, description).rstrip(".")
+    if kwargs:
+        text += ", with " + ", ".join(f"{k} = {v!s}" for k, v in kwargs.items())
+    return text + "."
+
+
 def _intended_action_text(intended_action: Any) -> str:
     """Flatten an intended-action of *any* shape (str / dict / list / object)
     into one string for tokenizing.

@@ -144,11 +144,25 @@ run against the container.
 
 ## Endpoints
 
+Every response is the same envelope:
+
+```json
+{"success": true, "message": "human-readable reason", "data": {}}
+```
+
+`success` says the request was **processed**, never what the answer was — an
+authorization deny is a successful call. The verdict is `data.decision`; reading
+`success` as "allowed" would invert the gate. Malformed input answers in the
+same envelope with HTTP 422 and the field errors under `data.errors`.
+
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/authorize-cbac` | The decision gate. Returns the verdict in `X-CBAC-Decision` and the reason in the body, and folds the component scores into the caller→callee trust score |
-| `POST` | `/precompute-policy` | Explicitly trigger policy embedding precomputation |
-| `GET` | `/health` | Database connectivity check |
+| `POST` | `/cbac/v1/authorize` | The decision gate. `data.decision` is `allow`/`deny`/`advise`/`error` (also mirrored in the `X-CBAC-Decision` header for proxies) and `message` the reason. Folds the component scores into the caller→callee trust score |
+| `GET` | `/cbac/v1/decisions?agent_id=&limit=&offset=` | An agent's decision history, newest first |
+| `GET` | `/cbac/v1/decisions/{id}` | One decision by id |
+| `GET` | `/cbac/v1/decisions/by-hash/{interaction_hash}` | One decision by its interaction hash |
+| `POST` | `/cbac/v1/policies/precompute` | Explicitly trigger policy embedding precomputation |
+| `GET` | `/health` | Database connectivity check. Unversioned on purpose — probes are wired once and must not track API versions |
 
 ## How a decision is made
 

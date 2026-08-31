@@ -38,7 +38,7 @@ is a markdown file the service reads from disk.
     │ MCP server to the agent,      │ ← the PEP
     │ MCP client to each upstream   │
     └───────────────┬───────────────┘
-                    │  POST /authorize-cbac
+                    │  POST /cbac/v1/authorize
                     ▼
   ┌───────────────────────────────────┐
   │   CBAC decision service   :8767   │
@@ -98,7 +98,7 @@ developer can delete is not a control. So the demo splits the job:
   (`X-CBAC-Agent-Id`) and what the user actually asked for
   (`X-CBAC-User-Intent`). `cbac_propagate` does only that. It calls no service,
   makes no decision, and cannot deny anything.
-- The gateway **decides**. It reads the label, calls `/authorize-cbac`, and
+- The gateway **decides**. It reads the label, calls `/cbac/v1/authorize`, and
   either forwards the call upstream or returns a denial.
 
 Delete `cbac_propagate` and calls still go through the gateway — they just
@@ -199,16 +199,22 @@ set it to `false` if you point `DATABASE_URL` at a plain pgvector server.
 Check it decides correctly before involving an LLM:
 
 ```bash
-curl -sD- -o /dev/null -XPOST localhost:8767/authorize-cbac \
+curl -s -XPOST localhost:8767/cbac/v1/authorize \
   -H 'content-type: application/json' \
   -d '{"agent_id":"github-worker","intended_action":"The agent wants to get a list of documentation topics for a GitHub repository, with repoName = modelcontextprotocol/python-sdk."}'
-# X-CBAC-Decision: allow
+# {"success":true,"message":"Tier 1 cosine gap 0.121 > 0.08 ...",
+#  "data":{"decision":"allow","error_code":3201}}
 
-curl -sD- -o /dev/null -XPOST localhost:8767/authorize-cbac \
+curl -s -XPOST localhost:8767/cbac/v1/authorize \
   -H 'content-type: application/json' \
   -d '{"agent_id":"github-worker","intended_action":"The agent wants to close an existing GitHub issue, with repo = owner/repo, number = 3."}'
-# X-CBAC-Decision: deny
+# {"success":true,"message":"Tier 1 cosine gap -0.182 < -0.08 ...",
+#  "data":{"decision":"deny","error_code":3202}}
 ```
+
+Note `success` is `true` on the deny: it reports that the call was *processed*,
+and the verdict is `data.decision`. The same verdict is on the
+`X-CBAC-Decision` header if you would rather not parse a body.
 
 The first call is slow — the service loads three transformer models and embeds
 the policy. Later calls hit the cached embeddings in Postgres.
@@ -326,20 +332,33 @@ Gateway → decision service, one POST per call:
 
 ```json
 {
-  "agent_id":        "github-worker",
-  "intended_action": "The agent wants to close an existing GitHub issue, with repo = owner/repo, number = 3.",
-  "user_intent":     "Close issue #3 in owner/repo",
-  "callee_name":     "github_close_issue",
-  "callee_type":     "mcp"
+  "agent_id":           "github-worker",
+  "callee_name":        "github_close_issue",
+  "callee_type":        "mcp",
+  "callee_description": "Close an existing GitHub issue.",
+  "arguments":          {"repo": "owner/repo", "number": "3"},
+  "user_intent":        "Close issue #3 in owner/repo"
 }
 ```
 
-`intended_action` is rendered as prose from the tool's own description plus the
-call's arguments — NLI scores prose far better than `close_issue(repo=...)`
-call syntax. The description survives the gateway's server-name prefixing, so
-`github_close_issue` still reads as *"close an existing GitHub issue"*; the
-prefix only shows up in `callee_name`, which is what the trust edge is keyed
-on — one edge per (agent, upstream tool), which is what you want.
+Facts, not a sentence. The service turns them into the prose its scorers
+actually see — *"The agent wants to close an existing GitHub issue, with repo =
+owner/repo, number = 3."* — because NLI scores prose far better than
+`close_issue(repo=...)` call syntax, and because the wording is therefore part
+of the decision. Rendering it service-side is what stops two enforcement points
+from wording the same call differently and getting different verdicts; it also
+means a gateway written in another language has nothing to port.
+
+`callee_description` is the tool's own description, which the gateway looks up
+locally — a client-side interceptor only has what was on the wire, and without
+the description the de-snaked name lands in the verb slot instead. It survives
+the gateway's server-name prefixing, so `github_close_issue` still reads as
+*"close an existing GitHub issue"*; the prefix only shows up in `callee_name`,
+which is what the trust edge is keyed on — one edge per (agent, upstream tool),
+which is what you want.
+
+A caller that phrases the action itself sends `intended_action` instead, and
+the service scores that verbatim.
 
 `user_intent` is the root request, which lets the service also check the tool
 call for drift away from what the user actually asked for.
