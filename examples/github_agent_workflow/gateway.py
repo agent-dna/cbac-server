@@ -49,7 +49,7 @@ from fastmcp.server.middleware import Middleware
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cbac import configure, get_config
-from cbac.guard import authorize
+from cbac.guard import AuthResult, authorize
 from cbac.mcp import context_from_headers, denial_body
 
 load_dotenv()
@@ -76,10 +76,8 @@ AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
 configure(cbac_url=CBAC_URL, cbac_timeout=CBAC_TIMEOUT)
 
 
-async def decide(
-    context, getter, agent_id, user_intent, fallback=None
-) -> tuple[str, str]:
-    """The gate itself. Returns ``authorize``'s ``(decision, detail)``.
+async def decide(context, getter, agent_id, user_intent, fallback=None) -> AuthResult:
+    """The gate itself. Returns ``authorize``'s :class:`AuthResult`.
 
     Every MCP primitive that acts on the world or returns the server's data
     comes through here — only the exception the caller raises on a non-``allow``
@@ -149,9 +147,9 @@ class CBACMiddleware(Middleware):
         ctx = context_from_headers(get_http_headers())
         agent_id = (ctx.agent_id if ctx else "") or AGENT_ID
         user_intent = ctx.user_intent if ctx else ""
-        decision, detail = await decide(context, "get_tool", agent_id, user_intent)
-        if decision != "allow":
-            raise ToolError(denial_body(decision, detail))
+        result = await decide(context, "get_tool", agent_id, user_intent)
+        if result.decision != "allow":
+            raise ToolError(denial_body(result.decision, result.message))
         return await call_next(context)
 
     async def on_read_resource(self, context, call_next):
@@ -165,15 +163,15 @@ class CBACMiddleware(Middleware):
         ctx = context_from_headers(get_http_headers())
         agent_id = (ctx.agent_id if ctx else "") or AGENT_ID
         user_intent = ctx.user_intent if ctx else ""
-        decision, detail = await decide(
+        result = await decide(
             context,
             "get_resource",
             agent_id,
             user_intent,
             fallback="read the resource",
         )
-        if decision != "allow":
-            raise ResourceError(denial_body(decision, detail))
+        if result.decision != "allow":
+            raise ResourceError(denial_body(result.decision, result.message))
         return await call_next(context)
 
     # ``prompts/get`` is deliberately not gated. Prompts are user-controlled in

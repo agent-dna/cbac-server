@@ -67,6 +67,7 @@ def _interaction_hash(
     callee_type: str | None,
     error_code: int | None,
     salt: str,
+    intent_id: str | None = None,
 ) -> str:
     """Content hash over one full ``cbac_decisions`` row, computed by
     :meth:`CBAC._record_decision` immediately before insert.
@@ -76,7 +77,9 @@ def _interaction_hash(
     value that happens to contain whatever separator we'd otherwise pick
     (a comma, a pipe) can't collide two different rows onto the same hash.
     Field order is fixed by this function, not sorted, since this is a
-    positional row fingerprint, not a dict digest.
+    positional row fingerprint, not a dict digest. ``intent_id`` —  it is
+    appended last (before ``salt``) so a historical hash computed before
+    this field existed cannot collide with one that includes it.
 
     ``salt`` is a fresh random value the caller generates per row (see
     ``_record_decision`` — ``uuid.uuid4()``), not a derived or fixed value.
@@ -98,6 +101,7 @@ def _interaction_hash(
             callee_name,
             callee_type,
             error_code,
+            intent_id,
             salt,
         ],
         ensure_ascii=False,
@@ -560,7 +564,8 @@ class CBAC:
         callee_name: str,
         callee_type: str,
         result: CBACResult,
-    ) -> None:
+        intent_id: str | None = None,
+    ) -> str | None:
         """Append the verdict to the ``cbac_decisions`` audit log.
 
         Never gates the decision, on the same grounds as :meth:`_fold_trust`:
@@ -579,6 +584,12 @@ class CBAC:
         guaranteed unique per row, including for two decisions with
         byte-for-byte identical content (e.g. a caller retry) — this is a
         per-row identifier, not a dedup key; see :func:`_interaction_hash`.
+
+        ``intent_id``
+
+        Returns the ``interaction_hash`` that was written, or ``None`` if the
+        insert failed — :meth:`verify_cbac` stamps this onto the result so a
+        caller gets the hash back without a second lookup.
         """
         # NULL rather than "" for what the caller never supplied, so
         # "no callee" stays distinguishable from "a callee named ''".
@@ -596,6 +607,7 @@ class CBAC:
                 callee_type=callee_type_val,
                 error_code=result.error_code,
                 salt=str(uuid.uuid4()),
+                intent_id=intent_id,
             )
             await insert_cbac_decision(
                 session,
@@ -608,13 +620,16 @@ class CBAC:
                 callee_type=callee_type_val,
                 error_code=result.error_code,
                 interaction_hash=interaction_hash,
+                intent_id=intent_id,
             )
+            return interaction_hash
         except Exception:
             logger.warning(
                 "cbac decision record failed",
                 decision=result.decision,
                 exc_info=True,
             )
+            return None
 
     async def verify_cbac(
         self,
@@ -624,6 +639,7 @@ class CBAC:
         user_intent: str | None = None,
         callee_name: str = "",
         callee_type: str = "tool",
+        intent_id: str | None = None,
     ) -> CBACResult:
         """Decide, then write the verdict to the audit log.
 
@@ -631,11 +647,16 @@ class CBAC:
         recording happens at exactly one place. ``_decide`` has seven distinct
         return paths, and every one of them must be logged — threading the
         write through each is how a path silently stops being audited.
+
+        ``intent_id`` is the caller's own opaque correlation id (minted
+        upstream, at the workflow's first envelope, not by CBAC) — it plays no
+        part in the decision itself, so it bypasses ``_decide`` entirely and
+        goes straight into the audit write, which is also where it is hashed.
         """
         result = await self._decide(
             session, agent_id, intended_action, user_intent, callee_name, callee_type
         )
-        await self._record_decision(
+        result.interaction_hash = await self._record_decision(
             session,
             agent_id,
             _intended_action_text(intended_action),
@@ -643,6 +664,7 @@ class CBAC:
             callee_name,
             callee_type,
             result,
+            intent_id,
         )
         return result
 

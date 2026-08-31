@@ -85,7 +85,7 @@ def test_authorize_returns_decision_and_reason_only(monkeypatch):
     assert envelope(response) == {
         "success": True,
         "message": "Tier 1 allow",
-        "data": {"decision": "allow", "error_code": None},
+        "data": {"decision": "allow", "status_code": None, "hash": None},
     }
     assert not any(
         h.startswith("x-cbac-") and h != "x-cbac-decision" for h in response.headers
@@ -107,6 +107,7 @@ def test_authorize_forwards_the_callee_edge(monkeypatch):
             "user_intent": "show me the PRs",
             "callee_name": "github_tool",
             "callee_type": "tool",
+            "intent_id": None,
         }
     ]
 
@@ -256,10 +257,10 @@ def test_guard_without_a_configured_service_fails_closed():
     """No CBAC_URL means nowhere to ask, which must never read as permission."""
     from cbac.guard import GuardConfig, _authorize
 
-    decision, detail = asyncio.run(_authorize({}, GuardConfig(cbac_url="")))
+    result = asyncio.run(_authorize({}, GuardConfig(cbac_url="")))
 
-    assert decision == "error"  # every caller treats non-"allow" as blocked
-    assert "no decision service configured" in detail
+    assert result.decision == "error"  # every caller treats non-"allow" as blocked
+    assert "no decision service configured" in result.message
 
 
 def test_authorize_failure_fails_closed(monkeypatch):
@@ -301,6 +302,7 @@ def decision_row(record_id=1, **overrides):
         "error_code": ec.TIER1_GAP_ALLOW,
         # Per-row unique in the real table (uuid4-salted), so vary it by id.
         "interaction_hash": f"{record_id:064x}",
+        "intent_id": None,
         "created_at": datetime(2026, 8, 17, 9, 14, 22, tzinfo=timezone.utc),
     }
     return SimpleNamespace(**{**fields, **overrides})

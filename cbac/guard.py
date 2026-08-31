@@ -68,12 +68,14 @@ from typing import (
 class GovernanceContext:
     """Per-request governance state the guard authorizes against.
 
-    ``agent_id`` (whose policy is checked) and ``user_intent`` are the
-    only two inputs the CBAC call needs beyond the intended action.
+    ``agent_id`` (whose policy is checked) and ``user_intent`` are the two
+    inputs the CBAC call needs beyond the intended action. ``intent_id`` — CBAC never parses or validates it, only threads it
+    through to the audit row and its hash.
     """
 
     agent_id: str
     user_intent: str = ""
+    intent_id: str = ""
 
 
 _governance_ctx: contextvars.ContextVar[GovernanceContext | None] = (
@@ -90,13 +92,18 @@ def get_context() -> GovernanceContext | None:
 def cbac_context(
     agent_id: str,
     user_intent: str = "",
+    intent_id: str = "",
 ) -> Iterator[GovernanceContext]:
     """Open a governance scope. Set once at the request entry point.
 
     Every ``@cbac_guard``-wrapped callable invoked inside this block
     reads the context ambiently; the caller passes nothing per call.
+    ``intent_id`` is opened once here — at the workflow's first envelope —
+    and every guarded call inside the scope carries it unchanged.
     """
-    holder = GovernanceContext(agent_id=agent_id, user_intent=user_intent)
+    holder = GovernanceContext(
+        agent_id=agent_id, user_intent=user_intent, intent_id=intent_id
+    )
     token = _governance_ctx.set(holder)
     try:
         yield holder
@@ -189,10 +196,13 @@ def _payload(
     user_intent: str | None,
     description: str | None,
     callee_type: str,
+    intent_id: str | None = None,
 ) -> dict[str, Any]:
     """The ``/cbac/v1/authorize`` request body. One definition, every entry point.
 
-    Facts only — the service turns them into the text it scores.
+    Facts only — the service turns them into the text it scores. ``intent_id``
+    is opaque to the service too — it is never worded into anything, only
+    stored and hashed.
     """
     return {
         "agent_id": agent_id,
@@ -201,10 +211,30 @@ def _payload(
         "callee_description": description,
         "arguments": _stringify(args),
         "user_intent": user_intent or None,
+        "intent_id": intent_id or None,
     }
 
 
-async def _authorize(payload: dict[str, Any], cfg: GuardConfig) -> tuple[str, str]:
+@dataclass
+class AuthResult:
+    """One ``/cbac/v1/authorize`` call's outcome, as the guard layer sees it.
+
+    ``decision`` and ``message`` are the pair every caller has always gotten;
+    ``status_code`` (the service's pipeline error code, ``cbac_service.
+    error_codes``) and ``hash`` (the row's ``interaction_hash``) ride back
+    alongside them so a caller never needs a second lookup to get either.
+    Both are ``None`` on the fail-closed paths inside :func:`_authorize`
+    itself (no service configured, a malformed response, a network error) —
+    there was no service-side verdict to carry a code or a hash.
+    """
+
+    decision: str
+    message: str
+    status_code: int | None = None
+    hash: str | None = None
+
+
+async def _authorize(payload: dict[str, Any], cfg: GuardConfig) -> AuthResult:
     """One decision call to the CBAC service, fail-closed: any error resolves
     to ``"error"``.
 
@@ -236,9 +266,10 @@ async def _authorize(payload: dict[str, Any], cfg: GuardConfig) -> tuple[str, st
 
     endpoint = cfg.authorize_endpoint()
     if not endpoint:
-        return "error", (
+        return AuthResult(
+            "error",
             "CBAC: no decision service configured — set CBAC_URL or call "
-            "cbac.configure(cbac_url=...)"
+            "cbac.configure(cbac_url=...)",
         )
 
     try:
@@ -251,17 +282,20 @@ async def _authorize(payload: dict[str, Any], cfg: GuardConfig) -> tuple[str, st
         # Reading the response stays inside the guard: decoding a body can
         # raise too, and the callers' contract is that this never does.
         body = response.json()
-        decision = (body.get("data") or {}).get("decision")
+        data = body.get("data") or {}
+        decision = data.get("decision")
         message = body.get("message") or ""
         # No decision in the envelope means this was not a verdict at all -- a
         # 422, a proxy's error page, some other service on that URL. Not
         # "advise": that is a real gray-zone verdict and would misreport the
         # reason a call was blocked.
         if not decision:
-            return "error", message or f"CBAC: unrecognized response {response.text!r}"
-        return decision, message
+            return AuthResult(
+                "error", message or f"CBAC: unrecognized response {response.text!r}"
+            )
+        return AuthResult(decision, message, data.get("status_code"), data.get("hash"))
     except Exception as exc:
-        return "error", str(exc)
+        return AuthResult("error", str(exc))
 
 
 # ── Framework-agnostic call gate ──────────────────────────────────────────────
@@ -280,7 +314,8 @@ async def authorize(
     description: str | None = None,
     callee_type: str = "tool",
     cfg: GuardConfig | None = None,
-) -> tuple[str, str]:
+    intent_id: str | None = None,
+) -> AuthResult:
     """Authorize one call. Every input is an argument (decision only).
 
     For enforcement points that already hold the governance context as
@@ -289,8 +324,8 @@ async def authorize(
     routing what they already hold through a contextvar only to read it back
     would be a detour.
 
-    Returns ``(decision, detail)``. Fail-closed: any error resolves to
-    ``"error"`` and never raises.
+    Returns an :class:`AuthResult`. Fail-closed: any error resolves to
+    ``decision="error"`` and never raises.
 
     ``description`` is the callee's own description (schema/docstring first
     line); the service uses it as the verb phrase when it renders the intent,
@@ -299,9 +334,19 @@ async def authorize(
     description scores far better than one working from the name alone.
     ``callee_type`` labels the other end of the edge (``"tool"``, ``"agent"``,
     ``"mcp"``) whose trust score the service updates while deciding.
+    ``intent_id`` is the caller's own opaque correlation id, threaded through
+    unchanged to the audit row and its hash.
     """
     return await _authorize(
-        _payload(agent_id, callee_name, args, user_intent, description, callee_type),
+        _payload(
+            agent_id,
+            callee_name,
+            args,
+            user_intent,
+            description,
+            callee_type,
+            intent_id,
+        ),
         cfg or get_config(),
     )
 
@@ -311,7 +356,7 @@ async def authorize_tool_call(
     args: dict[str, Any],
     description: str | None = None,
     callee_type: str = "tool",
-) -> tuple[str, str]:
+) -> AuthResult:
     """Authorize one tool call against the *ambient* policy (decision only).
 
     :func:`authorize` for in-process callers, which have no way to thread
@@ -324,9 +369,15 @@ async def authorize_tool_call(
     """
     ctx = get_context()
     if ctx is None:
-        return "allow", ""
+        return AuthResult("allow", "")
     return await authorize(
-        ctx.agent_id, callee_name, args, ctx.user_intent, description, callee_type
+        ctx.agent_id,
+        callee_name,
+        args,
+        ctx.user_intent,
+        description,
+        callee_type,
+        intent_id=ctx.intent_id,
     )
 
 
@@ -405,19 +456,25 @@ def cbac_guard(
                 ctx.user_intent,
                 description,
                 callee_type,
+                ctx.intent_id,
             )
             if action_intent:
                 # Caller phrases this action itself; the service scores that
                 # text verbatim instead of rendering from the fields above.
                 payload["intended_action"] = action_intent(call_kwargs)
 
-            decision, detail = await _authorize(payload, get_config())
+            result = await _authorize(payload, get_config())
 
-            if decision != "allow":
-                if decision == "deny" and on_deny == "raise":
-                    raise PermissionError(detail)
-                status = "denied" if decision == "deny" else "error"
-                return {"status": status, "error": detail}
+            if result.decision != "allow":
+                if result.decision == "deny" and on_deny == "raise":
+                    raise PermissionError(result.message)
+                status = "denied" if result.decision == "deny" else "error"
+                return {
+                    "status": status,
+                    "error": result.message,
+                    "status_code": result.status_code,
+                    "hash": result.hash,
+                }
 
             return await fn(*args, **kwargs)
 

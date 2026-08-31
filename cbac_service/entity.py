@@ -34,6 +34,7 @@ class AuthorizeRequest(BaseModel):
     # Any shape: flattened to text server-side. Not a str so a caller can post
     # a structured action and let the flattener walk it.
     intended_action: Any = None
+    intent_id: str | None = None
 
 
 class PrecomputePolicyRequest(BaseModel):

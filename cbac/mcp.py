@@ -154,11 +154,11 @@ async def cbac_intercept(request, handler):
     # None today and the de-snaked tool name becomes the verb phrase. A gateway
     # does better: it has the upstream tool's real description locally.
     description = getattr(request, "description", None)
-    decision, detail = await authorize_tool_call(
+    result = await authorize_tool_call(
         request.name, request.args, description, callee_type="mcp"
     )
-    if decision != "allow":
-        return _denied_result(decision, detail)
+    if result.decision != "allow":
+        return _denied_result(result.decision, result.message)
 
     return await handler(request)
 

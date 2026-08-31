@@ -89,6 +89,12 @@ class CBACResult:
     # so `None` here would mean a return path forgot to, not that no
     # decision was reached.
     error_code: int | None = None
+    # sha256 fingerprint of the cbac_decisions row this decision produced —
+    # see cbac.py's _interaction_hash. Set by CBAC.verify_cbac after
+    # _record_decision writes the row, not by _decide (which never touches
+    # the audit log); stays None if the caller never reaches verify_cbac
+    # (e.g. a stubbed CBACResult in a test) or the insert itself failed.
+    interaction_hash: str | None = None
 
 
 def parse_skill_md(text: str) -> SkillsCard:
