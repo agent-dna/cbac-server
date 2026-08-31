@@ -2,17 +2,18 @@ import asyncio
 import base64
 import hashlib
 import json
-from collections.abc import Callable
+import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import numpy as np
 import structlog
-from agentdna.id import get_id
 from agentdna.provenance import Provenance
 from agentdna.types import AgentCard
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cbac_service import error_codes as ec
 from cbac_service.chunking import flatten_policy_chunks
 from cbac_service.config import (
     ALLOW_GAP,
@@ -29,16 +30,18 @@ from cbac_service.config import (
     NLI_MODEL,
 )
 from cbac_service.db.repository import (
-    agent_has_lhi_records,
     get_latest_trust,
     get_policy_chunks,
+    insert_cbac_decision,
     insert_lhi_record,
     policy_hash_matches,
     save_policy_chunks,
 )
 from cbac_service.db.search import hybrid_search, vector_search
 from cbac_service.skills import (
+    VALID_LLM_DECISIONS,
     CBACResult,
+    LLMVerdict,
     _intended_action_text,
 )
 
@@ -54,6 +57,55 @@ def _policy_hash(policy: str) -> str:
     return hashlib.sha256(policy.encode()).hexdigest()
 
 
+def _interaction_hash(
+    agent_id: str,
+    decision: str,
+    reason: str,
+    intended_action: str,
+    user_intent: str | None,
+    callee_name: str | None,
+    callee_type: str | None,
+    error_code: int | None,
+    salt: str,
+) -> str:
+    """Content hash over one full ``cbac_decisions`` row, computed by
+    :meth:`CBAC._record_decision` immediately before insert.
+
+    Same construction as :func:`_policy_hash` — sha256 over a canonical
+    string — extended here to a JSON array rather than a plain join so a
+    value that happens to contain whatever separator we'd otherwise pick
+    (a comma, a pipe) can't collide two different rows onto the same hash.
+    Field order is fixed by this function, not sorted, since this is a
+    positional row fingerprint, not a dict digest.
+
+    ``salt`` is a fresh random value the caller generates per row (see
+    ``_record_decision`` — ``uuid.uuid4()``), not a derived or fixed value.
+    Its only job is to guarantee the hash is unique per row: two decisions
+    with byte-for-byte identical content (a genuine retry of the same
+    interaction) get *different* hashes, deliberately, because the hash is
+    now a per-row identifier, not a content fingerprint — do not reuse it
+    for dedup/retry detection, since it can no longer do that job. This
+    function stays deterministic and unit-testable given a fixed ``salt``;
+    the randomness lives at the call site, not in here.
+    """
+    payload = json.dumps(
+        [
+            agent_id,
+            decision,
+            reason,
+            intended_action,
+            user_intent,
+            callee_name,
+            callee_type,
+            error_code,
+            salt,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class CBAC:
     def __init__(
         self,
@@ -61,11 +113,14 @@ class CBAC:
         cbac_url: str = "https://cbac-admin.agentdna.io",
         encoder_name: str = ENCODER_MODEL,
         nli_model_name: str = NLI_MODEL,
-        llm_backend: Callable | None = None,
+        # Contract: an async callable taking (intent_text, policy_text) and
+        # returning an LLMVerdict — never a bare string. See _tiered_decision's
+        # Tier 3 branch for what happens when a backend doesn't honor this.
+        llm_backend: Callable[[str, str], Awaitable[LLMVerdict]] | None = None,
         allow_gap: float = ALLOW_GAP,
         deny_gap: float = DENY_GAP,
         hhem_model_name: str = HHEM_MODEL,
-        lhi_weights: tuple[float, float, float, float] = LHI_WEIGHTS,
+        lhi_weights: tuple[float, float, float] = LHI_WEIGHTS,
         lhi_lambda_up: float = LHI_LAMBDA_UP,
         lhi_lambda_down: float = LHI_LAMBDA_DOWN,
     ):
@@ -278,11 +333,11 @@ class CBAC:
         self,
         user_intent: str,
         agent_action: str,
-    ) -> tuple[tuple[str, str] | None, float]:
+    ) -> tuple[tuple[str, str, int] | None, float]:
         """NLI drift check: does the agent's action contradict the user's intent?
 
-        Returns ``((decision, reason), intent_score)`` if contradiction is
-        strong enough to deny, else ``(None, intent_score)``.
+        Returns ``((decision, reason, error_code), intent_score)`` if
+        contradiction is strong enough to deny, else ``(None, intent_score)``.
         """
         scores = await asyncio.to_thread(self._nli_scores, user_intent, agent_action)
         contradiction = scores.get("contradiction", 0.0)
@@ -295,6 +350,7 @@ class CBAC:
                         f"Check 1 drift: user intent {user_intent!r} contradicts agent action "
                         f"{agent_action!r} (NLI contradiction={contradiction:.2f})"
                     ),
+                    ec.CHECK1_DRIFT_DENY,
                 ),
                 intent_score,
             )
@@ -307,11 +363,11 @@ class CBAC:
         session: AsyncSession,
         agent_id: str,
         intent_text: str,
-    ) -> tuple[str, str, float | None]:
+    ) -> tuple[str, str, int, float | None]:
         """Tier 1 (cosine gap) → Tier 2 (NLI entailment) → Tier 3 (LLM).
 
         Uses pgvector search for Tier 1 instead of in-memory numpy operations.
-        Returns ``(decision, reason, policy_score)``.
+        Returns ``(decision, reason, error_code, policy_score)``.
         """
 
         # Encode only the intent at runtime (~5 ms on CPU).
@@ -346,6 +402,7 @@ class CBAC:
                     f"Tier 1 cosine gap {gap:+.3f} > +{self._allow_gap} "
                     f"(allowed={allowed_score:.3f}, forbidden={forbidden_score:.3f})"
                 ),
+                ec.TIER1_GAP_ALLOW,
                 gap_score,
             )
         if gap < -self._deny_gap:
@@ -355,6 +412,7 @@ class CBAC:
                     f"Tier 1 cosine gap {gap:+.3f} < -{self._deny_gap} "
                     f"(intent closer to forbidden than allowed policy)"
                 ),
+                ec.TIER1_GAP_DENY,
                 gap_score,
             )
 
@@ -377,9 +435,14 @@ class CBAC:
             top_chunk = None
 
         if not top_chunk:
-            return ("deny", "Tier 2: no allowed policy chunks found", None)
+            return (
+                "deny",
+                "Tier 2: no allowed policy chunks found",
+                ec.TIER2_NO_ALLOWED_CHUNKS,
+                None,
+            )
 
-        t2_scores = await asyncio.to_thread(self._nli_scores, intent_text, top_chunk)
+        t2_scores = await asyncio.to_thread(self._nli_scores, top_chunk, intent_text)
         entailment = t2_scores.get("entailment", 0.0)
         contradiction = t2_scores.get("contradiction", 0.0)
 
@@ -387,24 +450,27 @@ class CBAC:
             return (
                 "allow",
                 f"Tier 2 NLI entailment={entailment:.2f} vs {top_chunk!r}",
+                ec.TIER2_ENTAILMENT_ALLOW,
                 entailment,
             )
         if contradiction >= CONTRADICTION_THRESHOLD:
             return (
                 "deny",
                 f"Tier 2 NLI contradiction={contradiction:.2f} vs {top_chunk!r}",
+                ec.TIER2_CONTRADICTION_DENY,
                 entailment,
             )
 
         # Tier 3: LLM judgment (optional).
         if self._llm_backend is None:
             return (
-                "advise",
+                "deny",
                 (
                     f"Tier 1/2 inconclusive (gap={gap:+.3f}, "
                     f"entailment={entailment:.2f}, contradiction={contradiction:.2f}); "
-                    "no LLM backend configured — caller must decide"
+                    "no LLM backend configured"
                 ),
+                ec.TIER3_NO_BACKEND_DENY,
                 None,
             )
 
@@ -413,21 +479,142 @@ class CBAC:
         policy_text = "\n".join(all_chunks)
 
         try:
-            llm_decision = await self._llm_backend(intent_text, policy_text)
+            verdict = await self._llm_backend(intent_text, policy_text)
         except Exception as e:
-            return ("advise", f"Tier 3 LLM error: {e}", None)
+            return ("deny", f"Tier 3 LLM error: {e}", ec.TIER3_LLM_ERROR_DENY, None)
 
-        verdict = str(llm_decision).lower()
-        if any(w in verdict for w in ("deny", "reject", "not allow", "prohibited")):
-            return ("deny", f"Tier 3 LLM: {llm_decision}", None)
-        if any(
-            w in verdict
-            for w in ("allow", "permit", "approve", "authorise", "authorize")
-        ):
-            return ("allow", f"Tier 3 LLM: {llm_decision}", None)
-        return ("advise", f"Tier 3 LLM inconclusive: {llm_decision}", None)
+        # `llm_backend` is contracted to return an LLMVerdict (see skills.py),
+        # not free text — a misbehaving backend (wrong type, or a decision
+        # outside the known three) degrades to "deny" rather than raising or
+        # silently guessing from prose.
+        decision = getattr(verdict, "decision", None)
+        reason_text = getattr(verdict, "reason", None)
+        if not isinstance(verdict, LLMVerdict) or decision not in VALID_LLM_DECISIONS:
+            return (
+                "deny",
+                f"Tier 3 LLM returned an unrecognised verdict: {verdict!r}",
+                ec.TIER3_LLM_MALFORMED_DENY,
+                None,
+            )
+
+        code = {
+            "allow": ec.TIER3_LLM_ALLOW,
+            "deny": ec.TIER3_LLM_DENY,
+            "advise": ec.TIER3_LLM_ADVISE_DENY,
+        }[decision]
+        # A backend that itself returns "advise" is folded to deny too — the
+        # pipeline no longer has a caller-must-decide state; `decision` (not
+        # `final_decision`) still appears in the reason so the audit log shows
+        # what the backend actually said.
+        final_decision = "deny" if decision == "advise" else decision
+        return (final_decision, f"Tier 3 LLM ({decision}): {reason_text}", code, None)
 
     # ── Main entry point ──────────────────────────────────────────────────────
+
+    async def _fold_trust(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        callee_name: str,
+        callee_type: str,
+        result: CBACResult,
+    ) -> CBACResult:
+        """Fold a reached decision's component scores into the edge's trust and
+        stamp the new value onto ``result``.
+
+        Never gates the decision: a failed trust update is logged, not raised —
+        the same treatment hallucination scoring gets. The decision has already
+        been made against the policy, and a DB hiccup here must not turn a valid
+        ``allow`` into a blocked call.
+
+        Skipped without a ``callee_name``: the edge key would be empty and every
+        caller would pool into one junk edge.
+        """
+        if not callee_name:
+            return result
+        try:
+            result.trust = await self.compute_lhi(
+                session,
+                agent_id,
+                callee_name,
+                callee_type,
+                intent_score=result.intent_score,
+                policy_score=result.policy_score,
+                hallucination_score=result.hallucination_score,
+            )
+        except Exception:
+            logger.warning(
+                "lhi trust update failed",
+                callee_name=callee_name,
+                decision=result.decision,
+                exc_info=True,
+            )
+        return result
+
+    async def _record_decision(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intent_text: str,
+        user_intent: str | None,
+        callee_name: str,
+        callee_type: str,
+        result: CBACResult,
+    ) -> None:
+        """Append the verdict to the ``cbac_decisions`` audit log.
+
+        Never gates the decision, on the same grounds as :meth:`_fold_trust`:
+        the verdict is already settled, and failing to *write down* what was
+        decided must not change what was decided. A failed insert is logged.
+
+        Unlike the trust fold this has no skip conditions — every verdict is
+        recorded, including the infrastructure-failure denies and calls with no
+        callee, which is exactly what ``lhi_records`` cannot give us.
+
+        ``interaction_hash`` is computed here, over the exact row about to be
+        inserted, immediately before the insert — not earlier in the pipeline
+        — so it always reflects the final decision/reason/error_code, not an
+        intermediate value from a tier that ended up being superseded. A
+        fresh ``uuid.uuid4()`` is folded in as a per-row salt so the hash is
+        guaranteed unique per row, including for two decisions with
+        byte-for-byte identical content (e.g. a caller retry) — this is a
+        per-row identifier, not a dedup key; see :func:`_interaction_hash`.
+        """
+        # NULL rather than "" for what the caller never supplied, so
+        # "no callee" stays distinguishable from "a callee named ''".
+        user_intent_val = user_intent or None
+        callee_name_val = callee_name or None
+        callee_type_val = callee_type if callee_name else None
+        try:
+            interaction_hash = _interaction_hash(
+                agent_id=agent_id,
+                decision=result.decision,
+                reason=result.reason,
+                intended_action=intent_text,
+                user_intent=user_intent_val,
+                callee_name=callee_name_val,
+                callee_type=callee_type_val,
+                error_code=result.error_code,
+                salt=str(uuid.uuid4()),
+            )
+            await insert_cbac_decision(
+                session,
+                agent_id=agent_id,
+                decision=result.decision,
+                reason=result.reason,
+                intended_action=intent_text,
+                user_intent=user_intent_val,
+                callee_name=callee_name_val,
+                callee_type=callee_type_val,
+                error_code=result.error_code,
+                interaction_hash=interaction_hash,
+            )
+        except Exception:
+            logger.warning(
+                "cbac decision record failed",
+                decision=result.decision,
+                exc_info=True,
+            )
 
     async def verify_cbac(
         self,
@@ -435,6 +622,38 @@ class CBAC:
         agent_id: str,
         intended_action: Any,
         user_intent: str | None = None,
+        callee_name: str = "",
+        callee_type: str = "tool",
+    ) -> CBACResult:
+        """Decide, then write the verdict to the audit log.
+
+        The decision itself is :meth:`_decide`; this wrapper exists so the
+        recording happens at exactly one place. ``_decide`` has seven distinct
+        return paths, and every one of them must be logged — threading the
+        write through each is how a path silently stops being audited.
+        """
+        result = await self._decide(
+            session, agent_id, intended_action, user_intent, callee_name, callee_type
+        )
+        await self._record_decision(
+            session,
+            agent_id,
+            _intended_action_text(intended_action),
+            user_intent,
+            callee_name,
+            callee_type,
+            result,
+        )
+        return result
+
+    async def _decide(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intended_action: Any,
+        user_intent: str | None = None,
+        callee_name: str = "",
+        callee_type: str = "tool",
     ) -> CBACResult:
         """Semantic intent verification against the agent's on-chain policy.
 
@@ -449,6 +668,18 @@ class CBAC:
         ``intended_action`` text and denies immediately on a strong
         contradiction (``CONTRADICTION_THRESHOLD``).
 
+        Once a decision is *reached* — allow or deny alike — its
+        component scores are folded into the (agent → callee) trust score via
+        :meth:`_fold_trust`, and the result carries the new ``trust``. All three
+        components are known at this point, so there is nothing left to wait for
+        post-execution. Denials count: an agent probing forbidden actions scores
+        badly on policy and loses trust for it.
+
+        The early returns *above* the decision are infrastructure failures
+        (policy lookup down, no policy, no chunks), not judgments about the
+        agent, so they deliberately fold no trust. They are still *audited* —
+        :meth:`verify_cbac` logs every path to ``cbac_decisions`` regardless.
+
         Parameters
         ----------
         session:
@@ -459,16 +690,22 @@ class CBAC:
             The action the agent wants to perform (any shape, flattened to text).
         user_intent:
             The root user request. Enables Check-1 drift + hallucination score.
+        callee_name / callee_type:
+            The other end of the edge whose trust this decision updates
+            (``"tool"`` / ``"agent"`` / ``"mcp"``). No ``callee_name`` means no
+            trust update.
 
         Returns
         -------
-        CBACResult with ``decision`` in ``{"allow", "deny", "advise"}``.
+        CBACResult with ``decision`` in ``{"allow", "deny"}``.
         Fail-closed: any unrecoverable error resolves to ``deny``.
         """
         intent_text = _intended_action_text(intended_action)
         if not intent_text.strip():
             return CBACResult(
-                decision="deny", reason="Intended action carries no analysable content"
+                decision="deny",
+                reason="Intended action carries no analysable content",
+                error_code=ec.GUARD_INTENDED_ACTION_EMPTY,
             )
 
         # Check 1: NLI drift — only runs when caller supplies the root user intent.
@@ -476,9 +713,18 @@ class CBAC:
         if user_intent:
             drift, intent_score = await self._check1_drift(user_intent, intent_text)
             if drift is not None:
-                decision, reason = drift
-                return CBACResult(
-                    decision=decision, reason=reason, intent_score=intent_score
+                decision, reason, error_code = drift
+                return await self._fold_trust(
+                    session,
+                    agent_id,
+                    callee_name,
+                    callee_type,
+                    CBACResult(
+                        decision=decision,
+                        reason=reason,
+                        intent_score=intent_score,
+                        error_code=error_code,
+                    ),
                 )
 
         # Fetch current policy from chain — always, so we can detect updates.
@@ -490,10 +736,13 @@ class CBAC:
             return CBACResult(
                 decision="deny",
                 reason=f"Policy lookup failed for agent {agent_id}: {e}",
+                error_code=ec.GUARD_POLICY_LOOKUP_FAILED,
             )
         if not current_policy:
             return CBACResult(
-                decision="deny", reason=f"No policy available for agent {agent_id}"
+                decision="deny",
+                reason=f"No policy available for agent {agent_id}",
+                error_code=ec.GUARD_NO_POLICY_AVAILABLE,
             )
 
         current_hash = _policy_hash(current_policy)
@@ -507,17 +756,20 @@ class CBAC:
                 return CBACResult(
                     decision="deny",
                     reason=f"Policy unavailable for agent {agent_id}: {e}",
+                    error_code=ec.GUARD_POLICY_INDEX_FAILED,
                 )
 
         # Check that chunks actually exist.
         all_chunks = await get_policy_chunks(session, agent_id)
         if not all_chunks:
             return CBACResult(
-                decision="deny", reason="Policy carries no analysable content"
+                decision="deny",
+                reason="Policy carries no analysable content",
+                error_code=ec.GUARD_POLICY_NO_CONTENT,
             )
 
         # Run the tiered decision pipeline (DB-backed search).
-        decision, reason, policy_score = await self._tiered_decision(
+        decision, reason, error_code, policy_score = await self._tiered_decision(
             session, agent_id, intent_text
         )
 
@@ -534,67 +786,85 @@ class CBAC:
                 )
                 hallucination = None
 
-        return CBACResult(
-            decision=decision,
-            reason=reason,
-            hallucination_score=hallucination,
-            intent_score=intent_score,
-            policy_score=policy_score,
+        return await self._fold_trust(
+            session,
+            agent_id,
+            callee_name,
+            callee_type,
+            CBACResult(
+                decision=decision,
+                reason=reason,
+                hallucination_score=hallucination,
+                intent_score=intent_score,
+                policy_score=policy_score,
+                error_code=error_code,
+            ),
         )
 
-    # TODO:- Verify writing provenance card.
-    # TODO:- Remove output_score? In that case we can compute lhi score at the time of decision or it can be computed asynchornously\
     async def compute_lhi(
         self,
         session: AsyncSession,
         agent_id: str,
         callee_name: str,
         callee_type: str,
-        intent_score: float,
-        policy_score: float,
-        hallucination_score: float,
-        output_score: float,
-    ) -> float:
+        intent_score: float | None,
+        policy_score: float | None,
+        hallucination_score: float | None,
+    ) -> float | None:
         """Update and return the LHI (Local Heuristic Intelligence) trust
         score for one (agent → callee) edge.
 
-        Called *after* the interaction executed, once all four per-interaction
-        scores (each in [0, 1], higher is better) are known:
+        Called from :meth:`verify_cbac` the moment a decision is reached, with
+        the three per-decision scores (each in [0, 1], higher is better):
 
-        1. Instantaneous quality ``s`` = weighted **arithmetic** mean of the
-           four scores — the expected quality of the interaction. Deliberately
-           compensatory: hard constraints are already enforced by the
-           allow/deny gates *before* execution, and this update only ever sees
-           interactions that passed them, so the reputation's job is unbiased
-           longitudinal estimation, not constraint enforcement.
+        1. Instantaneous quality ``s`` = weighted **arithmetic** mean over the
+           components that were actually *observed*::
+
+               s = Σ_observed wᵢxᵢ / Σ_observed wᵢ
+
+           Renormalizing (rather than skipping the record, or substituting a
+           value for a missing component) matters because the components are
+           not missing at random: ``policy_score`` is ``None`` exactly on the
+           Tier-3 gray-zone decisions, and intent/hallucination are ``None``
+           whenever no ``user_intent`` was supplied. Complete-case analysis
+           would silently exclude precisely the interactions trust exists to
+           arbitrate. Returns ``None`` when *nothing* was observed — a record
+           with no measurement behind it would be fiction.
+
+           The mean is deliberately compensatory: the allow/deny gates already
+           enforce the hard constraints, so a single weak component costs its
+           (renormalized) weight rather than annihilating the score.
         2. Asymmetric EMA against the stored trust for this edge:
            ``T = λ·T_prev + (1−λ)·s`` with λ = ``lhi_lambda_up`` when improving
            (trust builds slowly) and ``lhi_lambda_down`` when degrading (trust
            drops fast). First interaction with a callee: ``T = s``.
 
-        Storage: one ``lhi_records`` row per interaction — the table is the
-        full trust history for every edge ((agent, callee_name, callee_type)),
-        and the current trust is simply the edge's latest row (see
-        ``repository.get_latest_trust`` / ``get_trust_history``). The record
-        is also appended to a dedicated per-agent CBAC card
-        (``{agent_id}:cbac``) on the Provenance Layer (created on the agent's
-        first record), so the history is independently verifiable on-chain.
-        Trust never overrides the per-interaction allow/deny gates — it is
-        read pre-execution only to arbitrate the inconclusive ("advise") band.
+        Storage: one ``lhi_records`` row per decision — the table is the full
+        trust history for every edge ((agent, callee_name, callee_type)), and
+        the current trust is simply the edge's latest row (see
+        ``repository.get_latest_trust`` / ``get_trust_history``). Unobserved
+        components are stored as NULL, never as a substituted value, so the
+        row stays honest about what was measured.
         """
         scores = {
             "intent": intent_score,
             "policy": policy_score,
             "hallucination": hallucination_score,
-            "output": output_score,
         }
         for key, value in scores.items():
-            if not 0.0 <= value <= 1.0:
+            if value is not None and not 0.0 <= value <= 1.0:
                 raise ValueError(f"{key}_score must be in [0, 1], got {value}")
 
-        s = sum(
-            value * weight
+        observed = [
+            (value, weight)
             for value, weight in zip(scores.values(), self._lhi_weights, strict=True)
+            if value is not None
+        ]
+        if not observed:
+            return None
+
+        s = sum(value * weight for value, weight in observed) / sum(
+            w for _, w in observed
         )
 
         prev = await get_latest_trust(session, agent_id, callee_name, callee_type)
@@ -604,13 +874,7 @@ class CBAC:
             lam = self._lhi_lambda_up if s >= prev else self._lhi_lambda_down
             trust = lam * prev + (1 - lam) * s
 
-        # First record for this agent (any edge) -> its CBAC card doesn't
-        # exist yet. Checked before the insert commits.
-        is_new_agent = not await agent_has_lhi_records(session, agent_id)
-
-        # DB is the working copy; the chain is the audit log. Commit first so
-        # a chain failure never loses the trust update.
-        db_record = await insert_lhi_record(
+        await insert_lhi_record(
             session,
             agent_id=agent_id,
             callee_name=callee_name,
@@ -618,38 +882,31 @@ class CBAC:
             intent_score=intent_score,
             policy_score=policy_score,
             hallucination_score=hallucination_score,
-            output_score=output_score,
             trust=trust,
         )
 
-        record = {
-            "type": "lhi_record",
-            "agent_id": agent_id,
-            "callee": {"name": callee_name, "type": callee_type},
-            "scores": scores,
-            "trust": trust,
-            "updated_at": db_record.created_at.isoformat(),
-        }
-        card_id = get_id(f"{agent_id}:cbac")
-
-        try:
-            # Chain writes are sync network calls — off the event loop.
-            if is_new_agent:
-                await asyncio.to_thread(
-                    self.provenance.create_new_provenance_card,
-                    card_id=card_id,
-                    card_info=json.dumps(record),
-                )
-            else:
-                await asyncio.to_thread(
-                    self.provenance.append_to_provenance_card,
-                    card_id=card_id,
-                    card_info=json.dumps(record),
-                )
-        except Exception as exc:
-            raise RuntimeError(
-                f"LHI record for agent {agent_id} saved locally but failed to "
-                f"write to provenance card {card_id}: {exc}"
-            ) from exc
+        # ponytail: on-chain mirror of the record is parked — the DB is the
+        # working copy and nothing reads the card yet. To restore, re-add the
+        # `json` / `agentdna.id.get_id` / `repository.agent_has_lhi_records`
+        # imports along with this block. Keep it *after* the commit above so a
+        # chain failure can never lose the trust update.
+        #
+        # is_new_agent = not await agent_has_lhi_records(session, agent_id)
+        # record = {
+        #     "type": "lhi_record",
+        #     "agent_id": agent_id,
+        #     "callee": {"name": callee_name, "type": callee_type},
+        #     "scores": scores,
+        #     "trust": trust,
+        #     "updated_at": db_record.created_at.isoformat(),
+        # }
+        # card_id = get_id(f"{agent_id}:cbac")
+        # write = (
+        #     self.provenance.create_new_provenance_card
+        #     if is_new_agent
+        #     else self.provenance.append_to_provenance_card
+        # )
+        # # Chain writes are sync network calls — off the event loop.
+        # await asyncio.to_thread(write, card_id=card_id, card_info=json.dumps(record))
 
         return trust

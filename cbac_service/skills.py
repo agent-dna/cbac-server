@@ -43,16 +43,52 @@ class CardCheck:
     reasons: list[str] = field(default_factory=list)
 
 
+VALID_LLM_DECISIONS = ("allow", "deny", "advise")
+
+
+@dataclass
+class LLMVerdict:
+    """Structured Tier-3 output an ``llm_backend`` callable must return.
+
+    Replaces free-text keyword matching (checking for "deny"/"allow" as
+    substrings anywhere in a response — which misfires on a negated mention
+    like "not prohibited," or a response that says "I'd normally deny this,
+    but..." before concluding allow). An ``llm_backend`` is expected to force
+    its underlying LLM into returning exactly this shape — e.g. via a
+    tool-call/structured-output API — so ``_tiered_decision`` reads
+    ``decision`` directly instead of guessing from prose.
+
+    ``decision`` must be one of :data:`VALID_LLM_DECISIONS`; anything else is
+    treated as malformed and resolves to ``"deny"`` rather than raising —
+    a misbehaving backend degrades the same way "no backend configured at
+    all" does, not a hard failure. A backend that itself returns
+    ``"advise"`` is folded to ``"deny"`` too: the pipeline has no
+    caller-must-decide state.
+    """
+
+    decision: str  # "allow" | "deny" | "advise"
+    reason: str
+
+
 @dataclass
 class CBACResult:
     """Overall CBAC decision after walking the full chain."""
 
-    decision: str  # "allow" | "deny" | "advise"
+    decision: str  # "allow" | "deny"
     reason: str = ""
     trace: list[CardCheck] = field(default_factory=list)
     hallucination_score: float | None = None
     intent_score: float | None = None
     policy_score: float | None = None
+    # Post-decision LHI trust for the (agent → callee) edge. None when no
+    # trust update ran — see CBAC._fold_trust for the skip conditions.
+    trust: float | None = None
+    # Numeric identifier for exactly which layer/condition produced `reason`
+    # — see cbac_service.error_codes. Machine-stable where `reason` (free
+    # text) is not; every construction site in cbac.py sets this explicitly,
+    # so `None` here would mean a return path forgot to, not that no
+    # decision was reached.
+    error_code: int | None = None
 
 
 def parse_skill_md(text: str) -> SkillsCard:
@@ -138,6 +174,42 @@ def _collect_text(obj: Any, *, include_keys: bool = True, _depth: int = 0) -> st
     if isinstance(data, dict):
         return _collect_text(data, include_keys=include_keys, _depth=_depth + 1)
     return str(obj)
+
+
+def _action_summary(action_name: str, description: str | None = None) -> str:
+    """Verb-only prose for the intended action: "The agent wants to <verb>."
+
+    The verb phrase is the callee's own description (schema or docstring first
+    line) when available, else the de-snaked callee name. This is the prefix of
+    :func:`render_intent`'s full rendering; kept as its own function so a
+    verb-only view stays available to callers that want one.
+    """
+    verb = (description or action_name.replace("_", " ")).strip().rstrip(".")
+    return f"The agent wants to {verb[:1].lower()}{verb[1:]}."
+
+
+def render_intent(
+    action_name: str, kwargs: dict[str, Any], description: str | None = None
+) -> str:
+    """Render a call as the prose the scorers see: "The agent wants to <verb>,
+    with k = v, …".
+
+    Server-side because the phrasing *is* part of the decision function: the
+    tiers score prose, so two enforcement points that word the same call
+    differently get different verdicts. Keeping it here means an enforcement
+    point supplies only mechanical facts — callee name, arguments, description
+    — and the wording is versioned alongside the models tuned against it. An
+    enforcement point in another language needs no port of this.
+
+    NLI and the policy tiers score natural language far better than raw
+    ``tool k=v`` call syntax — snake_case names hide their verb from the NLI
+    model (measured: a direct "close" vs "do not close" contradiction scored
+    0.01 on call syntax, 0.95 as prose).
+    """
+    text = _action_summary(action_name, description).rstrip(".")
+    if kwargs:
+        text += ", with " + ", ".join(f"{k} = {v!s}" for k, v in kwargs.items())
+    return text + "."
 
 
 def _intended_action_text(intended_action: Any) -> str:

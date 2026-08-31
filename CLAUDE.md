@@ -6,6 +6,21 @@ Guidance for this repo. It holds two things:
 - `cbac/` — the framework-agnostic guard + optional MCP glue. `import cbac` gets
   it; this repo owns it outright.
 
+## Writing docs and comments
+
+`README.md`, every doc here, and every **code comment and docstring** describe the
+code **as it currently stands**, never how it got there. Verify each claim against
+the actual files before writing it — endpoints against `main.py`, env vars against
+`config.py`, commands against `pyproject.toml` and `.github/workflows/` — rather
+than reconstructing from a conversation or from a previous version of the text. No
+"we used to", no "removed X because it's no longer needed", no "this previously
+returned Y", no rationale that only makes sense as a diff.
+
+Explaining *why the current code is the way it is* stays — that is what makes a
+comment worth reading ("fail-closed by design", "asarray narrows the declared
+union"). Restating it as a change does not. When resolving a doc merge conflict,
+re-check *both* sides against current code; neither side is presumed right.
+
 ## What this is
 
 `cbac_service` is the **reference CBAC decision service** — a standalone FastAPI
@@ -19,14 +34,31 @@ app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
   `ENCODER_MODEL`, `LHI_WEIGHTS`, `DATABASE_URL`, …). Change a value here and
   redeploy.
 - `chunking.py` — structure-aware policy-text chunking (`chunk_body_text`).
-- `skills.py` — `skill.md` parsing + the CBAC result dataclasses.
+- `skills.py` — `skill.md` parsing, `render_intent`, the CBAC result dataclasses.
+- `entity.py` — pydantic request models for the HTTP API.
 - **Not published as a wheel** (`[tool.uv] package = false`). Deployed from a
   checkout: `uvicorn cbac_service.main:app`.
+- Every response is `{success, message, data}` (`main.api_response`). `success`
+  means the request was *processed*, **not** that the action was allowed — a
+  deny is a successful call, and the verdict is `data.decision`. Request bodies
+  are pydantic models in `entity.py`; a schema violation answers in the same
+  envelope with 422 via the `RequestValidationError` handler.
 - Endpoints:
-  - **`POST /authorize-cbac`** — main decision gate.
-  - **`POST /compute-lhi`** — fold interaction scores into trust.
-  - **`POST /precompute-policy`** — explicitly trigger embedding precomputation.
-  - **`GET /health`** — DB connectivity check.
+  - **`POST /cbac/v1/authorize`** — main decision gate. Also folds the decision
+    into the caller→callee trust score, so it is the *only* call a guard makes.
+    Always HTTP 200, including the fail-closed `"error"` verdict: a 5xx would
+    invite a retry, and the trust fold is not idempotent.
+  - **`POST /cbac/v1/policies/precompute`** — explicitly trigger embedding precomputation.
+  - **`GET /cbac/v1/decisions?agent_id=&limit=&offset=`** — an agent's decision
+    history, newest first.
+  - **`GET /cbac/v1/decisions/{id}`** — one decision by id.
+  - **`GET /cbac/v1/decisions/by-hash/{interaction_hash}`** — one decision by
+    its interaction hash.
+  - **`POST /cbac/v1/lhi-scores`** — current trust for a batch of agents
+    (`{"agent_ids": [...]}`), one entry per caller→callee edge. A POST for a
+    read because the id batch is the body.
+  - **`GET /health`** — DB connectivity check. Unversioned on purpose: probes
+    are wired once at deploy time and must not track API versions.
 - Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`).
 
 ## Architecture
@@ -38,7 +70,9 @@ Guard (cbac/) --HTTP--> cbac_service (FastAPI)
                                 ├── pgvector 0.8.6 (semantic search)
                                 ├── pg_textsearch 1.4.0 (BM25 keyword search)
                                 ├── policy_chunks table (embeddings + text)
-                                └── policy_meta table (cache invalidation)
+                                ├── policy_meta table (cache invalidation)
+                                ├── cbac_decisions table (audit log)
+                                └── lhi_records table (trust history)
 ```
 
 ## Database
@@ -61,6 +95,23 @@ The service uses **PostgreSQL 18** with two extensions:
 - `policy_hash` — compared against on-chain hash at runtime
 - `encoder_model` / `nli_model` — detect if models changed
 - `chunk_count` / `cached_at` — operational metadata
+
+**`cbac_decisions`** — one row per verdict, the **audit log**:
+- `agent_id` / `decision` / `reason` — who, what, why
+- `intended_action` — the *flattened* action text, i.e. what the scorers saw
+- `user_intent` / `callee_name` / `callee_type` — context; NULL when not supplied
+- `created_at`
+
+**`lhi_records`** — one row per decision, the **trust history** (see the LHI
+section below).
+
+⚠️ **These two are not interchangeable, and the difference is easy to get
+wrong.** `cbac_decisions` is *complete*: every verdict `verify_cbac` reaches is
+recorded, including the infrastructure-failure denies and calls with no callee.
+`lhi_records` is deliberately *skipped* in exactly those cases (no
+`callee_name`, no measured component, the infra-failure early returns), because
+a trust score must not be moved by things that are not evidence about the agent.
+So only `cbac_decisions` can answer "what did we decide, and why".
 
 ### Indexes
 - `policy_chunks_embedding_idx` — HNSW (vector_cosine_ops)
@@ -126,33 +177,77 @@ Class `CBAC`. On each request:
    cross-encoder. Entailment ≥ 0.55 → allow, contradiction ≥ 0.60 → deny.
 
 5. **Tier 3 — LLM backend** (optional): If configured, sends intent + full
-   policy text to an LLM for judgment. Otherwise returns `"advise"`.
+   policy text to an LLM for judgment. Otherwise returns `"deny"`. A
+   configured backend that itself returns `"advise"` is also folded to
+   `"deny"` — the pipeline has no caller-must-decide state.
 
 6. **Hallucination score** (HHEM): Attached after the decision, never gates it.
 
-Decisions are `"allow" | "deny" | "advise"` and the pipeline is **fail-closed**
-(any error → `deny`).
+7. **LHI trust fold** (`_fold_trust` → `compute_lhi`): once a decision is
+   *reached*, its component scores are folded into the (agent → callee) trust
+   score and the new value is attached to the result. Also never gates the
+   decision — a failed trust update is logged, not raised. Skipped when no
+   `callee_name` was supplied, or when no component was measured. The early
+   returns *above* the decision (policy lookup down, no policy, no chunks) are
+   infrastructure failures, not evidence about the agent, and fold no trust.
+
+8. **Decision recorded** (`_record_decision` → `insert_cbac_decision`): the
+   verdict plus its action context is appended to `cbac_decisions`. Unlike the
+   trust fold this has **no skip conditions** — every path is audited, including
+   the infra-failure denies above. Also never gates: failing to write down what
+   was decided must not change what was decided.
+
+`verify_cbac` is a thin wrapper that calls `_decide` (the pipeline above) and
+then records. `_decide` has seven return paths and the wrapper exists so the
+audit write happens in exactly one place — threading it through each return is
+how a path silently stops being audited.
+
+Decisions are `"allow" | "deny"` and the pipeline is **fail-closed** (any
+error, or an inconclusive/misbehaving Tier 3, → `deny`).
 
 ## Scoring attached to a decision
 
 - **Hallucination score (HHEM):** when a decision is reached with a user intent
   present, `CBAC.hallucination_score` (vectara HHEM model, 1 = grounded,
   0 = hallucinated) is attached to the result.
-- **LHI trust:** `compute_lhi` combines four component scores
-  (intent, policy, hallucination, output) as a **weighted arithmetic mean**
+- **LHI trust:** `compute_lhi` combines three component scores
+  (intent, policy, hallucination) as a **weighted arithmetic mean**
   (`LHI_WEIGHTS`) — deliberately compensatory, since the allow/deny gates
-  already enforce the hard constraints *before* execution — then folds it into a
-  stored trust value via an **asymmetric EMA — slow to build (`LHI_LAMBDA_UP`),
-  fast to lose (`LHI_LAMBDA_DOWN`)**. A zero component costs only its weight, not
-  the whole score (a transient tool failure must not annihilate an
-  otherwise-compliant interaction). Trust is tracked **per caller→callee edge**
-  — the edge key is (`agent_id`, `callee_name`, `callee_type`) — and stored in
-  the **`lhi_records` table, one row per interaction**. The table *is* the trust
-  history: rows are append-only, an edge's current trust is its latest row
-  (`repository.get_latest_trust`), and `get_trust_history` reads the series.
-  Each record is also appended to the agent's `{agent_id}:cbac` provenance card,
-  so the history is verifiable on-chain. `compute_lhi` is **async and takes an
-  `AsyncSession`** like the rest of the pipeline. The LHI math is covered by
-  `cbac_service/tests/test_cbac_lhi.py` (repository functions faked in-memory,
-  no DB needed); score attachment by `cbac_service/tests/test_cbac_verify.py` —
-  keep both green when touching it.
+  already enforce the hard constraints — then folds it into a stored trust value
+  via an **asymmetric EMA — slow to build (`LHI_LAMBDA_UP`), fast to lose
+  (`LHI_LAMBDA_DOWN`)**. A zero component costs only its weight, not the whole
+  score.
+
+  It is called **from `verify_cbac` itself**, at decision time. There is no
+  post-execution step and no `/compute-lhi` endpoint: every component is known
+  the moment a decision is reached, so a guard makes exactly **one** HTTP call
+  per action and no score ever round-trips through the client. **Every decision
+  records** — allow and deny alike — so an agent probing forbidden actions
+  loses trust instead of keeping a pristine record.
+
+  The mean **renormalizes over the observed components** (`s = Σ wᵢxᵢ / Σ wᵢ`)
+  rather than skipping records with a missing one: the components are not
+  missing at random (`policy_score` is `None` exactly on Tier-3 gray-zone
+  decisions; intent/hallucination are `None` without a `user_intent`), so
+  complete-case analysis would silently exclude the very interactions trust
+  exists to arbitrate. An unmeasured component is stored **NULL**, never
+  substituted. Nothing observed → no record. Because of the renormalizing
+  denominator, `LHI_WEIGHTS` is **scale-invariant** — only the ratios matter, so
+  adding or removing a component needs no retuning.
+
+  Trust is tracked **per caller→callee edge** — the edge key is (`agent_id`,
+  `callee_name`, `callee_type`) — and stored in the **`lhi_records` table, one
+  row per decision**. The table *is* the trust history: rows are append-only, an
+  edge's current trust is its latest row (`repository.get_latest_trust`), and
+  `get_trust_history` reads the series. `compute_lhi` is **async and takes an
+  `AsyncSession`** like the rest of the pipeline.
+
+  The on-chain mirror (appending each record to the agent's `{agent_id}:cbac`
+  provenance card) is **currently commented out** in `compute_lhi` — the DB is
+  the working copy and nothing reads the card yet. The block names the imports
+  to restore alongside it.
+
+  The LHI math is covered by `cbac_service/tests/test_cbac_lhi.py` (repository
+  functions faked in-memory via the shared `rows` fixture in
+  `tests/conftest.py`, no DB needed); the fold into `verify_cbac` by
+  `cbac_service/tests/test_cbac_verify.py` — keep both green when touching it.
