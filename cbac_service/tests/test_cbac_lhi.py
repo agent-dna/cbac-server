@@ -132,8 +132,8 @@ def test_missing_component_renormalizes_rather_than_skipping(rows, tmp_path):
 
 
 def test_only_intent_observed_still_records(rows, tmp_path):
-    """No user_intent used to mean no record at all; one observed component is
-    enough now, and with a single component the mean is that component."""
+    """One observed component is enough to write a record, and with a single
+    component the mean is that component."""
     cbac = make_cbac(tmp_path)
     trust = compute(cbac, policy_score=None, hallucination_score=None)
     assert trust == pytest.approx(0.9)

@@ -6,16 +6,20 @@ Guidance for this repo. It holds two things:
 - `cbac/` — the framework-agnostic guard + optional MCP glue. `import cbac` gets
   it; this repo owns it outright.
 
-## Writing docs
+## Writing docs and comments
 
-`README.md` and every doc here describe the code **as it currently stands**, never
-how it got there. Verify each claim against the actual files before writing it —
-endpoints against `main.py`, env vars against `config.py`, commands against
-`pyproject.toml` and `.github/workflows/` — rather than reconstructing from a
-conversation or from a previous version of the doc. No "we used to", no "removed X
-because it's no longer needed", no rationale that only makes sense as a diff. When
-resolving a doc merge conflict, re-check *both* sides against current code; neither
-side is presumed right.
+`README.md`, every doc here, and every **code comment and docstring** describe the
+code **as it currently stands**, never how it got there. Verify each claim against
+the actual files before writing it — endpoints against `main.py`, env vars against
+`config.py`, commands against `pyproject.toml` and `.github/workflows/` — rather
+than reconstructing from a conversation or from a previous version of the text. No
+"we used to", no "removed X because it's no longer needed", no "this previously
+returned Y", no rationale that only makes sense as a diff.
+
+Explaining *why the current code is the way it is* stays — that is what makes a
+comment worth reading ("fail-closed by design", "asarray narrows the declared
+union"). Restating it as a change does not. When resolving a doc merge conflict,
+re-check *both* sides against current code; neither side is presumed right.
 
 ## What this is
 
@@ -30,17 +34,31 @@ app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
   `ENCODER_MODEL`, `LHI_WEIGHTS`, `DATABASE_URL`, …). Change a value here and
   redeploy.
 - `chunking.py` — structure-aware policy-text chunking (`chunk_body_text`).
-- `skills.py` — `skill.md` parsing + the CBAC result dataclasses.
+- `skills.py` — `skill.md` parsing, `render_intent`, the CBAC result dataclasses.
+- `entity.py` — pydantic request models for the HTTP API.
 - **Not published as a wheel** (`[tool.uv] package = false`). Deployed from a
   checkout: `uvicorn cbac_service.main:app`.
+- Every response is `{success, message, data}` (`main.api_response`). `success`
+  means the request was *processed*, **not** that the action was allowed — a
+  deny is a successful call, and the verdict is `data.decision`. Request bodies
+  are pydantic models in `entity.py`; a schema violation answers in the same
+  envelope with 422 via the `RequestValidationError` handler.
 - Endpoints:
-  - **`POST /authorize-cbac`** — main decision gate. Also folds the decision
+  - **`POST /cbac/v1/authorize`** — main decision gate. Also folds the decision
     into the caller→callee trust score, so it is the *only* call a guard makes.
-  - **`POST /precompute-policy`** — explicitly trigger embedding precomputation.
-  - **`GET /cbac-decisions?agent_id=&limit=&offset=`** — an agent's decision
+    Always HTTP 200, including the fail-closed `"error"` verdict: a 5xx would
+    invite a retry, and the trust fold is not idempotent.
+  - **`POST /cbac/v1/policies/precompute`** — explicitly trigger embedding precomputation.
+  - **`GET /cbac/v1/decisions?agent_id=&limit=&offset=`** — an agent's decision
     history, newest first.
-  - **`GET /cbac-decisions/{id}`** — one decision by id.
-  - **`GET /health`** — DB connectivity check.
+  - **`GET /cbac/v1/decisions/{id}`** — one decision by id.
+  - **`GET /cbac/v1/decisions/by-hash/{interaction_hash}`** — one decision by
+    its interaction hash.
+  - **`POST /cbac/v1/lhi-scores`** — current trust for a batch of agents
+    (`{"agent_ids": [...]}`), one entry per caller→callee edge. A POST for a
+    read because the id batch is the body.
+  - **`GET /health`** — DB connectivity check. Unversioned on purpose: probes
+    are wired once at deploy time and must not track API versions.
 - Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`).
 
 ## Architecture

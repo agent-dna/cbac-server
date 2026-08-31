@@ -8,12 +8,20 @@ framework (LangGraph, CrewAI, MCP, ...): the guard wraps plain async
 Python callables, which is the lowest common denominator every
 framework ultimately dispatches to.
 
-The guard does one thing: authorize. It turns a call into an intent,
-asks the CBAC decision service (one HTTP call), and either lets the
-wrapped function run or short-circuits a denial. It does **not** build
+The guard does one thing: authorize. It reports the call's facts to the
+CBAC decision service (one HTTP call) and either lets the wrapped
+function run or short-circuits a denial. It does **not** build
 provenance envelopes and does **not** perform the action itself:
 
-    intent (from call args) -> authorize (CBAC) -> run the wrapped fn
+    call facts -> authorize (CBAC) -> run the wrapped fn
+
+What it deliberately does *not* do is decide how the action is worded.
+The service's tiers score prose, so the phrasing is part of the decision
+function: an enforcement point that worded a call its own way would get
+its own verdicts. This layer sends the mechanical facts -- callee name,
+arguments, description -- and the service renders them, which is also
+why an enforcement point in another language needs no port of the
+rendering.
 
 The trust score (LHI) is folded in service-side as part of reaching the
 decision, so there is exactly one HTTP call per guarded action and no
@@ -46,8 +54,9 @@ import contextlib
 import contextvars
 import functools
 import inspect
+import os
 from collections.abc import Awaitable, Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
 )
@@ -100,8 +109,28 @@ def cbac_context(
 
 @dataclass
 class GuardConfig:
-    cbac_url: str = "https://cbac-admin.agentdna.io"
-    cbac_timeout: float = 100.0
+    """Where the decision service is and how long to wait for it.
+
+    Every field reads from the environment so a deployment can point the guard
+    somewhere without touching code, and :func:`configure` overrides what it is
+    given. There is no baked-in host: an unset ``CBAC_URL`` leaves ``cbac_url``
+    empty, and :func:`_authorize` fails the call closed rather than sending an
+    agent's actions to whatever host happened to be compiled in.
+    """
+
+    cbac_url: str = field(default_factory=lambda: os.environ.get("CBAC_URL", ""))
+    cbac_path: str = field(
+        default_factory=lambda: os.environ.get("CBAC_PATH", "/cbac/v1/authorize")
+    )
+    cbac_timeout: float = field(
+        default_factory=lambda: float(os.environ.get("CBAC_TIMEOUT", "100"))
+    )
+
+    def authorize_endpoint(self) -> str:
+        """The decision endpoint, or ``""`` when no service is configured."""
+        if not self.cbac_url:
+            return ""
+        return f"{self.cbac_url.rstrip('/')}/{self.cbac_path.lstrip('/')}"
 
 
 _config = GuardConfig()
@@ -110,12 +139,18 @@ _config = GuardConfig()
 def configure(
     cbac_url: str | None = None,
     cbac_timeout: float | None = None,
+    cbac_path: str | None = None,
 ) -> None:
-    """Set layer-wide guard configuration. Call once at startup."""
+    """Set layer-wide guard configuration. Call once at startup.
+
+    Each argument left ``None`` keeps whatever the environment supplied.
+    """
     if cbac_url is not None:
         _config.cbac_url = cbac_url
     if cbac_timeout is not None:
         _config.cbac_timeout = cbac_timeout
+    if cbac_path is not None:
+        _config.cbac_path = cbac_path
 
 
 def get_config() -> GuardConfig:
@@ -125,36 +160,15 @@ def get_config() -> GuardConfig:
 # ── Guard internals ───────────────────────────────────────────────────────────
 
 
-def _action_summary(action_name: str, description: str | None = None) -> str:
-    """Verb-only prose for the intended action: "The agent wants to <verb>."
+def _stringify(args: dict[str, Any]) -> dict[str, str]:
+    """Argument values as text, which is the only use the service has for them.
 
-    The verb phrase is the tool's own description (docstring first line)
-    when available, else the de-snaked tool name. This is the prefix of
-    :func:`render_intent`'s full rendering; kept as its own function so a
-    verb-only view stays available to callers that want one.
+    They exist to be phrased into the intent prose, so rendering them here
+    keeps the wire trivially JSON-serializable — a ``datetime`` or a dataclass
+    argument would otherwise fail to encode and fail the call closed. This is
+    mechanical, not phrasing: how the pieces are worded stays server-side.
     """
-    verb = (description or action_name.replace("_", " ")).strip().rstrip(".")
-    return f"The agent wants to {verb[:1].lower()}{verb[1:]}."
-
-
-def render_intent(
-    action_name: str, kwargs: dict[str, Any], description: str | None = None
-) -> str:
-    """Render the intended action as prose, parameters included.
-
-    Public because it is the one thing every enforcement point must agree on:
-    a guard, an MCP gateway and an ext_authz adapter have to phrase the same
-    call the same way, or the policy scores them differently.
-
-    NLI and the policy tiers score natural language far better than raw
-    ``tool k=v`` call syntax — snake_case tool names hide their verb from
-    the NLI model (measured: a direct "close" vs "do not close"
-    contradiction scored 0.01 on call syntax, 0.95 as prose).
-    """
-    text = _action_summary(action_name, description).rstrip(".")
-    if kwargs:
-        text += ", with " + ", ".join(f"{k} = {v!s}" for k, v in kwargs.items())
-    return text + "."
+    return {k: str(v) for k, v in args.items()}
 
 
 def _bind_kwargs(sig: inspect.Signature, args: tuple, kwargs: dict) -> dict[str, Any]:
@@ -168,69 +182,84 @@ def _bind_kwargs(sig: inspect.Signature, args: tuple, kwargs: dict) -> dict[str,
         return dict(kwargs)
 
 
-def _authorize_sync(
+def _payload(
     agent_id: str,
-    intended_action: Any,
-    user_intent: str | None,
     callee_name: str,
+    args: dict[str, Any],
+    user_intent: str | None,
+    description: str | None,
     callee_type: str,
-    cfg: GuardConfig,
-) -> tuple[str, str]:
-    """POST to the CBAC decision service.
+) -> dict[str, Any]:
+    """The ``/cbac/v1/authorize`` request body. One definition, every entry point.
+
+    Facts only — the service turns them into the text it scores.
+    """
+    return {
+        "agent_id": agent_id,
+        "callee_name": callee_name,
+        "callee_type": callee_type,
+        "callee_description": description,
+        "arguments": _stringify(args),
+        "user_intent": user_intent or None,
+    }
+
+
+async def _authorize(payload: dict[str, Any], cfg: GuardConfig) -> tuple[str, str]:
+    """One decision call to the CBAC service, fail-closed: any error resolves
+    to ``"error"``.
 
     The reference implementation (the cbac_service package) runs
-    ``verify_cbac`` behind this endpoint and returns a
-    decision only -- it never executes the action. The payload is
-    exactly that method's inputs.
+    ``verify_cbac`` behind this endpoint and returns a decision only -- it
+    never executes the action.
 
-    ``callee_name``/``callee_type`` name the edge whose trust score the
-    service updates as a side effect of deciding. The component scores
-    behind that update stay server-side: there is nothing for the caller
-    to carry, and nothing to report back afterwards.
+    The payload is the call's mechanical facts, not a rendered sentence: the
+    service phrases ``callee_name``/``arguments``/``callee_description`` into
+    the text its scorers see, so an enforcement point cannot word a call into
+    a different verdict. ``intended_action`` overrides that, for a caller with
+    phrasing of its own. ``callee_name``/``callee_type`` also name the edge
+    whose trust score the service updates as a side effect of deciding; the
+    component scores behind that update stay server-side, so there is nothing
+    for the caller to carry and nothing to report back afterwards.
+
+    ``requests`` blocks, and the enforcement points that call this serve other
+    traffic concurrently -- a gateway multiplexes MCP sessions, and
+    ``cbac_timeout`` is generous enough (a cold service loads three transformer
+    models) that a blocked event loop would stall every call in flight, not
+    just this one. Hence the thread.
+
+    ``cfg`` is threaded in rather than looked up here: it is set once when the
+    process starts, so a caller that never configured a service fails at the
+    one place that can say so. With no ``CBAC_URL`` there is nowhere to ask,
+    which is an ``"error"`` -- every caller treats that as not-allowed.
     """
     import requests  # lazy; transitive dependency of the library already
 
-    payload = {
-        "agent_id": agent_id,
-        "intended_action": intended_action,
-        "user_intent": user_intent,
-        "callee_name": callee_name,
-        "callee_type": callee_type,
-    }
-
-    response = requests.post(
-        f"{cfg.cbac_url.rstrip('/')}/authorize-cbac",
-        json=payload,
-        timeout=cfg.cbac_timeout,
-    )
-
-    return response.headers.get("X-CBAC-Decision", "advise"), response.text
-
-
-async def _authorize(
-    agent_id: str,
-    intent_text: str,
-    user_intent: str | None,
-    callee_name: str,
-    callee_type: str,
-    cfg: GuardConfig,
-) -> tuple[str, str]:
-    """One decision call, fail-closed: any error resolves to ``"error"``.
-
-    ``cfg`` is threaded in rather than looked up here: it is set once when
-    the process starts, and a caller that forgot to :func:`configure` should
-    fail where it can be seen rather than quietly reach the default URL.
-    """
-    try:
-        return await asyncio.to_thread(
-            _authorize_sync,
-            agent_id,
-            intent_text,
-            user_intent or None,
-            callee_name,
-            callee_type,
-            cfg,
+    endpoint = cfg.authorize_endpoint()
+    if not endpoint:
+        return "error", (
+            "CBAC: no decision service configured — set CBAC_URL or call "
+            "cbac.configure(cbac_url=...)"
         )
+
+    try:
+        response = await asyncio.to_thread(
+            requests.post,
+            endpoint,
+            json=payload,
+            timeout=cfg.cbac_timeout,
+        )
+        # Reading the response stays inside the guard: decoding a body can
+        # raise too, and the callers' contract is that this never does.
+        body = response.json()
+        decision = (body.get("data") or {}).get("decision")
+        message = body.get("message") or ""
+        # No decision in the envelope means this was not a verdict at all -- a
+        # 422, a proxy's error page, some other service on that URL. Not
+        # "advise": that is a real gray-zone verdict and would misreport the
+        # reason a call was blocked.
+        if not decision:
+            return "error", message or f"CBAC: unrecognized response {response.text!r}"
+        return decision, message
     except Exception as exc:
         return "error", str(exc)
 
@@ -264,17 +293,15 @@ async def authorize(
     ``"error"`` and never raises.
 
     ``description`` is the callee's own description (schema/docstring first
-    line) used as the verb phrase of the rendered intent; without it the
-    de-snaked ``callee_name`` is the fallback. ``callee_type`` labels the
-    other end of the edge (``"tool"``, ``"agent"``, ``"mcp"``) whose trust
-    score the service updates while deciding.
+    line); the service uses it as the verb phrase when it renders the intent,
+    and falls back to the de-snaked ``callee_name`` without it. Passing it is
+    worth the lookup — an enforcement point that has the callee's real
+    description scores far better than one working from the name alone.
+    ``callee_type`` labels the other end of the edge (``"tool"``, ``"agent"``,
+    ``"mcp"``) whose trust score the service updates while deciding.
     """
     return await _authorize(
-        agent_id,
-        render_intent(callee_name, args, description),
-        user_intent,
-        callee_name,
-        callee_type,
+        _payload(agent_id, callee_name, args, user_intent, description, callee_type),
         cfg or get_config(),
     )
 
@@ -321,8 +348,11 @@ def cbac_guard(
         Logical action name used to label the intent; defaults to the
         function name.
     action_intent:
-        ``kwargs -> str`` builder for the intent handed to CBAC. Defaults
-        to the action name followed by the call's arguments.
+        ``kwargs -> str`` builder that phrases the action itself, scored
+        verbatim. Left unset -- the normal case -- the service renders the
+        prose from the action name, the call's arguments and the docstring,
+        wording it the same way it words every other enforcement point's
+        calls. Set this only for an action those three do not describe.
     on_deny:
         ``"return"`` -> a denied call returns ``{"status": "denied", ...}``
         (readable by an LLM loop); ``"raise"`` -> raises PermissionError.
@@ -368,20 +398,20 @@ def cbac_guard(
                 return await fn(*args, **kwargs)
 
             call_kwargs = _bind_kwargs(sig, args, kwargs)
-            intent_text = (
-                action_intent(call_kwargs)
-                if action_intent
-                else render_intent(action_name, call_kwargs, description)
-            )
-
-            decision, detail = await _authorize(
+            payload = _payload(
                 ctx.agent_id,
-                intent_text,
-                ctx.user_intent,
                 action_name,
+                call_kwargs,
+                ctx.user_intent,
+                description,
                 callee_type,
-                get_config(),
             )
+            if action_intent:
+                # Caller phrases this action itself; the service scores that
+                # text verbatim instead of rendering from the fields above.
+                payload["intended_action"] = action_intent(call_kwargs)
+
+            decision, detail = await _authorize(payload, get_config())
 
             if decision != "allow":
                 if decision == "deny" and on_deny == "raise":

@@ -153,7 +153,7 @@ class CBACDecision(Base):
     # deliberately unique even across two decisions with byte-for-byte
     # identical content (e.g. a caller retry) — not a content fingerprint,
     # so don't use it to detect that an interaction was decided more than
-    # once; it can no longer answer that.
+    # once; it cannot answer that.
     interaction_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

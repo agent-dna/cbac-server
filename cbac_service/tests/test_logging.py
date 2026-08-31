@@ -21,12 +21,12 @@ def test_every_line_is_json_carrying_the_bound_context():
     structlog.contextvars.bind_contextvars(request_id="r1", agent_id="did:agent")
 
     structlog.get_logger("test").info("cbac decision", decision="deny")
-    logging.getLogger("uvicorn.access").info("%s %d", "POST /authorize-cbac", 200)
+    logging.getLogger("uvicorn.access").info("%s %d", "POST /cbac/v1/authorize", 200)
 
     records = [json.loads(line) for line in stream.getvalue().splitlines()]
     assert [r["event"] for r in records] == [
         "cbac decision",
-        "POST /authorize-cbac 200",
+        "POST /cbac/v1/authorize 200",
     ]
     # Bound at the request boundary — present on the foreign uvicorn record too.
     assert all(

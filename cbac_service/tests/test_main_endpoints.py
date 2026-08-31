@@ -10,17 +10,27 @@ import pytest
 pytest.importorskip("sentence_transformers")
 
 from agentdna.types import AgentCard
+from fastapi.testclient import TestClient
 
 from cbac_service import error_codes as ec
 from cbac_service import main
 from cbac_service.cbac import CBACResult
+from cbac_service.entity import (
+    MAX_LHI_AGENTS,
+    AuthorizeRequest,
+    LHIScoresRequest,
+    PrecomputePolicyRequest,
+)
 
 
 def stub_request(body):
-    async def _json():
-        return body
+    """The authorize body as the model FastAPI would have parsed it."""
+    return AuthorizeRequest(**body)
 
-    return SimpleNamespace(json=_json)
+
+def envelope(response):
+    """The {success, message, data} envelope every endpoint answers with."""
+    return json.loads(response.body)
 
 
 def install_cbac(monkeypatch, **attrs):
@@ -74,7 +84,11 @@ def test_authorize_returns_decision_and_reason_only(monkeypatch):
     response = asyncio.run(main.authorize_cbac(stub_request(AUTHORIZE_BODY)))
 
     assert response.headers["X-CBAC-Decision"] == "allow"
-    assert response.body == b"Tier 1 allow"
+    assert envelope(response) == {
+        "success": True,
+        "message": "Tier 1 allow",
+        "data": {"decision": "allow", "error_code": None},
+    }
     assert not any(
         h.startswith("x-cbac-") and h != "x-cbac-decision" for h in response.headers
     )
@@ -113,6 +127,143 @@ def test_authorize_defaults_the_callee_edge(monkeypatch):
     assert calls[0]["callee_type"] == "tool"
 
 
+def test_authorize_renders_the_intent_from_the_call_facts(monkeypatch):
+    """An enforcement point sends facts; the phrasing happens here.
+
+    This is the whole point of rendering server-side — every PEP, whatever
+    protocol or language it speaks, gets the same sentence for the same call,
+    so none of them can word its way to a different verdict.
+    """
+    calls = []
+    install_cbac(
+        monkeypatch,
+        verify_cbac=authorizing(CBACResult(decision="allow", reason="ok"), calls),
+    )
+    asyncio.run(
+        main.authorize_cbac(
+            stub_request(
+                {
+                    "agent_id": "did:agent",
+                    "callee_name": "github_close_issue",
+                    "callee_description": "Close an existing GitHub issue.",
+                    "arguments": {"repo": "owner/repo", "number": "3"},
+                    "user_intent": "close issue 3",
+                }
+            )
+        )
+    )
+
+    assert calls[0]["intended_action"] == (
+        "The agent wants to close an existing GitHub issue, "
+        "with repo = owner/repo, number = 3."
+    )
+
+
+def test_authorize_falls_back_to_the_callee_name_as_the_verb(monkeypatch):
+    """No description: the de-snaked name carries the verb instead."""
+    calls = []
+    install_cbac(
+        monkeypatch,
+        verify_cbac=authorizing(CBACResult(decision="allow", reason="ok"), calls),
+    )
+    asyncio.run(
+        main.authorize_cbac(
+            stub_request({"agent_id": "did:agent", "callee_name": "close_issue"})
+        )
+    )
+
+    assert calls[0]["intended_action"] == "The agent wants to close issue."
+
+
+def test_authorize_keeps_a_pre_rendered_intended_action(monkeypatch):
+    """A caller with phrasing of its own keeps it, rendering skipped entirely
+    even when the fields to render from are all present."""
+    calls = []
+    install_cbac(
+        monkeypatch,
+        verify_cbac=authorizing(CBACResult(decision="allow", reason="ok"), calls),
+    )
+    asyncio.run(
+        main.authorize_cbac(
+            stub_request(
+                {
+                    "agent_id": "did:agent",
+                    "intended_action": "wire $5000 to account 12345",
+                    "callee_name": "transfer_funds",
+                    "callee_description": "Transfer money between accounts.",
+                }
+            )
+        )
+    )
+
+    assert calls[0]["intended_action"] == "wire $5000 to account 12345"
+
+
+def test_guard_payload_round_trips_into_the_rendered_intent(monkeypatch):
+    """The guard's body and the endpoint's reader, pinned to each other.
+
+    They are the two halves of one contract and live in separate packages, so
+    a renamed key fails *silently*: the endpoint just stops seeing a
+    description and quietly scores the de-snaked name instead. Building the
+    body with the real guard and feeding it to the real endpoint is what
+    catches that.
+    """
+    from cbac.guard import _payload
+
+    calls = []
+    install_cbac(
+        monkeypatch,
+        verify_cbac=authorizing(CBACResult(decision="allow", reason="ok"), calls),
+    )
+    body = _payload(
+        "did:agent",
+        "github_close_issue",
+        # A value json.dumps cannot encode: the guard renders arguments to text
+        # before they hit the wire, so this must survive rather than fail closed.
+        {"repo": "owner/repo", "when": datetime(2026, 8, 17, tzinfo=timezone.utc)},
+        "close issue 3",
+        "Close an existing GitHub issue.",
+        "mcp",
+    )
+    json.dumps(body)  # the guard POSTs this; unserializable would fail closed
+    asyncio.run(main.authorize_cbac(stub_request(body)))
+
+    assert calls[0]["intended_action"] == (
+        "The agent wants to close an existing GitHub issue, "
+        "with repo = owner/repo, when = 2026-08-17 00:00:00+00:00."
+    )
+    assert calls[0]["callee_name"] == "github_close_issue"
+    assert calls[0]["callee_type"] == "mcp"
+
+
+def test_guard_endpoint_matches_the_route_the_service_serves():
+    """The other half of the same contract: the path the guard POSTs to has to
+    be a route this app actually registers, prefix and all."""
+    from cbac.guard import GuardConfig
+
+    cfg = GuardConfig(cbac_url="http://svc:8767")
+    assert cfg.authorize_endpoint() == "http://svc:8767/cbac/v1/authorize"
+    # openapi() rather than app.routes: an included router stays nested there,
+    # so app.routes lists the router, not the paths it serves.
+    assert cfg.cbac_path in main.app.openapi()["paths"]
+
+    # A service mounted under an ingress prefix: one slash, not two.
+    behind_ingress = GuardConfig(cbac_url="https://gw.example.com/agentdna/")
+    assert behind_ingress.authorize_endpoint() == (
+        "https://gw.example.com/agentdna/cbac/v1/authorize"
+    )
+
+
+def test_guard_without_a_configured_service_fails_closed():
+    """No CBAC_URL means nowhere to ask, which must never read as permission."""
+    from cbac.guard import GuardConfig, _authorize
+
+    decision, detail = asyncio.run(_authorize({}, GuardConfig(cbac_url="")))
+
+    assert decision == "error"  # every caller treats non-"allow" as blocked
+    assert "no decision service configured" in detail
+
+
 def test_authorize_failure_fails_closed(monkeypatch):
     async def boom(session, **kwargs):
         raise RuntimeError("policy lookup failed")
@@ -121,21 +272,22 @@ def test_authorize_failure_fails_closed(monkeypatch):
     response = asyncio.run(main.authorize_cbac(stub_request(AUTHORIZE_BODY)))
 
     assert response.headers["X-CBAC-Decision"] == "error"
-    assert b"policy lookup failed" in response.body
+    body = envelope(response)
+    assert body["data"]["decision"] == "error"
+    assert "policy lookup failed" in body["message"]
+    # The pipeline blew up, so the request did not succeed -- but still HTTP
+    # 200, because a 5xx invites the retry that double-folds trust.
+    assert body["success"] is False
+    assert response.status_code == 200
 
 
 def test_compute_lhi_endpoint_is_gone():
-    """Trust is folded in by /authorize-cbac; there is no second call."""
+    """Trust is folded in by /cbac/v1/authorize; there is no second call."""
     assert not hasattr(main, "compute_lhi")
-    assert "/compute-lhi" not in {route.path for route in main.app.routes}
+    assert not any("compute-lhi" in path for path in main.app.openapi()["paths"])
 
 
 # ── Decision audit log ────────────────────────────────────────────────────────
-
-
-def stub_query_request(**params):
-    """A Request whose only used surface is `.query_params`."""
-    return SimpleNamespace(query_params={k: str(v) for k, v in params.items()})
 
 
 def decision_row(record_id=1, **overrides):
@@ -174,13 +326,16 @@ def install_repository(monkeypatch, calls=None, records=(), one=None):
     monkeypatch.setattr(main, "get_cbac_decision", fake_get_cbac_decision)
 
 
+def list_decisions(**params):
+    """Over the real request path: the paging defaults and their bounds are
+    declared as Query(...), so a direct call would never resolve them."""
+    return TestClient(main.app).get(f"{main.API_PREFIX}/decisions", params=params)
+
+
 def test_list_decisions_returns_serialized_rows(monkeypatch):
     install_repository(monkeypatch, records=[decision_row(2), decision_row(1)])
-    response = asyncio.run(
-        main.list_cbac_decisions(stub_query_request(agent_id="did:agent"))
-    )
+    payload = list_decisions(agent_id="did:agent").json()["data"]
 
-    payload = json.loads(response.body)
     assert payload["agent_id"] == "did:agent"
     assert payload["count"] == 2
     assert [d["id"] for d in payload["decisions"]] == [2, 1]  # newest first
@@ -191,12 +346,8 @@ def test_list_decisions_returns_serialized_rows(monkeypatch):
 def test_list_decisions_defaults_and_forwards_paging(monkeypatch):
     calls = []
     install_repository(monkeypatch, calls=calls)
-    asyncio.run(main.list_cbac_decisions(stub_query_request(agent_id="did:agent")))
-    asyncio.run(
-        main.list_cbac_decisions(
-            stub_query_request(agent_id="did:agent", limit=10, offset=20)
-        )
-    )
+    list_decisions(agent_id="did:agent")
+    list_decisions(agent_id="did:agent", limit=10, offset=20)
 
     assert calls == [
         {"agent_id": "did:agent", "limit": 100, "offset": 0},
@@ -206,43 +357,42 @@ def test_list_decisions_defaults_and_forwards_paging(monkeypatch):
 
 def test_list_decisions_clamps_limit(monkeypatch):
     """An oversized page is clamped, not rejected — a caller asking for
-    everything gets a large page rather than a 400 to learn about."""
+    everything gets a large page rather than a 422 to learn about."""
     calls = []
     install_repository(monkeypatch, calls=calls)
-    asyncio.run(
-        main.list_cbac_decisions(stub_query_request(agent_id="did:agent", limit=100000))
-    )
+    list_decisions(agent_id="did:agent", limit=100000)
 
     assert calls[0]["limit"] == main.MAX_DECISION_LIMIT
 
 
-def test_list_decisions_requires_agent_id(monkeypatch):
-    install_repository(monkeypatch)
-    response = asyncio.run(main.list_cbac_decisions(stub_query_request()))
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},  # agent_id is required
+        {"agent_id": ""},  # ...and must not be blank
+        {"agent_id": "did:agent", "limit": "abc"},  # limit must be an int
+        {"agent_id": "did:agent", "limit": 0},  # ...and at least 1
+        {"agent_id": "did:agent", "offset": -1},  # offset must not be negative
+    ],
+)
+def test_list_decisions_rejects_bad_query(params):
+    """Driven over the real request path: FastAPI validates before the handler
+    runs, so calling the handler directly would skip the thing under test."""
+    response = TestClient(main.app).get(f"{main.API_PREFIX}/decisions", params=params)
 
-    assert response.status_code == 400
-    assert json.loads(response.body)["error"] == "agent_id is required"
-
-
-def test_list_decisions_rejects_bad_paging(monkeypatch):
-    install_repository(monkeypatch)
-    bad_type = asyncio.run(
-        main.list_cbac_decisions(stub_query_request(agent_id="did:agent", limit="abc"))
-    )
-    out_of_range = asyncio.run(
-        main.list_cbac_decisions(stub_query_request(agent_id="did:agent", offset=-1))
-    )
-
-    assert bad_type.status_code == 400
-    assert "integers" in json.loads(bad_type.body)["error"]
-    assert out_of_range.status_code == 400
+    assert response.status_code == 422
+    body = response.json()
+    assert body["success"] is False
+    assert body["message"] == "request validation failed"
+    # Same envelope as every other response, not FastAPI's own {"detail": ...}.
+    assert set(body) == {"success", "message", "data"}
 
 
 def test_read_decision_returns_the_row(monkeypatch):
     install_repository(monkeypatch, one=decision_row(42, decision="deny"))
     response = asyncio.run(main.read_cbac_decision(42))
 
-    payload = json.loads(response.body)
+    payload = envelope(response)["data"]
     assert payload["id"] == 42
     assert payload["decision"] == "deny"
 
@@ -252,7 +402,8 @@ def test_read_decision_404s_when_absent(monkeypatch):
     response = asyncio.run(main.read_cbac_decision(999))
 
     assert response.status_code == 404
-    assert "999" in json.loads(response.body)["error"]
+    assert envelope(response)["success"] is False
+    assert "999" in envelope(response)["message"]
 
 
 # ── LHI trust scores ──────────────────────────────────────────────────────────
@@ -300,10 +451,10 @@ def test_lhi_scores_groups_edges_by_agent(monkeypatch):
         ],
     )
     response = asyncio.run(
-        main.read_lhi_scores(stub_request({"agent_ids": ["did:a", "did:b"]}))
+        main.read_lhi_scores(LHIScoresRequest(agent_ids=["did:a", "did:b"]))
     )
 
-    payload = json.loads(response.body)
+    payload = envelope(response)["data"]
     assert {e["callee_name"] for e in payload["agents"]["did:a"]} == {
         "github_tool",
         "slack_tool",
@@ -316,56 +467,38 @@ def test_lhi_scores_includes_agents_with_no_history(monkeypatch):
     """An agent with no trust record yet is still a key, mapped to []."""
     install_lhi_repository(monkeypatch, records=[lhi_row("did:a")])
     response = asyncio.run(
-        main.read_lhi_scores(stub_request({"agent_ids": ["did:a", "did:no-history"]}))
+        main.read_lhi_scores(LHIScoresRequest(agent_ids=["did:a", "did:no-history"]))
     )
 
-    payload = json.loads(response.body)
-    assert payload["agents"]["did:no-history"] == []
+    assert envelope(response)["data"]["agents"]["did:no-history"] == []
 
 
 def test_lhi_scores_forwards_requested_ids(monkeypatch):
     calls = []
     install_lhi_repository(monkeypatch, calls=calls)
-    asyncio.run(main.read_lhi_scores(stub_request({"agent_ids": ["did:a", "did:b"]})))
+    asyncio.run(main.read_lhi_scores(LHIScoresRequest(agent_ids=["did:a", "did:b"])))
 
     assert calls == [["did:a", "did:b"]]
 
 
-def test_lhi_scores_rejects_missing_or_empty_list(monkeypatch):
-    install_lhi_repository(monkeypatch)
-    missing = asyncio.run(main.read_lhi_scores(stub_request({})))
-    empty = asyncio.run(main.read_lhi_scores(stub_request({"agent_ids": []})))
-    not_a_list = asyncio.run(
-        main.read_lhi_scores(stub_request({"agent_ids": "did:agent"}))
-    )
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},  # agent_ids is required
+        {"agent_ids": []},  # ...and must not be empty
+        {"agent_ids": "did:agent"},  # ...and must be a list, not a string
+        {"agent_ids": ["did:a", 42]},  # entries must be strings
+        {"agent_ids": ["did:a", ""]},  # ...and not blank
+        {"agent_ids": [f"did:{i}" for i in range(MAX_LHI_AGENTS + 1)]},  # too many
+    ],
+)
+def test_lhi_scores_rejects_bad_batch(body):
+    """Schema-enforced now, so this goes over the real request path — and the
+    engine is deliberately not stubbed: nothing may reach it."""
+    response = TestClient(main.app).post(f"{main.API_PREFIX}/lhi-scores", json=body)
 
-    for response in (missing, empty, not_a_list):
-        assert response.status_code == 400
-        assert "agent_ids" in json.loads(response.body)["error"]
-
-
-def test_lhi_scores_rejects_non_string_entries(monkeypatch):
-    install_lhi_repository(monkeypatch)
-    response = asyncio.run(
-        main.read_lhi_scores(stub_request({"agent_ids": ["did:a", 42]}))
-    )
-
-    assert response.status_code == 400
-    assert "agent_ids" in json.loads(response.body)["error"]
-
-
-def test_lhi_scores_rejects_oversized_batch(monkeypatch):
-    install_lhi_repository(monkeypatch)
-    response = asyncio.run(
-        main.read_lhi_scores(
-            stub_request(
-                {"agent_ids": [f"did:{i}" for i in range(main.MAX_LHI_AGENTS + 1)]}
-            )
-        )
-    )
-
-    assert response.status_code == 400
-    assert str(main.MAX_LHI_AGENTS) in json.loads(response.body)["error"]
+    assert response.status_code == 422
+    assert response.json()["success"] is False
 
 
 def _recording_precompute(calls, result=7):
@@ -381,36 +514,35 @@ def test_precompute_forwards_supplied_policy(monkeypatch):
     install_cbac(monkeypatch, index_policy=_recording_precompute(calls))
     response = asyncio.run(
         main.precompute_policy(
-            stub_request({"agent_id": "did:agent", "policy": "allowed-actions: read"})
+            PrecomputePolicyRequest(
+                agent_id="did:agent", policy="allowed-actions: read"
+            )
         )
     )
 
     assert calls == [{"agent_id": "did:agent", "policy": "allowed-actions: read"}]
-    assert json.loads(response.body) == {"agent_id": "did:agent", "chunks_stored": 7}
+    assert envelope(response)["data"] == {"agent_id": "did:agent", "chunks_stored": 7}
 
 
 def test_precompute_without_policy_passes_none(monkeypatch):
     # None is the signal to read the agent's card from the Provenance Layer.
     calls = []
     install_cbac(monkeypatch, index_policy=_recording_precompute(calls))
-    asyncio.run(main.precompute_policy(stub_request({"agent_id": "did:agent"})))
+    asyncio.run(main.precompute_policy(PrecomputePolicyRequest(agent_id="did:agent")))
 
     assert calls == [{"agent_id": "did:agent", "policy": None}]
 
 
 def test_precompute_rejects_non_string_policy(monkeypatch):
-    async def never(session, agent_id, policy):
-        raise AssertionError("should not reach the engine")
-
-    install_cbac(monkeypatch, precompute_policy=never)
-    response = asyncio.run(
-        main.precompute_policy(
-            stub_request({"agent_id": "did:agent", "policy": {"a": 1}})
-        )
+    """The engine must never see a non-string policy — the schema stops it
+    before the handler, so nothing is stubbed here on purpose."""
+    response = TestClient(main.app).post(
+        f"{main.API_PREFIX}/policies/precompute",
+        json={"agent_id": "did:agent", "policy": {"a": 1}},
     )
 
-    assert response.status_code == 400
-    assert json.loads(response.body)["error"] == "policy must be a string"
+    assert response.status_code == 422
+    assert response.json()["success"] is False
 
 
 # ── Local policy source (CBAC_LOCAL_POLICY_DIR) ───────────────────────────────
