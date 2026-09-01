@@ -303,6 +303,7 @@ async def insert_cbac_decision(
     callee_type: str | None,
     error_code: int | None,
     interaction_hash: str,
+    intent_id: str | None = None,
 ) -> CBACDecision:
     """Append one authorization verdict to the audit log. Commits.
 
@@ -316,7 +317,9 @@ async def insert_cbac_decision(
     (``CBAC._interaction_hash``) immediately before this call — passed in
     rather than computed here so the repository layer stays pure DB access
     with no hashing/business logic of its own. The salt makes it unique per
-    row, not a content-derived dedup key.
+    row, not a content-derived dedup key. ``intent_id`` is the caller's own
+    opaque correlation id, stored and returned verbatim — never generated or
+    validated here.
     """
     record = CBACDecision(
         agent_id=agent_id,
@@ -328,6 +331,7 @@ async def insert_cbac_decision(
         callee_type=callee_type,
         error_code=error_code,
         interaction_hash=interaction_hash,
+        intent_id=intent_id,
     )
     session.add(record)
     await session.commit()

@@ -138,6 +138,13 @@ class CBACDecision(Base):
     # NULL when the caller supplied none, rather than an empty string, so
     # "not provided" stays distinguishable from "provided as empty".
     user_intent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Opaque id the caller generates upstream — at the workflow's first
+    # envelope, before it fans out into individual guarded calls — and passes
+    # through unchanged. CBAC never parses or validates it; it exists so a
+    # caller can correlate its own logs with this row without a hash lookup.
+    # Nullable: a caller that never had one to send leaves it NULL, same
+    # treatment as user_intent above.
+    intent_id: Mapped[str | None] = mapped_column(String, nullable=True)
     callee_name: Mapped[str | None] = mapped_column(String, nullable=True)
     callee_type: Mapped[str | None] = mapped_column(
         String, nullable=True

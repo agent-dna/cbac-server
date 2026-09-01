@@ -1,4 +1,3 @@
-import os
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
@@ -12,7 +11,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from cbac_service import error_codes as ec
 from cbac_service.cbac import CBAC
+from cbac_service.config import (
+    AGENTDNA_API_KEY,
+    CBAC_SERVICE_HOST,
+    CBAC_SERVICE_PORT,
+    PROVENANCE_URL,
+)
 from cbac_service.db.engine import close_db, get_session
 from cbac_service.db.models import CBACDecision, LHIRecord
 from cbac_service.db.repository import (
@@ -36,10 +42,6 @@ logger = structlog.get_logger("cbac_service.api")
 
 _cbac: CBAC | None = None
 
-# Fail closed when a call arrives without the root user intent: the drift check
-# is half the decision, and a caller that omits it gets neither half.
-REQUIRE_CONTEXT = os.environ.get("CBAC_REQUIRE_CONTEXT", "true").lower() == "true"
-
 
 def _get_cbac() -> CBAC:
     """The decision engine, built on first use.
@@ -53,7 +55,8 @@ def _get_cbac() -> CBAC:
         _cbac = CBAC(
             provenance=Provenance(
                 name="cbac-service",
-                api_key=os.environ.get("AGENTDNA_API_KEY", ""),
+                api_key=AGENTDNA_API_KEY,
+                provenance_url=PROVENANCE_URL,
             )
         )
     return _cbac
@@ -182,8 +185,14 @@ async def authorize_cbac(body: AuthorizeRequest) -> JSONResponse:
                 user_intent=body.user_intent,
                 callee_name=body.callee_name,
                 callee_type=body.callee_type,
+                intent_id=body.intent_id,
             )
-        decision, reason, error_code = result.decision, result.reason, result.error_code
+        decision, reason, status_code = (
+            result.decision,
+            result.reason,
+            result.error_code,
+        )
+        interaction_hash = result.interaction_hash
         logger.info(
             "cbac decision",
             decision=decision,
@@ -194,11 +203,19 @@ async def authorize_cbac(body: AuthorizeRequest) -> JSONResponse:
             trust=result.trust,
         )
     except Exception as exc:
-        decision, reason, error_code = "error", str(exc), None
+        # Raised before or around _decide (e.g. the DB session never opens),
+        # so there is no CBACResult and no cbac_decisions row — a pipeline
+        # error_code would misattribute this to a layer that never ran.
+        decision, reason, status_code = "error", str(exc), ec.API_UNHANDLED_EXCEPTION
+        interaction_hash = None
         logger.exception("cbac authorization failed")
 
     response = api_response(
-        data={"decision": decision, "error_code": error_code},
+        data={
+            "decision": decision,
+            "status_code": status_code,
+            "hash": interaction_hash,
+        },
         message=reason,
         # The gate ran and answered; the answer itself lives in data.decision.
         success=decision != "error",
@@ -221,6 +238,7 @@ def _decision_json(record: CBACDecision) -> dict:
         "reason": record.reason,
         "error_code": record.error_code,
         "interaction_hash": record.interaction_hash,
+        "intent_id": record.intent_id,
         "intended_action": record.intended_action,
         "user_intent": record.user_intent,
         "callee_name": record.callee_name,
@@ -399,8 +417,8 @@ app.include_router(router)
 if __name__ == "__main__":
     uvicorn.run(
         app,
-        host=os.environ.get("CBAC_SERVICE_HOST", "127.0.0.1"),
-        port=int(os.environ.get("CBAC_SERVICE_PORT", "8767")),
+        host=CBAC_SERVICE_HOST,
+        port=CBAC_SERVICE_PORT,
         # None = keep our JSON config; uvicorn's default would re-add its own handlers.
         log_config=None,
     )
