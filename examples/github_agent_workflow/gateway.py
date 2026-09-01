@@ -97,7 +97,7 @@ class CBACMiddleware(Middleware):
             obj = await server.get_tool(tool_name)
             tool_description = (obj.description or "").partition("\n")[0] or None
 
-        result = await authorize(
+        _status_code, _interaction_hash, decision, message = await authorize(
             agent_id,
             tool_name,
             tool_args,
@@ -108,9 +108,8 @@ class CBACMiddleware(Middleware):
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )
-        # result = await decide(context, "get_tool", agent_id, user_intent)
-        if result.decision != "allow":
-            raise ToolError(denial_body(result.decision, result.message))
+        if decision != "allow":
+            raise ToolError(denial_body(decision, message))
         return await call_next(context)
 
     async def on_read_resource(self, context, call_next):
@@ -140,7 +139,7 @@ class CBACMiddleware(Middleware):
                     description = first or None
                     break
 
-        result = await authorize(
+        _status_code, _interaction_hash, decision, message = await authorize(
             agent_id,
             name or key,
             args,
@@ -151,8 +150,8 @@ class CBACMiddleware(Middleware):
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )
-        if result.decision != "allow":
-            raise ResourceError(denial_body(result.decision, result.message))
+        if decision != "allow":
+            raise ResourceError(denial_body(decision, message))
         return await call_next(context)
 
     # ``prompts/get`` is deliberately not gated. Prompts are user-controlled in
