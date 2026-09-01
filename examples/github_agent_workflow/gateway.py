@@ -46,7 +46,7 @@ from fastmcp.exceptions import ResourceError, ToolError
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.middleware import Middleware
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cbac" / "src"))
 
 from cbac.guard import authorize
 from cbac.mcp import context_from_headers, denial_body
@@ -87,6 +87,7 @@ class CBACMiddleware(Middleware):
         ctx = context_from_headers(get_http_headers())
         agent_id = (ctx.agent_id if ctx else "") or AGENT_ID
         user_intent = ctx.user_intent if ctx else ""
+        intent_id = ctx.intent_id if ctx else ""
         message = context.message
         tool_name, tool_args = message.name, dict(message.arguments or {})
 
@@ -103,6 +104,7 @@ class CBACMiddleware(Middleware):
             user_intent,
             tool_description,
             callee_type="mcp",
+            intent_id=intent_id,
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )
@@ -122,6 +124,7 @@ class CBACMiddleware(Middleware):
         ctx = context_from_headers(get_http_headers())
         agent_id = (ctx.agent_id if ctx else "") or AGENT_ID
         user_intent = ctx.user_intent if ctx else ""
+        intent_id = ctx.intent_id if ctx else ""
         # A URI carries its arguments inside it — github://acme/api/… — so it
         # is both the lookup key and the whole argument set.
         key = str(context.message.uri)
@@ -144,6 +147,7 @@ class CBACMiddleware(Middleware):
             user_intent,
             description,
             callee_type="mcp",
+            intent_id=intent_id,
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )

@@ -1,26 +1,19 @@
 """
 MCP integration for the CBAC guard (optional).
 
-Requires the ``mcp`` package (declared in the ``dev`` dependency group).
+Pure stdlib: the context is HTTP headers, so nothing here imports the MCP
+SDK -- only the enforcement point that calls it does.
 
-Two enforcement topologies live here, and they are not equivalent:
-
-**Gateway-enforced (preferred).** The agent's MCP client points at a CBAC
-gateway instead of at the MCP server. The client's only job is to *label*
-each outgoing call with the governance context (:func:`cbac_propagate`);
-the gateway extracts that label, calls the decision service, and forwards
-or blocks. The developer holds no security logic and cannot switch the
-check off -- dropping :func:`cbac_propagate` does not bypass CBAC, it just
-makes every call arrive contextless, which a fail-closed gateway denies.
-See ``examples/github_agent_workflow/gateway.py`` for the gateway half.
-
-**Client-enforced (fallback).** :func:`cbac_intercept` calls the decision
-service from inside the client process. Use it only where no gateway can
-sit in the path -- a laptop agent talking straight to a remote MCP server.
-It is real enforcement against a *confused* agent, but not against a
-developer who declines to install it.
-
-Both share the same governance context and the same one-HTTP-call gate.
+Enforcement is gateway-side. The agent's MCP client points at a CBAC
+gateway instead of at the MCP server, and the client's only job is to
+*label* each outgoing call with the governance context
+(:func:`cbac_propagate`); the gateway extracts that label
+(:func:`context_from_headers`), calls the decision service, and forwards
+or blocks (:func:`denial_body`). The developer holds no security logic and
+cannot switch the check off -- dropping :func:`cbac_propagate` does not
+bypass CBAC, it only makes calls arrive unlabelled, and what a gateway
+does with an unlabelled call is the gateway's policy. See
+``examples/github_agent_workflow/gateway.py`` for the gateway half.
 
 The context travels as HTTP headers because that is the only per-call
 channel MCP client adapters expose today (``langchain_mcp_adapters``
@@ -36,24 +29,23 @@ import json
 import re
 from urllib.parse import quote, unquote
 
-from mcp.types import CallToolResult, TextContent
-
 # Re-exported so MCP users import the whole recipe from one place.
 from .guard import (
     GovernanceContext,
-    authorize_tool_call,
+    # authorize_tool_call,  # commented out in guard.py for now
     cbac_context,
-    cbac_guard,
+    # cbac_guard,  # commented out in guard.py for now
     get_context,
 )
 
 __all__ = [
     "CBAC_AGENT_HEADER",
     "CBAC_INTENT_HEADER",
+    "CBAC_INTENT_ID_HEADER",
     "cbac_context",
-    "cbac_guard",
+    # "cbac_guard",
     "cbac_headers",
-    "cbac_intercept",
+    # "cbac_intercept",
     "cbac_propagate",
     "context_from_headers",
     "denial_body",
@@ -69,8 +61,13 @@ __all__ = [
 # pinned by the gateway from its authenticated principal (OAuth subject, mTLS
 # SAN, API key) wherever one exists; the header is the fallback for a trusted
 # network only.
+# ``intent_id`` is neither: it is the caller's own opaque correlation id, minted
+# upstream at the workflow's first envelope. CBAC never parses or validates it,
+# only threads it to the audit row and its hash -- so a client that forges one
+# corrupts its own trace and nothing else.
 CBAC_AGENT_HEADER = "X-CBAC-Agent-Id"
 CBAC_INTENT_HEADER = "X-CBAC-User-Intent"
+CBAC_INTENT_ID_HEADER = "X-CBAC-Intent-Id"
 
 # Headers are latin-1 and size-capped by every HTTP stack in the path, while a
 # user intent is arbitrary UTF-8 of arbitrary length. Percent-encode, then cap
@@ -97,10 +94,15 @@ def cbac_headers() -> dict[str, str]:
     ctx = get_context()
     if ctx is None:
         return {}
-    return {
+    headers = {
         CBAC_AGENT_HEADER: quote(ctx.agent_id, safe=""),
         CBAC_INTENT_HEADER: _encode_intent(ctx.user_intent),
     }
+    # Only when there is one: a workflow that mints no correlation id should
+    # not put an empty header on every call it makes.
+    if ctx.intent_id:
+        headers[CBAC_INTENT_ID_HEADER] = quote(ctx.intent_id, safe="")
+    return headers
 
 
 async def cbac_propagate(request, handler):
@@ -137,30 +139,33 @@ def context_from_headers(headers: dict[str, str]) -> GovernanceContext | None:
     return GovernanceContext(
         agent_id=unquote(agent_id or ""),
         user_intent=unquote(intent or ""),
+        intent_id=unquote(lowered.get(CBAC_INTENT_ID_HEADER.lower()) or ""),
     )
 
 
-async def cbac_intercept(request, handler):
-    """Client-side *enforcement*: authorize each call before it leaves.
+# Commented out for now: this repo enforces at the gateway, and nothing here
+# uses the client-side interceptor.
+# async def cbac_intercept(request, handler):
+#     """Client-side *enforcement*: authorize each call before it leaves.
 
-    The fallback topology -- use it only where no gateway can sit in the
-    path. All CBAC logic lives in :func:`~cbac.guard.authorize_tool_call`;
-    this only maps the MCP request/result types and renders the denial, so
-    another framework needs just its own equally thin adapter. Requires an
-    open :func:`cbac_context`; without one it is a passthrough.
-    """
-    # MCPToolCallRequest (verified ≤0.3.2 and upstream main) carries no tool
-    # description — only name/args/server_name/headers/runtime — so this reads
-    # None today and the de-snaked tool name becomes the verb phrase. A gateway
-    # does better: it has the upstream tool's real description locally.
-    description = getattr(request, "description", None)
-    result = await authorize_tool_call(
-        request.name, request.args, description, callee_type="mcp"
-    )
-    if result.decision != "allow":
-        return _denied_result(result.decision, result.message)
+#     The fallback topology -- use it only where no gateway can sit in the
+#     path. All CBAC logic lives in :func:`~cbac.guard.authorize_tool_call`;
+#     this only maps the MCP request/result types and renders the denial, so
+#     another framework needs just its own equally thin adapter. Requires an
+#     open :func:`cbac_context`; without one it is a passthrough.
+#     """
+#     # MCPToolCallRequest (verified ≤0.3.2 and upstream main) carries no tool
+#     # description — only name/args/server_name/headers/runtime — so this reads
+#     # None today and the de-snaked tool name becomes the verb phrase. A gateway
+#     # does better: it has the upstream tool's real description locally.
+#     description = getattr(request, "description", None)
+#     result = await authorize_tool_call(
+#         request.name, request.args, description, callee_type="mcp"
+#     )
+#     if result.decision != "allow":
+#         return _denied_result(result.decision, result.message)
 
-    return await handler(request)
+#     return await handler(request)
 
 
 def denial_body(decision: str, detail: str) -> str:
@@ -175,9 +180,9 @@ def denial_body(decision: str, detail: str) -> str:
     return json.dumps({"status": status, "error": detail})
 
 
-def _denied_result(decision: str, detail: str) -> CallToolResult:
-    # is_error defaults to False; passing it explicitly is unresolvable for pyright
-    # because mcp 2.0 generates the camelCase alias via alias_generator.
-    return CallToolResult(
-        content=[TextContent(type="text", text=denial_body(decision, detail))]
-    )
+# def _denied_result(decision: str, detail: str) -> CallToolResult:
+#     # is_error defaults to False; passing it explicitly is unresolvable for pyright
+#     # because mcp 2.0 generates the camelCase alias via alias_generator.
+#     return CallToolResult(
+#         content=[TextContent(type="text", text=denial_body(decision, detail))]
+#     )

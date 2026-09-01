@@ -1,4 +1,3 @@
-import os
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
@@ -14,6 +13,12 @@ from sqlalchemy import text
 
 from cbac_service import error_codes as ec
 from cbac_service.cbac import CBAC
+from cbac_service.config import (
+    AGENTDNA_API_KEY,
+    CBAC_SERVICE_HOST,
+    CBAC_SERVICE_PORT,
+    PROVENANCE_URL,
+)
 from cbac_service.db.engine import close_db, get_session
 from cbac_service.db.models import CBACDecision, LHIRecord
 from cbac_service.db.repository import (
@@ -37,10 +42,6 @@ logger = structlog.get_logger("cbac_service.api")
 
 _cbac: CBAC | None = None
 
-# Fail closed when a call arrives without the root user intent: the drift check
-# is half the decision, and a caller that omits it gets neither half.
-REQUIRE_CONTEXT = os.environ.get("CBAC_REQUIRE_CONTEXT", "true").lower() == "true"
-
 
 def _get_cbac() -> CBAC:
     """The decision engine, built on first use.
@@ -54,7 +55,8 @@ def _get_cbac() -> CBAC:
         _cbac = CBAC(
             provenance=Provenance(
                 name="cbac-service",
-                api_key=os.environ.get("AGENTDNA_API_KEY", ""),
+                api_key=AGENTDNA_API_KEY,
+                provenance_url=PROVENANCE_URL,
             )
         )
     return _cbac
@@ -415,8 +417,8 @@ app.include_router(router)
 if __name__ == "__main__":
     uvicorn.run(
         app,
-        host=os.environ.get("CBAC_SERVICE_HOST", "127.0.0.1"),
-        port=int(os.environ.get("CBAC_SERVICE_PORT", "8767")),
+        host=CBAC_SERVICE_HOST,
+        port=CBAC_SERVICE_PORT,
         # None = keep our JSON config; uvicorn's default would re-add its own handlers.
         log_config=None,
     )

@@ -114,7 +114,6 @@ class CBAC:
     def __init__(
         self,
         provenance: Provenance,
-        cbac_url: str = "https://cbac-admin.agentdna.io",
         encoder_name: str = ENCODER_MODEL,
         nli_model_name: str = NLI_MODEL,
         # Contract: an async callable taking (intent_text, policy_text) and
@@ -129,7 +128,6 @@ class CBAC:
         lhi_lambda_down: float = LHI_LAMBDA_DOWN,
     ):
         self.provenance = provenance
-        self.cbac_url = cbac_url
         self._encoder_name = encoder_name
         self._nli_model_name = nli_model_name
         self._llm_backend = llm_backend
@@ -547,6 +545,11 @@ class CBAC:
                 hallucination_score=result.hallucination_score,
             )
         except Exception:
+            # The audit write runs next on this same session. A failed insert
+            # leaves the transaction pending-rollback, so without this the trust
+            # fold takes the decision record down with it -- and `cbac_decisions`
+            # is the one table that must have no skip conditions.
+            await session.rollback()
             logger.warning(
                 "lhi trust update failed",
                 callee_name=callee_name,

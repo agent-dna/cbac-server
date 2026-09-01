@@ -9,13 +9,13 @@ pull it in.
 from .guard import (
     GovernanceContext,
     cbac_context,
-    cbac_guard,
+    # cbac_guard,  # commented out in guard.py for now
     get_context,
 )
 
 __all__ = [
     "GovernanceContext",
     "cbac_context",
-    "cbac_guard",
+    # "cbac_guard",
     "get_context",
 ]

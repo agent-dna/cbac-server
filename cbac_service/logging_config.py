@@ -7,9 +7,10 @@ boundary rides along on every line emitted while handling that request.
 """
 
 import logging
-import os
 
 import structlog
+
+from cbac_service.config import CBAC_SERVICE_LOG_LEVEL
 
 _SHARED = [
     structlog.contextvars.merge_contextvars,
@@ -45,7 +46,7 @@ def setup_logging(level: str | None = None) -> None:
         )
     )
     logging.basicConfig(
-        level=level or os.environ.get("CBAC_SERVICE_LOG_LEVEL", "INFO").upper(),
+        level=level or CBAC_SERVICE_LOG_LEVEL,
         handlers=[handler],
         force=True,
     )

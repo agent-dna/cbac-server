@@ -1,6 +1,25 @@
 # Tunables for the CBAC decision pipeline (cbac_service/cbac.py).
+#
+# Every environment variable this service reads is read *here*, once, and each
+# constant is named after the variable it comes from — so `.env.sample` and this
+# file are the same list, and nothing has to be grepped for. The guard (`cbac/`)
+# is the exception by construction: it is a separate distribution that cannot
+# import this module, so it reads its own three variables per call.
 
 import os
+
+# ── Provenance Layer ──────────────────────────────────────────────────────────
+# Rubix chain connector the policy is fetched from. Pinned here rather than left
+# to the agent-dna client's own default, so which chain this service talks to is
+# visible in this file; a deployment points it elsewhere (a staging connector, a
+# self-hosted node) without touching code.
+PROVENANCE_URL: str = os.environ.get(
+    "PROVENANCE_URL", "https://chain-connector-2.rubix.net"
+)
+
+# Provenance Layer credential. Empty is a valid deployment: the client is
+# constructed either way and fails on use, not on import.
+AGENTDNA_API_KEY: str = os.environ.get("AGENTDNA_API_KEY", "")
 
 # ── Database ──────────────────────────────────────────────────────────────────
 # Async Postgres connection string (asyncpg driver).
@@ -53,3 +72,8 @@ LHI_LAMBDA_DOWN = 0.70
 # split further only past this word-count budget (~1.3 tokens/word for English).
 CHUNK_MAX_WORDS = 120
 NLI_BATCH_SIZE = 64
+
+# ── Service binding & logging ─────────────────────────────────────────────────
+CBAC_SERVICE_HOST: str = os.environ.get("CBAC_SERVICE_HOST", "127.0.0.1")
+CBAC_SERVICE_PORT: int = int(os.environ.get("CBAC_SERVICE_PORT", "8767"))
+CBAC_SERVICE_LOG_LEVEL: str = os.environ.get("CBAC_SERVICE_LOG_LEVEL", "INFO").upper()

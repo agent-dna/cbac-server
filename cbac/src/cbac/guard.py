@@ -37,11 +37,11 @@ already holds the governance context:
 
 - :func:`authorize` takes everything as arguments -- for an enforcement
   point that parsed the context off the wire, such as an MCP gateway.
-- :func:`authorize_tool_call` and ``@cbac_guard`` read it from a
-  ``contextvars.ContextVar`` set once at the request entry point via
-  :func:`cbac_context` -- for in-process calls, which have no way to
-  thread it down to the call site. It is never a function argument
-  there, so an LLM can neither supply nor forge it.
+- :func:`authorize_tool_call` reads it from a ``contextvars.ContextVar``
+  set once at the request entry point via :func:`cbac_context` -- for
+  in-process calls, which have no way to thread it down to the call
+  site. It is never a function argument there, so an LLM can neither
+  supply nor forge it.
 
 Static config comes from the decorator's own parameters. Where the
 decision service is (``cbac_url``, ``cbac_endpoint``, ``cbac_timeout``)
@@ -55,10 +55,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import functools
-import inspect
 import os
-from collections.abc import Awaitable, Callable, Iterator
+
+# functools and inspect are only needed by the commented-out decorator below.
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -131,15 +131,15 @@ def _stringify(args: dict[str, Any]) -> dict[str, str]:
     return {k: str(v) for k, v in args.items()}
 
 
-def _bind_kwargs(sig: inspect.Signature, args: tuple, kwargs: dict) -> dict[str, Any]:
-    """Flatten positional + keyword call args into a name->value dict."""
-    try:
-        bound = sig.bind(*args, **kwargs)
-        bound.apply_defaults()
-        return dict(bound.arguments)
-    except TypeError:
-        # Let the wrapped function raise its own error on the real call.
-        return dict(kwargs)
+# def _bind_kwargs(sig: inspect.Signature, args: tuple, kwargs: dict) -> dict[str, Any]:
+#     """Flatten positional + keyword call args into a name->value dict."""
+#     try:
+#         bound = sig.bind(*args, **kwargs)
+#         bound.apply_defaults()
+#         return dict(bound.arguments)
+#     except TypeError:
+#         # Let the wrapped function raise its own error on the real call.
+#         return dict(kwargs)
 
 
 def _payload(
@@ -323,141 +323,144 @@ async def authorize(
     )
 
 
-async def authorize_tool_call(
-    callee_name: str,
-    args: dict[str, Any],
-    description: str | None = None,
-    callee_type: str = "tool",
-) -> AuthResult:
-    """Authorize one tool call against the *ambient* policy (decision only).
+# Commented out with cbac_intercept, its only caller.
+# async def authorize_tool_call(
+#     callee_name: str,
+#     args: dict[str, Any],
+#     description: str | None = None,
+#     callee_type: str = "tool",
+# ) -> AuthResult:
+#     """Authorize one tool call against the *ambient* policy (decision only).
 
-    :func:`authorize` for in-process callers, which have no way to thread
-    the governance context down to the call site and read it from
-    :func:`cbac_context` instead.
+#     :func:`authorize` for in-process callers, which have no way to thread
+#     the governance context down to the call site and read it from
+#     :func:`cbac_context` instead.
 
-    ``decision`` is ``"allow"`` when governance is off (no
-    :func:`cbac_context` open), so a caller can always proceed on
-    ``"allow"`` and short-circuit otherwise.
-    """
-    ctx = get_context()
-    if ctx is None:
-        return AuthResult("allow", "")
-    return await authorize(
-        ctx.agent_id,
-        callee_name,
-        args,
-        ctx.user_intent,
-        description,
-        callee_type,
-        intent_id=ctx.intent_id,
-    )
-
-
-# ── The decorator ─────────────────────────────────────────────────────────────
+#     ``decision`` is ``"allow"`` when governance is off (no
+#     :func:`cbac_context` open), so a caller can always proceed on
+#     ``"allow"`` and short-circuit otherwise.
+#     """
+#     ctx = get_context()
+#     if ctx is None:
+#         return AuthResult("allow", "")
+#     return await authorize(
+#         ctx.agent_id,
+#         callee_name,
+#         args,
+#         ctx.user_intent,
+#         description,
+#         callee_type,
+#         intent_id=ctx.intent_id,
+#     )
 
 
-def cbac_guard(
-    *,
-    action: str | None = None,
-    action_intent: Callable[[dict[str, Any]], str] | None = None,
-    on_deny: str = "return",
-    callee_type: str = "tool",
-):
-    """Guard an async callable with a CBAC authorization gate.
+# Commented out for now: the gateway uses authorize() only, and nothing in
+# this repo wraps a callable with the decorator.
+# # ── The decorator ─────────────────────────────────────────────────────────────
 
-    Parameters
-    ----------
-    action:
-        Logical action name used to label the intent; defaults to the
-        function name.
-    action_intent:
-        ``kwargs -> str`` builder that phrases the action itself, scored
-        verbatim. Left unset -- the normal case -- the service renders the
-        prose from the action name, the call's arguments and the docstring,
-        wording it the same way it words every other enforcement point's
-        calls. Set this only for an action those three do not describe.
-    on_deny:
-        ``"return"`` -> a denied call returns ``{"status": "denied", ...}``
-        (readable by an LLM loop); ``"raise"`` -> raises PermissionError.
-    callee_type:
-        What is on the other end of this edge (``"tool"``, ``"agent"``,
-        ``"mcp"``), recorded with the trust score.
 
-    Behavior
-    --------
-    - No ambient context (:func:`cbac_context` not open): governance is
-      not enabled for this call path, so the guard is a no-op and the
-      wrapped function runs unguarded. Opening a context is a deployment
-      decision an LLM cannot make, so this can never bypass a guard that
-      *is* active -- it only expresses "this path opted out of
-      governance", the same way a route without rate-limiting opts out.
-    - Otherwise: intent (from the call's arguments) -> authorize (one HTTP
-      call to the CBAC decision service) -> a non-allow decision
-      short-circuits -> run the wrapped function -> return the result.
+# def cbac_guard(
+#     *,
+#     action: str | None = None,
+#     action_intent: Callable[[dict[str, Any]], str] | None = None,
+#     on_deny: str = "return",
+#     callee_type: str = "tool",
+# ):
+#     """Guard an async callable with a CBAC authorization gate.
 
-    The trust score is updated service-side while the decision is made, so
-    the guard has nothing to report afterwards -- and a denied call, which
-    never runs, still leaves a record of having been denied.
-    """
-    if on_deny not in ("return", "raise"):
-        raise ValueError(f"unsupported on_deny: {on_deny!r}")
+#     Parameters
+#     ----------
+#     action:
+#         Logical action name used to label the intent; defaults to the
+#         function name.
+#     action_intent:
+#         ``kwargs -> str`` builder that phrases the action itself, scored
+#         verbatim. Left unset -- the normal case -- the service renders the
+#         prose from the action name, the call's arguments and the docstring,
+#         wording it the same way it words every other enforcement point's
+#         calls. Set this only for an action those three do not describe.
+#     on_deny:
+#         ``"return"`` -> a denied call returns ``{"status": "denied", ...}``
+#         (readable by an LLM loop); ``"raise"`` -> raises PermissionError.
+#     callee_type:
+#         What is on the other end of this edge (``"tool"``, ``"agent"``,
+#         ``"mcp"``), recorded with the trust score.
 
-    def decorate(fn: Callable[..., Awaitable[Any]]):
-        if not asyncio.iscoroutinefunction(fn):
-            raise TypeError(f"cbac_guard requires an async function, got {fn!r}")
+#     Behavior
+#     --------
+#     - No ambient context (:func:`cbac_context` not open): governance is
+#       not enabled for this call path, so the guard is a no-op and the
+#       wrapped function runs unguarded. Opening a context is a deployment
+#       decision an LLM cannot make, so this can never bypass a guard that
+#       *is* active -- it only expresses "this path opted out of
+#       governance", the same way a route without rate-limiting opts out.
+#     - Otherwise: intent (from the call's arguments) -> authorize (one HTTP
+#       call to the CBAC decision service) -> a non-allow decision
+#       short-circuits -> run the wrapped function -> return the result.
 
-        action_name = action or fn.__name__
-        sig = inspect.signature(fn)
-        doc = inspect.getdoc(fn)
-        description = doc.splitlines()[0].strip() if doc else None
+#     The trust score is updated service-side while the decision is made, so
+#     the guard has nothing to report afterwards -- and a denied call, which
+#     never runs, still leaves a record of having been denied.
+#     """
+#     if on_deny not in ("return", "raise"):
+#         raise ValueError(f"unsupported on_deny: {on_deny!r}")
 
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
-            ctx = get_context()
+#     def decorate(fn: Callable[..., Awaitable[Any]]):
+#         if not asyncio.iscoroutinefunction(fn):
+#             raise TypeError(f"cbac_guard requires an async function, got {fn!r}")
 
-            # No governance scope open -> governance is opt-in and this
-            # path opted out; run the function exactly as if unguarded.
-            if ctx is None:
-                return await fn(*args, **kwargs)
+#         action_name = action or fn.__name__
+#         sig = inspect.signature(fn)
+#         doc = inspect.getdoc(fn)
+#         description = doc.splitlines()[0].strip() if doc else None
 
-            call_kwargs = _bind_kwargs(sig, args, kwargs)
-            payload = _payload(
-                ctx.agent_id,
-                action_name,
-                call_kwargs,
-                ctx.user_intent,
-                description,
-                callee_type,
-                ctx.intent_id,
-            )
-            if action_intent:
-                # Caller phrases this action itself; the service scores that
-                # text verbatim instead of rendering from the fields above.
-                payload["intended_action"] = action_intent(call_kwargs)
+#         @functools.wraps(fn)
+#         async def wrapper(*args, **kwargs):
+#             ctx = get_context()
 
-            result = await _authorize(payload)
+#             # No governance scope open -> governance is opt-in and this
+#             # path opted out; run the function exactly as if unguarded.
+#             if ctx is None:
+#                 return await fn(*args, **kwargs)
 
-            if result.decision != "allow":
-                if result.decision == "deny" and on_deny == "raise":
-                    raise PermissionError(result.message)
-                status = "denied" if result.decision == "deny" else "error"
-                return {
-                    "status": status,
-                    "error": result.message,
-                    "status_code": result.status_code,
-                    "hash": result.hash,
-                }
+#             call_kwargs = _bind_kwargs(sig, args, kwargs)
+#             payload = _payload(
+#                 ctx.agent_id,
+#                 action_name,
+#                 call_kwargs,
+#                 ctx.user_intent,
+#                 description,
+#                 callee_type,
+#                 ctx.intent_id,
+#             )
+#             if action_intent:
+#                 # Caller phrases this action itself; the service scores that
+#                 # text verbatim instead of rendering from the fields above.
+#                 payload["intended_action"] = action_intent(call_kwargs)
 
-            return await fn(*args, **kwargs)
+#             result = await _authorize(payload)
 
-        # Frameworks (LangChain / MCP) build the LLM-facing tool schema by
-        # introspecting the callable's signature. functools.wraps copies
-        # __name__/__doc__/__annotations__ but leaves the wrapper's own
-        # ``(*args, **kwargs)`` in place, and not every schema generator
-        # follows ``__wrapped__``. Pin the wrapped function's real
-        # signature so the generated schema stays correct.
-        wrapper.__signature__ = sig  # pyright: ignore[reportAttributeAccessIssue]
+#             if result.decision != "allow":
+#                 if result.decision == "deny" and on_deny == "raise":
+#                     raise PermissionError(result.message)
+#                 status = "denied" if result.decision == "deny" else "error"
+#                 return {
+#                     "status": status,
+#                     "error": result.message,
+#                     "status_code": result.status_code,
+#                     "hash": result.hash,
+#                 }
 
-        return wrapper
+#             return await fn(*args, **kwargs)
 
-    return decorate
+#         # Frameworks (LangChain / MCP) build the LLM-facing tool schema by
+#         # introspecting the callable's signature. functools.wraps copies
+#         # __name__/__doc__/__annotations__ but leaves the wrapper's own
+#         # ``(*args, **kwargs)`` in place, and not every schema generator
+#         # follows ``__wrapped__``. Pin the wrapped function's real
+#         # signature so the generated schema stays correct.
+#         wrapper.__signature__ = sig  # pyright: ignore[reportAttributeAccessIssue]
+
+#         return wrapper
+
+#     return decorate

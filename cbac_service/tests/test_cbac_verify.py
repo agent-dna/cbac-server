@@ -278,10 +278,22 @@ def test_early_hard_fail_folds_no_trust_but_is_audited(
 
 def test_trust_failure_does_not_change_decision(rows, decisions, tmp_path, monkeypatch):
     """A DB hiccup during the trust write must never turn a valid decision
-    into a blocked call."""
+    into a blocked call -- nor cost the decision its audit row.
+
+    The audit write runs on the same session moments later, so a failed insert
+    left un-rolled-back poisons it: SQLAlchemy refuses every statement on the
+    session until the pending rollback happens, and `cbac_decisions` silently
+    stops recording. Hence the rollback assertion.
+    """
     import cbac_service.cbac as mod
 
     cbac = make_verify_cbac(tmp_path, monkeypatch)
+
+    class Session:
+        rolled_back = False
+
+        async def rollback(self):
+            Session.rolled_back = True
 
     async def boom(*args, **kwargs):
         raise RuntimeError("connection reset")
@@ -289,7 +301,7 @@ def test_trust_failure_does_not_change_decision(rows, decisions, tmp_path, monke
     monkeypatch.setattr(mod, "insert_lhi_record", boom)
     result = asyncio.run(
         cbac.verify_cbac(
-            session=None,
+            session=Session(),  # pyright: ignore[reportArgumentType]
             agent_id=AGENT_ID,
             intended_action="read pull requests",
             user_intent="Please show me the pull requests",
@@ -298,6 +310,8 @@ def test_trust_failure_does_not_change_decision(rows, decisions, tmp_path, monke
     )
     assert result.decision == "deny"
     assert result.trust is None
+    assert Session.rolled_back, "a poisoned session takes the audit row with it"
+    assert len(decisions) == 1  # the decision was still recorded
 
 
 # ── Decision audit log ────────────────────────────────────────────────────────

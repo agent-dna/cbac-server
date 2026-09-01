@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import uuid
 from pathlib import Path
 
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cbac" / "src"))
 
 from agent import (
     CBAC_AGENT_ID,
@@ -138,6 +139,9 @@ async def check() -> None:
     ``draft_summary`` only rewraps text. Probe 4 is the one real network call,
     and it is read-only.
     """
+    # One correlation id for the whole run: every decision below lands in the
+    # audit log under it, so one check run is one queryable trace.
+    intent_id = uuid.uuid4().hex
     tools = {tool.name: tool for tool in await _mcp_client().get_tools()}
     unlabelled = {
         tool.name: tool for tool in await _mcp_client(labelled=False).get_tools()
@@ -150,7 +154,9 @@ async def check() -> None:
     print(f"[cbac] service={CBAC_URL} gateway={GATEWAY_URL} agent_id={CBAC_AGENT_ID}\n")
     close = {"repo": "owner/repo", "number": 3}
     with cbac_context(
-        agent_id=CBAC_AGENT_ID, user_intent="Close issue #3 in owner/repo"
+        agent_id=CBAC_AGENT_ID,
+        user_intent="Close issue #3 in owner/repo",
+        intent_id=intent_id,
     ):
         denied = await _tool(tools, "close_issue").ainvoke(close)
         unlabelled_result = await _tool(unlabelled, "close_issue").ainvoke(close)
@@ -158,7 +164,9 @@ async def check() -> None:
 
     # Same gateway, same policy, a server nobody here owns or can decorate.
     with cbac_context(
-        agent_id=CBAC_AGENT_ID, user_intent="What docs exist for " + THIRDPARTY_REPO
+        agent_id=CBAC_AGENT_ID,
+        user_intent="What docs exist for " + THIRDPARTY_REPO,
+        intent_id=intent_id,
     ):
         third_party = await _tool(tools, "read_wiki_structure").ainvoke(
             {"repoName": THIRDPARTY_REPO}
@@ -172,11 +180,15 @@ async def check() -> None:
     # reachable as a resource. prompts/get is not gated — see the note in
     # gateway.py — so it passes through and is here to show that.
     with cbac_context(
-        agent_id=CBAC_AGENT_ID, user_intent="Who can write to owner/repo?"
+        agent_id=CBAC_AGENT_ID,
+        user_intent="Who can write to owner/repo?",
+        intent_id=intent_id,
     ):
         resource = await _read_collaborators("owner", "repo")
     with cbac_context(
-        agent_id=CBAC_AGENT_ID, user_intent="Give me a review checklist for owner/repo"
+        agent_id=CBAC_AGENT_ID,
+        user_intent="Give me a review checklist for owner/repo",
+        intent_id=intent_id,
     ):
         prompt = await _get_review_checklist("owner/repo")
 

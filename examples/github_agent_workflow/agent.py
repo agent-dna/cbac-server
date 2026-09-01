@@ -51,6 +51,7 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 import httpx
@@ -61,9 +62,9 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-# The cbac package lives in this repo's checkout (it ships no wheel), two
-# directories up from examples/github_agent_workflow/.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Import the guard from this checkout rather than from PyPI, so the example
+# always runs against the code next to it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cbac" / "src"))
 
 from cbac import cbac_context
 from cbac.mcp import cbac_propagate
@@ -334,7 +335,12 @@ async def run(request: str) -> None:
 
     # The root request is the governance context: each guarded call is checked
     # against the agent's policy AND for drift away from what the user asked.
-    with cbac_context(agent_id=CBAC_AGENT_ID, user_intent=request):
+    # ``intent_id`` is minted here, once, and rides along unchanged — every
+    # decision this request causes lands in the audit log under the same id,
+    # so one user request is one queryable trace. CBAC never parses it.
+    with cbac_context(
+        agent_id=CBAC_AGENT_ID, user_intent=request, intent_id=uuid.uuid4().hex
+    ):
         result = await agent.ainvoke({"messages": [HumanMessage(content=request)]})
 
     _print_transcript(result.get("messages", []))
