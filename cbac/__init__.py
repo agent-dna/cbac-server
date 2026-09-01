@@ -8,20 +8,14 @@ pull it in.
 
 from .guard import (
     GovernanceContext,
-    GuardConfig,
     cbac_context,
     cbac_guard,
-    configure,
-    get_config,
     get_context,
 )
 
 __all__ = [
     "GovernanceContext",
-    "GuardConfig",
     "cbac_context",
     "cbac_guard",
-    "configure",
-    "get_config",
     "get_context",
 ]

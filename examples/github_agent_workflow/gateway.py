@@ -48,8 +48,7 @@ from fastmcp.server.middleware import Middleware
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cbac import configure, get_config
-from cbac.guard import AuthResult, authorize
+from cbac.guard import authorize
 from cbac.mcp import context_from_headers, denial_body
 
 load_dotenv()
@@ -73,65 +72,6 @@ CBAC_TIMEOUT = float(os.environ.get("CBAC_TIMEOUT", "600"))
 # instead, in the two lines where the hooks read the header.
 AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
 
-configure(cbac_url=CBAC_URL, cbac_timeout=CBAC_TIMEOUT)
-
-
-async def decide(context, getter, agent_id, user_intent, fallback=None) -> AuthResult:
-    """The gate itself. Returns ``authorize``'s :class:`AuthResult`.
-
-    Every MCP primitive that acts on the world or returns the server's data
-    comes through here — only the exception the caller raises on a non-``allow``
-    differs, because that is all that differs. A gate wired to ``tools/call``
-    alone is not a gate: the same capability is usually reachable as a resource
-    or a prompt, and the client picks which one to use.
-
-    ``getter`` (``get_tool`` or ``get_resource``) says which primitive
-    ``context.message`` holds and looks the callee up on the local proxy for
-    its registered name and first description line — a gateway-side advantage,
-    since a client-side interceptor only has what was on the wire, and NLI
-    scores "close an existing GitHub issue" far better than a de-snaked "close
-    issue". ``get_resource`` resolves only URIs that were registered literally,
-    so a concrete URI for a templated resource
-    (``github://{owner}/{name}/collaborators``) is matched against the
-    templates instead. Worth the extra lookup: the description carries the
-    verb, and without it the key lands in the verb slot, where a forbidden read
-    that should score a clear -0.113 cosine gap scores -0.054 and falls into
-    the gray zone. ``fallback`` is the last resort, never the bare key.
-    """
-    message = context.message
-    if getter == "get_tool":
-        key, args = message.name, dict(message.arguments or {})
-    else:
-        # A URI carries its arguments inside it — github://acme/api/… — so it
-        # is both the lookup key and the whole argument set.
-        key = str(message.uri)
-        args = {"uri": key}
-
-    server = context.fastmcp_context.fastmcp
-    name = description = None
-    with contextlib.suppress(Exception):
-        obj = await getattr(server, getter)(key)
-        name = obj.name
-        description = (obj.description or "").partition("\n")[0] or None
-    if description is None and getter == "get_resource":
-        with contextlib.suppress(Exception):
-            for template in await server.list_resource_templates():
-                if template.matches(key) is not None:
-                    name = template.name
-                    first = (template.description or "").partition("\n")[0]
-                    description = first or None
-                    break
-
-    return await authorize(
-        agent_id,
-        name or key,
-        args,
-        user_intent,
-        description or fallback,
-        callee_type="mcp",
-        cfg=get_config(),
-    )
-
 
 class CBACMiddleware(Middleware):
     """Route every acting MCP primitive crossing this gateway through the gate.
@@ -147,7 +87,26 @@ class CBACMiddleware(Middleware):
         ctx = context_from_headers(get_http_headers())
         agent_id = (ctx.agent_id if ctx else "") or AGENT_ID
         user_intent = ctx.user_intent if ctx else ""
-        result = await decide(context, "get_tool", agent_id, user_intent)
+        message = context.message
+        tool_name, tool_args = message.name, dict(message.arguments or {})
+
+        server = context.fastmcp_context.fastmcp
+        tool_description = None
+        with contextlib.suppress(Exception):
+            obj = await server.get_tool(tool_name)
+            tool_description = (obj.description or "").partition("\n")[0] or None
+
+        result = await authorize(
+            agent_id,
+            tool_name,
+            tool_args,
+            user_intent,
+            tool_description,
+            callee_type="mcp",
+            cbac_url=CBAC_URL,
+            cbac_timeout=CBAC_TIMEOUT,
+        )
+        # result = await decide(context, "get_tool", agent_id, user_intent)
         if result.decision != "allow":
             raise ToolError(denial_body(result.decision, result.message))
         return await call_next(context)
@@ -163,12 +122,30 @@ class CBACMiddleware(Middleware):
         ctx = context_from_headers(get_http_headers())
         agent_id = (ctx.agent_id if ctx else "") or AGENT_ID
         user_intent = ctx.user_intent if ctx else ""
-        result = await decide(
-            context,
-            "get_resource",
+        # A URI carries its arguments inside it — github://acme/api/… — so it
+        # is both the lookup key and the whole argument set.
+        key = str(context.message.uri)
+        args = {"uri": key}
+
+        server = context.fastmcp_context.fastmcp
+        name = description = None
+        with contextlib.suppress(Exception):
+            for template in await server.list_resource_templates():
+                if template.matches(key) is not None:
+                    name = template.name
+                    first = (template.description or "").partition("\n")[0]
+                    description = first or None
+                    break
+
+        result = await authorize(
             agent_id,
+            name or key,
+            args,
             user_intent,
-            fallback="read the resource",
+            description,
+            callee_type="mcp",
+            cbac_url=CBAC_URL,
+            cbac_timeout=CBAC_TIMEOUT,
         )
         if result.decision != "allow":
             raise ResourceError(denial_body(result.decision, result.message))
@@ -205,7 +182,6 @@ gateway = FastMCP.as_proxy(
     name="cbac-gateway",
 )
 gateway.add_middleware(CBACMiddleware())
-
 
 if __name__ == "__main__":
     print(f"[gateway] {GATEWAY_HOST}:{GATEWAY_PORT} -> {UPSTREAM_URL} (github)")

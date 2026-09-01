@@ -43,8 +43,11 @@ already holds the governance context:
   thread it down to the call site. It is never a function argument
   there, so an LLM can neither supply nor forge it.
 
-Static config comes from the decorator's own parameters, and the layer
-config (service URL, timeout) from :func:`configure` at startup.
+Static config comes from the decorator's own parameters. Where the
+decision service is (``cbac_url``, ``cbac_endpoint``, ``cbac_timeout``)
+is an argument to :func:`authorize`, and falls back to ``CBAC_URL`` /
+``CBAC_PATH`` / ``CBAC_TIMEOUT`` in the environment for the ambient
+entry points, which have nowhere to pass it from.
 """
 
 from __future__ import annotations
@@ -56,7 +59,7 @@ import functools
 import inspect
 import os
 from collections.abc import Awaitable, Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     Any,
 )
@@ -112,56 +115,6 @@ def cbac_context(
 
 
 # ── Layer configuration ───────────────────────────────────────────────────────
-
-
-@dataclass
-class GuardConfig:
-    """Where the decision service is and how long to wait for it.
-
-    Every field reads from the environment so a deployment can point the guard
-    somewhere without touching code, and :func:`configure` overrides what it is
-    given. There is no baked-in host: an unset ``CBAC_URL`` leaves ``cbac_url``
-    empty, and :func:`_authorize` fails the call closed rather than sending an
-    agent's actions to whatever host happened to be compiled in.
-    """
-
-    cbac_url: str = field(default_factory=lambda: os.environ.get("CBAC_URL", ""))
-    cbac_path: str = field(
-        default_factory=lambda: os.environ.get("CBAC_PATH", "/cbac/v1/authorize")
-    )
-    cbac_timeout: float = field(
-        default_factory=lambda: float(os.environ.get("CBAC_TIMEOUT", "100"))
-    )
-
-    def authorize_endpoint(self) -> str:
-        """The decision endpoint, or ``""`` when no service is configured."""
-        if not self.cbac_url:
-            return ""
-        return f"{self.cbac_url.rstrip('/')}/{self.cbac_path.lstrip('/')}"
-
-
-_config = GuardConfig()
-
-
-def configure(
-    cbac_url: str | None = None,
-    cbac_timeout: float | None = None,
-    cbac_path: str | None = None,
-) -> None:
-    """Set layer-wide guard configuration. Call once at startup.
-
-    Each argument left ``None`` keeps whatever the environment supplied.
-    """
-    if cbac_url is not None:
-        _config.cbac_url = cbac_url
-    if cbac_timeout is not None:
-        _config.cbac_timeout = cbac_timeout
-    if cbac_path is not None:
-        _config.cbac_path = cbac_path
-
-
-def get_config() -> GuardConfig:
-    return _config
 
 
 # ── Guard internals ───────────────────────────────────────────────────────────
@@ -234,7 +187,12 @@ class AuthResult:
     hash: str | None = None
 
 
-async def _authorize(payload: dict[str, Any], cfg: GuardConfig) -> AuthResult:
+async def _authorize(
+    payload: dict[str, Any],
+    cbac_url: str = "",
+    cbac_endpoint: str = "",
+    cbac_timeout: float = 0.0,
+) -> AuthResult:
     """One decision call to the CBAC service, fail-closed: any error resolves
     to ``"error"``.
 
@@ -257,27 +215,31 @@ async def _authorize(payload: dict[str, Any], cfg: GuardConfig) -> AuthResult:
     models) that a blocked event loop would stall every call in flight, not
     just this one. Hence the thread.
 
-    ``cfg`` is threaded in rather than looked up here: it is set once when the
-    process starts, so a caller that never configured a service fails at the
-    one place that can say so. With no ``CBAC_URL`` there is nowhere to ask,
-    which is an ``"error"`` -- every caller treats that as not-allowed.
+    Where the service is and how long to wait for it are arguments, and each
+    one left unset falls back to the environment here -- read per call, so a
+    process that loads its ``.env`` after importing this module still gets it.
+    There is no baked-in host: with no ``CBAC_URL`` there is nowhere to ask,
+    which is an ``"error"`` -- every caller treats that as not-allowed -- rather
+    than an agent's actions going to whatever host was compiled in.
     """
     import requests  # lazy; transitive dependency of the library already
 
-    endpoint = cfg.authorize_endpoint()
-    if not endpoint:
+    cbac_url = cbac_url or os.environ.get("CBAC_URL", "")
+    cbac_endpoint = cbac_endpoint or os.environ.get("CBAC_PATH", "/cbac/v1/authorize")
+    cbac_timeout = cbac_timeout or float(os.environ.get("CBAC_TIMEOUT", "100"))
+    if not cbac_url:
         return AuthResult(
             "error",
-            "CBAC: no decision service configured — set CBAC_URL or call "
-            "cbac.configure(cbac_url=...)",
+            "CBAC: no decision service configured — set CBAC_URL or pass "
+            "cbac_url= to authorize()",
         )
 
     try:
         response = await asyncio.to_thread(
             requests.post,
-            endpoint,
+            f"{cbac_url.rstrip('/')}/{cbac_endpoint.lstrip('/')}",
             json=payload,
-            timeout=cfg.cbac_timeout,
+            timeout=cbac_timeout,
         )
         # Reading the response stays inside the guard: decoding a body can
         # raise too, and the callers' contract is that this never does.
@@ -313,8 +275,10 @@ async def authorize(
     user_intent: str | None = None,
     description: str | None = None,
     callee_type: str = "tool",
-    cfg: GuardConfig | None = None,
     intent_id: str | None = None,
+    cbac_url: str = "",
+    cbac_endpoint: str = "",
+    cbac_timeout: float = 0.0,
 ) -> AuthResult:
     """Authorize one call. Every input is an argument (decision only).
 
@@ -336,6 +300,12 @@ async def authorize(
     ``"mcp"``) whose trust score the service updates while deciding.
     ``intent_id`` is the caller's own opaque correlation id, threaded through
     unchanged to the audit row and its hash.
+
+    ``cbac_url``/``cbac_endpoint``/``cbac_timeout`` say where the service is;
+    each one left unset falls back to ``CBAC_URL``/``CBAC_PATH``/
+    ``CBAC_TIMEOUT`` in the environment, read per call. An enforcement point
+    that already reads its own settings — a gateway with a ``.env`` — passes
+    them and skips the environment entirely.
     """
     return await _authorize(
         _payload(
@@ -347,7 +317,9 @@ async def authorize(
             callee_type,
             intent_id,
         ),
-        cfg or get_config(),
+        cbac_url,
+        cbac_endpoint,
+        cbac_timeout,
     )
 
 
@@ -463,7 +435,7 @@ def cbac_guard(
                 # text verbatim instead of rendering from the fields above.
                 payload["intended_action"] = action_intent(call_kwargs)
 
-            result = await _authorize(payload, get_config())
+            result = await _authorize(payload)
 
             if result.decision != "allow":
                 if result.decision == "deny" and on_deny == "raise":

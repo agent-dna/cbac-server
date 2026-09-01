@@ -235,29 +235,42 @@ def test_guard_payload_round_trips_into_the_rendered_intent(monkeypatch):
     assert calls[0]["callee_type"] == "mcp"
 
 
-def test_guard_endpoint_matches_the_route_the_service_serves():
+def test_guard_endpoint_matches_the_route_the_service_serves(monkeypatch):
     """The other half of the same contract: the path the guard POSTs to has to
     be a route this app actually registers, prefix and all."""
-    from cbac.guard import GuardConfig
+    from cbac.guard import _authorize
 
-    cfg = GuardConfig(cbac_url="http://svc:8767")
-    assert cfg.authorize_endpoint() == "http://svc:8767/cbac/v1/authorize"
-    # openapi() rather than app.routes: an included router stays nested there,
-    # so app.routes lists the router, not the paths it serves.
-    assert cfg.cbac_path in main.app.openapi()["paths"]
+    monkeypatch.delenv("CBAC_PATH", raising=False)
+    posted = []
 
-    # A service mounted under an ingress prefix: one slash, not two.
-    behind_ingress = GuardConfig(cbac_url="https://gw.example.com/agentdna/")
-    assert behind_ingress.authorize_endpoint() == (
-        "https://gw.example.com/agentdna/cbac/v1/authorize"
+    class _Response:
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"data": {"decision": "allow"}, "message": ""}
+
+    monkeypatch.setattr(
+        "requests.post", lambda url, **kw: (posted.append(url), _Response())[1]
     )
 
+    asyncio.run(_authorize({}, cbac_url="http://svc:8767"))
+    assert posted[-1] == "http://svc:8767/cbac/v1/authorize"
+    # openapi() rather than app.routes: an included router stays nested there,
+    # so app.routes lists the router, not the paths it serves.
+    assert "/cbac/v1/authorize" in main.app.openapi()["paths"]
 
-def test_guard_without_a_configured_service_fails_closed():
+    # A service mounted under an ingress prefix: one slash, not two.
+    asyncio.run(_authorize({}, cbac_url="https://gw.example.com/agentdna/"))
+    assert posted[-1] == "https://gw.example.com/agentdna/cbac/v1/authorize"
+
+
+def test_guard_without_a_configured_service_fails_closed(monkeypatch):
     """No CBAC_URL means nowhere to ask, which must never read as permission."""
-    from cbac.guard import GuardConfig, _authorize
+    from cbac.guard import _authorize
 
-    result = asyncio.run(_authorize({}, GuardConfig(cbac_url="")))
+    monkeypatch.delenv("CBAC_URL", raising=False)
+    result = asyncio.run(_authorize({}))
 
     assert result.decision == "error"  # every caller treats non-"allow" as blocked
     assert "no decision service configured" in result.message

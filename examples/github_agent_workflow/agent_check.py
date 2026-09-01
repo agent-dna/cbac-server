@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agent import (
     CBAC_AGENT_ID,
-    CBAC_TIMEOUT,
     CBAC_URL,
     GATEWAY_URL,
     MCP_URL,
@@ -34,7 +33,7 @@ from agent import (
     draft_summary,
 )
 
-from cbac import cbac_context, configure
+from cbac import cbac_context
 from cbac.mcp import cbac_headers
 
 
@@ -139,7 +138,6 @@ async def check() -> None:
     ``draft_summary`` only rewraps text. Probe 4 is the one real network call,
     and it is read-only.
     """
-    configure(cbac_url=CBAC_URL, cbac_timeout=CBAC_TIMEOUT)
     tools = {tool.name: tool for tool in await _mcp_client().get_tools()}
     unlabelled = {
         tool.name: tool for tool in await _mcp_client(labelled=False).get_tools()
