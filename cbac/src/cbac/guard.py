@@ -276,10 +276,9 @@ async def authorize(
     description: str | None = None,
     callee_type: str = "tool",
     intent_id: str | None = None,
-    cbac_url: str = "",
-    cbac_endpoint: str = "",
-    cbac_timeout: float = 0.0,
-) -> AuthResult:
+    cbac_url: str = "https://cbac-service.agentdna.io",
+    cbac_timeout: float = 300,
+) -> list[int | str | None]:
     """Authorize one call. Every input is an argument (decision only).
 
     For enforcement points that already hold the governance context as
@@ -288,8 +287,16 @@ async def authorize(
     routing what they already hold through a contextvar only to read it back
     would be a detour.
 
-    Returns an :class:`AuthResult`. Fail-closed: any error resolves to
-    ``decision="error"`` and never raises.
+    Returns ``[status_code, hash, decision, message]`` rather than an
+    :class:`AuthResult`, to match a plain ``Callable[..., list]`` contract on
+    the caller's side. Fail-closed: any error resolves to ``decision="error"``
+    and never raises. ``decision``/``message`` are always ``str``.
+    ``status_code``/``hash`` are ``None`` in exactly the three fail-closed
+    cases inside :func:`_authorize` itself -- no service configured, a
+    malformed response, a network error -- because there is no service-side
+    verdict to carry either; ``None`` is kept rather than a placeholder value
+    (``0``, ``""``) so a caller can never mistake "no verdict reached" for a
+    real code or hash.
 
     ``description`` is the callee's own description (schema/docstring first
     line); the service uses it as the verb phrase when it renders the intent,
@@ -301,13 +308,16 @@ async def authorize(
     ``intent_id`` is the caller's own opaque correlation id, threaded through
     unchanged to the audit row and its hash.
 
-    ``cbac_url``/``cbac_endpoint``/``cbac_timeout`` say where the service is;
-    each one left unset falls back to ``CBAC_URL``/``CBAC_PATH``/
-    ``CBAC_TIMEOUT`` in the environment, read per call. An enforcement point
-    that already reads its own settings — a gateway with a ``.env`` — passes
-    them and skips the environment entirely.
+    ``cbac_url`` defaults to the hosted reference service; pass a different
+    one for a self-hosted deployment. ``cbac_timeout`` defaults to 300s — a
+    cold service loads three transformer models, and this is generous enough
+    to ride that out rather than time out a caller's first request. The path
+    on the service (``/cbac/v1/authorize``) is not a parameter here — it is
+    not something a caller has a reason to override — but still falls back
+    to ``CBAC_PATH`` in the environment inside :func:`_authorize`, for a
+    deployment that mounts the service under a different prefix.
     """
-    return await _authorize(
+    result = await _authorize(
         _payload(
             agent_id,
             callee_name,
@@ -318,9 +328,9 @@ async def authorize(
             intent_id,
         ),
         cbac_url,
-        cbac_endpoint,
-        cbac_timeout,
+        cbac_timeout=cbac_timeout,
     )
+    return [result.status_code, result.hash, result.decision, result.message]
 
 
 # Commented out with cbac_intercept, its only caller.
