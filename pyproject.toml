@@ -21,11 +21,21 @@ dependencies = [
   "alembic>=1.13.0",
   "pgvector>=0.3.6",
   "greenlet>=3.0.0",
+  # The guard, from cbac/ in this checkout — see [tool.uv.sources] below.
+  "cbac",
 ]
 
 # Deployed from a checkout (uvicorn cbac_service.cbac:app).
 [tool.uv]
 package = false
+
+# The guard is its own distribution (published to PyPI as `cbac`); the service
+# depends on it from this checkout rather than from the index.
+[tool.uv.workspace]
+members = ["cbac"]
+
+[tool.uv.sources]
+cbac = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -34,6 +44,11 @@ dev = [
     "ruff==0.16.3",
     "pyright==1.1.411",
 ]
+
+[tool.ruff]
+# The guard is first-party even though it lives in its own project directory:
+# without this, isort files `cbac` and `cbac.mcp` into different groups.
+src = [".", "cbac/src"]
 
 [tool.ruff.lint]
 # The decision pipeline is fail-closed by design: any error becomes a `deny`, and

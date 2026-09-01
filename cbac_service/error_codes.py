@@ -11,6 +11,7 @@ layer:
     3200-3299  Tier 1  — bi-encoder cosine gap
     3300-3399  Tier 2  — NLI entailment/contradiction vs. top chunk
     3400-3499  Tier 3  — optional LLM backend
+    9000-9099  API     — failures in the HTTP handler, outside the pipeline
 
 Codes are stable identifiers, not free-form: every code below maps 1:1 to
 exactly one return statement in ``cbac.py``. Do not renumber an existing
@@ -65,3 +66,9 @@ TIER3_LLM_ADVISE_DENY = (
 )
 TIER3_LLM_MALFORMED_DENY = 3409  # deny — backend returned something that isn't a
 # valid LLMVerdict, or an unrecognised `decision` value
+
+# ── 9000s: API — failures outside the decision pipeline ─────────────────────
+# Produced by main.authorize_cbac's own exception handler, not by anything in
+# cbac.py — thrown before or around _decide (e.g. the DB session never opens),
+# so no CBACResult and no cbac_decisions row exist to carry a pipeline code.
+API_UNHANDLED_EXCEPTION = 9001  # error — exception raised outside verify_cbac

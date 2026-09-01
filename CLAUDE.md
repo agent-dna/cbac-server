@@ -3,8 +3,11 @@
 Guidance for this repo. It holds two things:
 
 - `cbac_service/` — the decision service (this file is mostly about it).
-- `cbac/` — the framework-agnostic guard + optional MCP glue. `import cbac` gets
-  it; this repo owns it outright.
+- `cbac/` — the framework-agnostic guard + optional MCP glue, its own
+  distribution (`cbac` on PyPI) with its own `pyproject.toml`. The import
+  package is `cbac/src/cbac/`; the service depends on it as a **uv workspace
+  member**, so `import cbac` in this checkout always resolves to that source,
+  never to a published wheel.
 
 ## Writing docs and comments
 
@@ -135,8 +138,12 @@ everything from there, not from inside `cbac_service/`:
 - `uv sync --locked` — install from `uv.lock`. `agent-dna` resolves from PyPI
   like any other dependency; there is no path source to the sibling checkout, so
   library edits are **not** picked up live — publish, then bump the pin here.
-  The `dev` group declares `mcp` directly, which `cbac/mcp.py` needs (the
-  published `agent-dna` wheel ships no `mcp` extra).
+  `cbac` is the exception: it is a workspace member (`[tool.uv.workspace]`,
+  `[tool.uv.sources]`), installed from `cbac/` in this checkout, so guard edits
+  *are* live.
+- `uv build --package cbac` — build the guard's sdist + wheel into `dist/`. It
+  declares one dependency (`requests`) and ships only `cbac/src/cbac/`; the
+  service is not published (`[tool.uv] package = false`).
 - `uv run pytest` — runs `cbac_service/tests/` (`[tool.pytest.ini_options]`,
   `pythonpath = ["."]`).
 - `ruff` and `pyright` are pinned **exactly**, not floored: CI and the local
