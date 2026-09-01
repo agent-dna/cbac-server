@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from cbac_service.config import DATABASE_URL
 
 # create_async_engine only builds the pool; no connection opens until first use.
-engine = create_async_engine(DATABASE_URL, pool_size=5, max_overflow=10)
+engine = create_async_engine(
+    DATABASE_URL, pool_size=5, max_overflow=10, pool_pre_ping=True
+)
 _session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
