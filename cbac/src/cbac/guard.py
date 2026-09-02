@@ -278,7 +278,7 @@ async def authorize(
     intent_id: str | None = None,
     cbac_url: str = "https://cbac-service.agentdna.io",
     cbac_timeout: float = 300,
-) -> list[int | str | None]:
+) -> tuple[int | None, str | None]:
     """Authorize one call. Every input is an argument (decision only).
 
     For enforcement points that already hold the governance context as
@@ -287,16 +287,18 @@ async def authorize(
     routing what they already hold through a contextvar only to read it back
     would be a detour.
 
-    Returns ``[status_code, hash, decision, message]`` rather than an
-    :class:`AuthResult`, to match a plain ``Callable[..., list]`` contract on
-    the caller's side. Fail-closed: any error resolves to ``decision="error"``
-    and never raises. ``decision``/``message`` are always ``str``.
-    ``status_code``/``hash`` are ``None`` in exactly the three fail-closed
-    cases inside :func:`_authorize` itself -- no service configured, a
-    malformed response, a network error -- because there is no service-side
-    verdict to carry either; ``None`` is kept rather than a placeholder value
-    (``0``, ``""``) so a caller can never mistake "no verdict reached" for a
-    real code or hash.
+    Returns ``(status_code, interaction_hash)``. The code *is* the verdict --
+    it is ``cbac_service.error_codes``, where each code names one outcome of
+    one pipeline layer -- and which codes an enforcement point treats as
+    permission is the enforcement point's call. Never raises, so a caller that
+    forgets to check the code fails **open**; that check is its whole job.
+
+    Both are ``None`` in exactly the three fail-closed cases inside
+    :func:`_authorize` -- no service configured, a malformed response, a
+    network error -- because no service-side verdict was reached to carry
+    either. ``None`` is kept rather than a placeholder (``0``, ``""``) so a
+    caller can never mistake "no verdict" for a real code or hash, and the
+    hash is ``None`` too whenever the service could not write its audit row.
 
     ``description`` is the callee's own description (schema/docstring first
     line); the service uses it as the verb phrase when it renders the intent,
@@ -330,7 +332,7 @@ async def authorize(
         cbac_url,
         cbac_timeout=cbac_timeout,
     )
-    return [result.status_code, result.hash, result.decision, result.message]
+    return (result.status_code, result.hash)
 
 
 # Commented out with cbac_intercept, its only caller.

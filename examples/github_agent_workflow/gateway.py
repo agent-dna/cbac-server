@@ -72,6 +72,17 @@ CBAC_TIMEOUT = float(os.environ.get("CBAC_TIMEOUT", "600"))
 # instead, in the two lines where the hooks read the header.
 AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
 
+# The service's pipeline codes (``cbac_service.error_codes``) that this gateway
+# treats as permission. Everything else blocks: a deny code, a code minted after
+# this list was written, and the None that means no verdict was reached at all.
+ALLOW_STATUS_CODES = frozenset(
+    {
+        3201,  # TIER1_GAP_ALLOW        — cosine gap > +ALLOW_GAP
+        3302,  # TIER2_ENTAILMENT_ALLOW — entailment >= ENTAILMENT_THRESHOLD
+        3406,  # TIER3_LLM_ALLOW        — backend returned decision="allow"
+    }
+)
+
 
 class CBACMiddleware(Middleware):
     """Route every acting MCP primitive crossing this gateway through the gate.
@@ -97,7 +108,7 @@ class CBACMiddleware(Middleware):
             obj = await server.get_tool(tool_name)
             tool_description = (obj.description or "").partition("\n")[0] or None
 
-        _status_code, _interaction_hash, decision, message = await authorize(
+        status_code, interaction_hash = await authorize(
             agent_id,
             tool_name,
             tool_args,
@@ -108,8 +119,11 @@ class CBACMiddleware(Middleware):
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )
-        if decision != "allow":
-            raise ToolError(denial_body(decision, message))
+        # The code is the verdict. Anything outside the allow set blocks —
+        # including a code this guard has never heard of, and the None that
+        # means no verdict was reached at all.
+        if status_code not in ALLOW_STATUS_CODES:
+            raise ToolError(denial_body(status_code, interaction_hash))
         return await call_next(context)
 
     async def on_read_resource(self, context, call_next):
@@ -139,7 +153,7 @@ class CBACMiddleware(Middleware):
                     description = first or None
                     break
 
-        _status_code, _interaction_hash, decision, message = await authorize(
+        status_code, interaction_hash = await authorize(
             agent_id,
             name or key,
             args,
@@ -150,8 +164,8 @@ class CBACMiddleware(Middleware):
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )
-        if decision != "allow":
-            raise ResourceError(denial_body(decision, message))
+        if status_code not in ALLOW_STATUS_CODES:
+            raise ResourceError(denial_body(status_code, interaction_hash))
         return await call_next(context)
 
     # ``prompts/get`` is deliberately not gated. Prompts are user-controlled in

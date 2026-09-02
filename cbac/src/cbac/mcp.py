@@ -168,16 +168,32 @@ def context_from_headers(headers: dict[str, str]) -> GovernanceContext | None:
 #     return await handler(request)
 
 
-def denial_body(decision: str, detail: str) -> str:
-    """The wire form of a block: ``{"status": "denied"|"error", "error": ...}``.
+def denial_body(status_code: int | None, interaction_hash: str | None = None) -> str:
+    """The wire form of a block, from what :func:`~cbac.guard.authorize` returns.
 
     Readable JSON, not a raised error, so the agent loop can see the block and
     adapt. Shared by every enforcement point so a client sees the same shape
-    whether the block came from ``@cbac_guard``, this module's interceptor, or
-    a gateway several hops away.
+    however many hops away the gateway is.
+
+    ``"denied"`` when the service reached a verdict and it was not an allow;
+    ``"error"`` when it never reached one (``status_code`` is ``None`` -- no
+    service configured, a malformed response, a network error). Both stop the
+    call; only the reason differs. The code and hash are what a caller follows
+    up with: ``GET /cbac/v1/decisions/by-hash/{hash}`` has the full reason, and
+    the audit row it came from.
     """
-    status = "denied" if decision == "deny" else "error"
-    return json.dumps({"status": status, "error": detail})
+    if status_code is None:
+        return json.dumps(
+            {"status": "error", "error": "CBAC reached no decision", "hash": None}
+        )
+    return json.dumps(
+        {
+            "status": "denied",
+            "error": f"CBAC denied this call (status {status_code})",
+            "status_code": status_code,
+            "hash": interaction_hash,
+        }
+    )
 
 
 # def _denied_result(decision: str, detail: str) -> CallToolResult:
