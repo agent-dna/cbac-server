@@ -30,11 +30,9 @@ import re
 from urllib.parse import quote, unquote
 
 # Re-exported so MCP users import the whole recipe from one place.
-from .guard import (
+from .authorize import (
     GovernanceContext,
-    # authorize_tool_call,  # commented out in guard.py for now
     cbac_context,
-    # cbac_guard,  # commented out in guard.py for now
     get_context,
 )
 
@@ -43,9 +41,7 @@ __all__ = [
     "CBAC_INTENT_HEADER",
     "CBAC_INTENT_ID_HEADER",
     "cbac_context",
-    # "cbac_guard",
     "cbac_headers",
-    # "cbac_intercept",
     "cbac_propagate",
     "context_from_headers",
     "denial_body",
@@ -143,33 +139,9 @@ def context_from_headers(headers: dict[str, str]) -> GovernanceContext | None:
     )
 
 
-# Commented out for now: this repo enforces at the gateway, and nothing here
-# uses the client-side interceptor.
-# async def cbac_intercept(request, handler):
-#     """Client-side *enforcement*: authorize each call before it leaves.
-
-#     The fallback topology -- use it only where no gateway can sit in the
-#     path. All CBAC logic lives in :func:`~cbac.guard.authorize_tool_call`;
-#     this only maps the MCP request/result types and renders the denial, so
-#     another framework needs just its own equally thin adapter. Requires an
-#     open :func:`cbac_context`; without one it is a passthrough.
-#     """
-#     # MCPToolCallRequest (verified ≤0.3.2 and upstream main) carries no tool
-#     # description — only name/args/server_name/headers/runtime — so this reads
-#     # None today and the de-snaked tool name becomes the verb phrase. A gateway
-#     # does better: it has the upstream tool's real description locally.
-#     description = getattr(request, "description", None)
-#     result = await authorize_tool_call(
-#         request.name, request.args, description, callee_type="mcp"
-#     )
-#     if result.decision != "allow":
-#         return _denied_result(result.decision, result.message)
-
-#     return await handler(request)
-
 
 def denial_body(status_code: int | None, interaction_hash: str | None = None) -> str:
-    """The wire form of a block, from what :func:`~cbac.guard.authorize` returns.
+    """The wire form of a block, from what :func:`~cbac.authorize.authorize` returns.
 
     Readable JSON, not a raised error, so the agent loop can see the block and
     adapt. Shared by every enforcement point so a client sees the same shape
@@ -195,10 +167,3 @@ def denial_body(status_code: int | None, interaction_hash: str | None = None) ->
         }
     )
 
-
-# def _denied_result(decision: str, detail: str) -> CallToolResult:
-#     # is_error defaults to False; passing it explicitly is unresolvable for pyright
-#     # because mcp 2.0 generates the camelCase alias via alias_generator.
-#     return CallToolResult(
-#         content=[TextContent(type="text", text=denial_body(decision, detail))]
-#     )

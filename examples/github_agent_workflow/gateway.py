@@ -48,7 +48,7 @@ from fastmcp.server.middleware import Middleware
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cbac" / "src"))
 
-from cbac.guard import authorize
+from cbac import authorize
 from cbac.mcp import context_from_headers, denial_body
 
 load_dotenv()

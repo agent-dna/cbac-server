@@ -58,7 +58,7 @@ parsed the governance context off the wire (a gateway) or read it from a queue
 message. Nothing is looked up ambiently.
 
 ```python
-from cbac.guard import authorize
+from cbac import authorize
 
 result = await authorize(
     agent_id,

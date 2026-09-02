@@ -1,21 +1,20 @@
 """CBAC governance layer: the framework-agnostic guard + optional MCP glue.
 
-The guard API is re-exported here for ``from cbac import ...``.
-The MCP integration lives in :mod:`cbac.mcp` and is imported separately
-(it needs the ``mcp`` dependency), so importing this package does not
-pull it in.
+The guard API is re-exported here for ``from cbac import ...``. The MCP
+adapter lives in :mod:`cbac.mcp` and is imported from there — it is one
+framework's glue, not something every caller needs.
 """
 
-from .guard import (
+from .authorize import (
     GovernanceContext,
+    authorize,
     cbac_context,
-    # cbac_guard,  # commented out in guard.py for now
     get_context,
 )
 
 __all__ = [
     "GovernanceContext",
+    "authorize",
     "cbac_context",
-    # "cbac_guard",
     "get_context",
 ]

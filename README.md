@@ -61,6 +61,21 @@ Both extensions are created automatically on first startup via
 `shared_preload_libraries = 'pg_textsearch'` to `postgresql.conf.sample`, which
 that extension requires at server start.
 
+The data lands in a Docker named volume (`cbac_pgdata`). To keep it on a host
+path you control instead — somewhere you can back up, or a disk with room —
+set `PG_DATA_PATH`:
+
+```bash
+PG_DATA_PATH="PATH" docker compose up -d
+```
+
+Either the variable or the named volume, never both: an unset (or empty)
+`PG_DATA_PATH` falls back to `cbac_pgdata`, and a set one replaces it. The two
+are separate databases, so a path used for the first time starts empty and
+needs its own `alembic upgrade head` — switching back to the named volume finds
+everything as it was. On Linux the directory must be writable by the
+container's postgres user (uid 999); Docker Desktop handles that itself.
+
 ### 3. Run database migrations
 
 Still inside `cbac_service/`:
@@ -111,7 +126,8 @@ PYTHONPATH=. uv run python scripts/test_lifecycle.py
 | Task | Command |
 |------|---------|
 | Stop Postgres | `cd cbac_service && docker compose down` |
-| Stop + destroy data | `cd cbac_service && docker compose down -v` |
+| Stop + destroy data | `cd cbac_service && docker compose down -v` (named volume only — a `PG_DATA_PATH` directory survives) |
+| Start with data on a host path | `cd cbac_service && PG_DATA_PATH="PATH" docker compose up -d` |
 | Rebuild Postgres image | `cd cbac_service && docker compose build --no-cache` |
 | Connect via psql | `psql postgresql://cbac_user:cbac_pass@localhost:5432/cbac` |
 | Run tests | `uv run pytest` |

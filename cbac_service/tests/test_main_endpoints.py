@@ -207,7 +207,7 @@ def test_guard_payload_round_trips_into_the_rendered_intent(monkeypatch):
     body with the real guard and feeding it to the real endpoint is what
     catches that.
     """
-    from cbac.guard import _payload
+    from cbac.authorize import _payload
 
     calls = []
     install_cbac(
@@ -238,7 +238,7 @@ def test_guard_payload_round_trips_into_the_rendered_intent(monkeypatch):
 def test_guard_endpoint_matches_the_route_the_service_serves(monkeypatch):
     """The other half of the same contract: the path the guard POSTs to has to
     be a route this app actually registers, prefix and all."""
-    from cbac.guard import _authorize
+    from cbac.authorize import _authorize
 
     monkeypatch.delenv("CBAC_PATH", raising=False)
     posted = []
@@ -267,7 +267,7 @@ def test_guard_endpoint_matches_the_route_the_service_serves(monkeypatch):
 
 def test_guard_without_a_configured_service_fails_closed(monkeypatch):
     """No CBAC_URL means nowhere to ask, which must never read as permission."""
-    from cbac.guard import _authorize
+    from cbac.authorize import _authorize
 
     monkeypatch.delenv("CBAC_URL", raising=False)
     result = asyncio.run(_authorize({}))

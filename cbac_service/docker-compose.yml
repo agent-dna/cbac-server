@@ -24,7 +24,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - cbac_pgdata:/var/lib/postgresql
+      - ${PG_DATA_PATH:-cbac_pgdata}:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cbac_user -d cbac"]
       interval: 5s
