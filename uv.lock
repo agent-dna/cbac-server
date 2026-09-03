@@ -202,7 +202,7 @@ wheels = [
 
 [[package]]
 name = "cbac"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "cbac" }
 dependencies = [
     { name = "requests" },

@@ -1,6 +1,6 @@
 [project]
 name = "cbac"
-version = "0.1.0"
+version = "0.1.1"
 description = "Framework-agnostic guard for CBAC: authorize an agent's action against its policy"
 readme = "README.md"
 requires-python = ">=3.10"
