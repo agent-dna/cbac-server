@@ -139,8 +139,7 @@ def context_from_headers(headers: dict[str, str]) -> GovernanceContext | None:
     )
 
 
-
-def denial_body(status_code: int | None, interaction_hash: str | None = None) -> str:
+def denial_body(status_code: int, interaction_hash: str = "") -> str:
     """The wire form of a block, from what :func:`~cbac.authorize.authorize` returns.
 
     Readable JSON, not a raised error, so the agent loop can see the block and
@@ -148,22 +147,25 @@ def denial_body(status_code: int | None, interaction_hash: str | None = None) ->
     however many hops away the gateway is.
 
     ``"denied"`` when the service reached a verdict and it was not an allow;
-    ``"error"`` when it never reached one (``status_code`` is ``None`` -- no
-    service configured, a malformed response, a network error). Both stop the
-    call; only the reason differs. The code and hash are what a caller follows
-    up with: ``GET /cbac/v1/decisions/by-hash/{hash}`` has the full reason, and
-    the audit row it came from.
+    ``"error"`` for the 9000s, which are failures of the asking rather than of
+    the action -- the service's own handler blowing up (9000s) or this guard
+    never getting an answer (9100s). Both stop the call; only the reason
+    differs, and only the second is the operator's to fix.
+
+    ``hash`` is what a caller follows up with:
+    ``GET /cbac/v1/decisions/by-hash/{hash}`` has the full reason and the audit
+    row it came from. It is ``""`` when no row was written to look up.
     """
-    if status_code is None:
-        return json.dumps(
-            {"status": "error", "error": "CBAC reached no decision", "hash": None}
-        )
+    failure = status_code >= 9000
     return json.dumps(
         {
-            "status": "denied",
-            "error": f"CBAC denied this call (status {status_code})",
+            "status": "error" if failure else "denied",
+            "error": (
+                f"CBAC reached no decision (status {status_code})"
+                if failure
+                else f"CBAC denied this call (status {status_code})"
+            ),
             "status_code": status_code,
             "hash": interaction_hash,
         }
     )
-

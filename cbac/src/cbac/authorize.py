@@ -157,23 +157,43 @@ def _payload(
     }
 
 
+# ── Guard-side status codes ───────────────────────────────────────────────────
+#
+# The service's codes (``cbac_service.error_codes``) name an outcome of one
+# pipeline layer, and it owns 3000-3999 and 9000-9099 for them. These four name
+# the cases where this guard never got a verdict to report, so 9100-9199 is
+# reserved here to say so without a code the service could also mint. Same rules
+# as the service's: one code per return statement below, and never renumbered --
+# a code that reached a log or a dashboard has to keep meaning what it meant.
+#
+# All four are failures of the *asking*, not of the action, and every one blocks:
+# a guard that cannot reach a verdict has not been told yes.
+NO_SERVICE_CONFIGURED = 9101  # error — no cbac_url and no CBAC_URL in the env
+UNRECOGNIZED_RESPONSE = 9102  # error — 200 body carried no decision at all
+TRANSPORT_FAILED = 9103  # error — the POST raised: refused, timed out, bad TLS
+VERDICT_WITHOUT_CODE = 9104  # error — a decision came back, but with no code to
+# act on, so this guard cannot tell allow from deny
+
+
 @dataclass
 class AuthResult:
     """One ``/cbac/v1/authorize`` call's outcome, as the guard layer sees it.
 
-    ``decision`` and ``message`` are the pair every caller has always gotten;
-    ``status_code`` (the service's pipeline error code, ``cbac_service.
-    error_codes``) and ``hash`` (the row's ``interaction_hash``) ride back
-    alongside them so a caller never needs a second lookup to get either.
-    Both are ``None`` on the fail-closed paths inside :func:`_authorize`
-    itself (no service configured, a malformed response, a network error) —
-    there was no service-side verdict to carry a code or a hash.
+    ``decision`` and ``message`` are the human-readable pair. ``status_code``
+    is the machine-readable one — the service's pipeline code
+    (``cbac_service.error_codes``) when a verdict was reached, one of the
+    9100s above when it was not — and ``hash`` is the audit row's
+    ``interaction_hash``, ``""`` when no row was written to have one.
+
+    Neither is ever ``None``: an enforcement point decides on the code, and a
+    code it has to null-check first is one more branch between an agent and a
+    blocked action.
     """
 
     decision: str
     message: str
-    status_code: int | None = None
-    hash: str | None = None
+    status_code: int
+    hash: str = ""
 
 
 async def _authorize(
@@ -221,6 +241,7 @@ async def _authorize(
             "error",
             "CBAC: no decision service configured — set CBAC_URL or pass "
             "cbac_url= to authorize()",
+            NO_SERVICE_CONFIGURED,
         )
 
     try:
@@ -242,11 +263,25 @@ async def _authorize(
         # reason a call was blocked.
         if not decision:
             return AuthResult(
-                "error", message or f"CBAC: unrecognized response {response.text!r}"
+                "error",
+                message or f"CBAC: unrecognized response {response.text!r}",
+                UNRECOGNIZED_RESPONSE,
             )
-        return AuthResult(decision, message, data.get("status_code"), data.get("hash"))
+        # A verdict with no code is one this guard cannot act on -- an
+        # enforcement point decides by code, and there is nothing to compare.
+        # Reported as its own failure rather than folded into the deny codes,
+        # because the fix is a service version, not a policy change.
+        status_code = data.get("status_code")
+        if not isinstance(status_code, int):
+            return AuthResult(
+                "error",
+                message or "CBAC: verdict carried no status code",
+                VERDICT_WITHOUT_CODE,
+                data.get("hash") or "",
+            )
+        return AuthResult(decision, message, status_code, data.get("hash") or "")
     except Exception as exc:
-        return AuthResult("error", str(exc))
+        return AuthResult("error", str(exc), TRANSPORT_FAILED)
 
 
 # ── Framework-agnostic call gate ──────────────────────────────────────────────
@@ -267,7 +302,7 @@ async def authorize(
     intent_id: str | None = None,
     cbac_url: str = "https://cbac-service.agentdna.io",
     cbac_timeout: float = 300,
-) -> tuple[int | None, str | None]:
+) -> tuple[int, str]:
     """Authorize one call. Every input is an argument (decision only).
 
     For enforcement points that already hold the governance context as
@@ -276,18 +311,25 @@ async def authorize(
     routing what they already hold through a contextvar only to read it back
     would be a detour.
 
-    Returns ``(status_code, interaction_hash)``. The code *is* the verdict --
-    it is ``cbac_service.error_codes``, where each code names one outcome of
-    one pipeline layer -- and which codes an enforcement point treats as
-    permission is the enforcement point's call. Never raises, so a caller that
-    forgets to check the code fails **open**; that check is its whole job.
+    Returns ``(status_code, interaction_hash)``, always both, never ``None``.
+    The code *is* the verdict -- ``cbac_service.error_codes`` when the service
+    reached one, where each code names the outcome of one pipeline layer -- and
+    which codes an enforcement point treats as permission is the enforcement
+    point's call. Never raises, so a caller that forgets to check the code
+    fails **open**; that check is its whole job.
 
-    Both are ``None`` in exactly the three fail-closed cases inside
-    :func:`_authorize` -- no service configured, a malformed response, a
-    network error -- because no service-side verdict was reached to carry
-    either. ``None`` is kept rather than a placeholder (``0``, ``""``) so a
-    caller can never mistake "no verdict" for a real code or hash, and the
-    hash is ``None`` too whenever the service could not write its audit row.
+    When no verdict was reached the code is one of this module's 9100s --
+    :data:`NO_SERVICE_CONFIGURED`, :data:`UNRECOGNIZED_RESPONSE`,
+    :data:`TRANSPORT_FAILED`, :data:`VERDICT_WITHOUT_CODE` -- rather than
+    ``None``, so an enforcement point tests one thing (is this code permission?)
+    instead of two, and the reason still reaches a log or a dashboard. A caller
+    that needs to tell "blocked by policy" from "could not ask" tests the range,
+    not a null.
+
+    ``interaction_hash`` is ``""`` whenever no audit row was written to have
+    one -- every no-verdict case, and a service-side failure outside the
+    pipeline. It is an id to look a decision up by, so absence is the empty
+    string rather than a null to guard against.
 
     ``description`` is the callee's own description (schema/docstring first
     line); the service uses it as the verb phrase when it renders the intent,
