@@ -34,7 +34,6 @@ from cbac_service.db.repository import (
     get_policy_chunks,
     insert_cbac_decision,
     insert_lhi_record,
-    policy_hash_matches,
     save_policy_chunks,
 )
 from cbac_service.db.search import hybrid_search, vector_search
@@ -276,14 +275,15 @@ class CBAC:
         4. Encode all chunks with the bi-encoder.
         5. Persist to the policy_chunks table via the repository layer.
 
-        Always recomputes — callers that want a cache check do it themselves
-        (``verify_cbac`` compares the on-chain hash before calling).
+        Always recomputes, replacing whatever was indexed before. That makes
+        this the *only* way an agent's policy changes after the first decision:
+        ``verify_cbac`` reads the indexed copy and consults the Provenance Layer
+        only when there is none, so a card republished on chain reaches
+        decisions when this runs and not before. Behind
+        ``POST /cbac/v1/policies/precompute`` for exactly that reason.
 
-        Passing ``policy`` warms the cache for a policy the chain does not carry
-        yet. ``verify_cbac`` still re-reads the chain on every request, so a
-        cached policy that disagrees with the chain is replaced on the next
-        authorization — this is a cache warm, never a way to override the policy
-        a decision is made against.
+        Passing ``policy`` indexes that text instead of the agent's card —
+        which also means it decides real calls until something re-indexes.
 
         Returns the number of chunks stored.
         """
@@ -752,40 +752,36 @@ class CBAC:
                     ),
                 )
 
-        # Fetch current policy from chain — always, so we can detect updates.
-        try:
-            current_policy = await asyncio.to_thread(
-                self._get_latest_agent_policy, agent_id
-            )
-        except Exception as e:
-            return CBACResult(
-                decision="deny",
-                reason=f"Policy lookup failed for agent {agent_id}: {e}",
-                error_code=ec.GUARD_POLICY_LOOKUP_FAILED,
-            )
-        if not current_policy:
-            return CBACResult(
-                decision="deny",
-                reason=f"No policy available for agent {agent_id}",
-                error_code=ec.GUARD_NO_POLICY_AVAILABLE,
-            )
-
-        current_hash = _policy_hash(current_policy)
-
-        # Check DB cache — recompute if stale.
-        cache_valid = await policy_hash_matches(session, agent_id, current_hash)
-        if not cache_valid:
+        all_chunks = await get_policy_chunks(session, agent_id)
+        if not all_chunks:
             try:
-                await self.index_policy(session, agent_id, policy=current_policy)
+                policy = await asyncio.to_thread(
+                    self._get_latest_agent_policy, agent_id
+                )
+            except Exception as e:
+                return CBACResult(
+                    decision="deny",
+                    reason=f"Policy lookup failed for agent {agent_id}: {e}",
+                    error_code=ec.GUARD_POLICY_LOOKUP_FAILED,
+                )
+            if not policy:
+                return CBACResult(
+                    decision="deny",
+                    reason=f"No policy available for agent {agent_id}",
+                    error_code=ec.GUARD_NO_POLICY_AVAILABLE,
+                )
+            try:
+                await self.index_policy(session, agent_id, policy=policy)
             except Exception as e:
                 return CBACResult(
                     decision="deny",
                     reason=f"Policy unavailable for agent {agent_id}: {e}",
                     error_code=ec.GUARD_POLICY_INDEX_FAILED,
                 )
+            all_chunks = await get_policy_chunks(session, agent_id)
 
-        # Check that chunks actually exist.
-        all_chunks = await get_policy_chunks(session, agent_id)
+        # Still nothing means the policy indexed to no usable chunks — there is
+        # nothing to decide against, which is a deny, not an empty allow.
         if not all_chunks:
             return CBACResult(
                 decision="deny",

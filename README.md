@@ -187,8 +187,11 @@ inconclusive:
 
 1. **NLI drift** — if a `user_intent` was supplied, check whether the agent's
    intended action contradicts it. Contradiction ≥ 0.60 → immediate deny.
-2. **Policy fetch + cache** — pull the agent's policy, compare its hash against
-   `policy_meta`. Stale or missing → chunk, classify, encode, store.
+2. **Policy** — read the agent's indexed chunks from Postgres. Only when there
+   are none does the service call the Provenance Layer, chunk, classify, encode
+   and store. A policy already indexed is decided against as-is: republishing a
+   card on chain changes nothing until `POST /cbac/v1/policies/precompute`
+   re-indexes it.
 3. **Tier 1 — cosine gap** (pgvector) — compare the intent against allowed and
    forbidden chunks. A clear margin either way decides; otherwise escalate.
 4. **Tier 2 — NLI entailment** — hybrid search (pgvector + BM25, RRF-fused) picks

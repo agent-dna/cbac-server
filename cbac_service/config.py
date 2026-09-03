@@ -14,7 +14,7 @@ import os
 # visible in this file; a deployment points it elsewhere (a staging connector, a
 # self-hosted node) without touching code.
 PROVENANCE_URL: str = os.environ.get(
-    "PROVENANCE_URL", "https://chain-connector-2.rubix.net"
+    "PROVENANCE_URL", "https://chain-connector-2-dev.rubix.net"
 )
 
 # Provenance Layer credential. Empty is a valid deployment: the client is

@@ -54,12 +54,10 @@ def make_verify_cbac(
     )
 
     # DB search layer stubbed to in-memory so the pipeline runs without Postgres:
-    # cache always fresh, one dummy chunk, and equal allowed/forbidden scores
-    # (gap 0) so Tier 1 escalates to Tier 2, which — NLI stubbed — reaches Tier 3.
-    async def _hash_matches(session, agent_id, policy_hash):
-        return True
-
-    async def _get_chunks(session, agent_id):
+    # a policy already indexed (so the Provenance Layer is never called), one
+    # dummy chunk, and equal allowed/forbidden scores (gap 0) so Tier 1 escalates
+    # to Tier 2, which — NLI stubbed — reaches Tier 3.
+    async def _get_chunks(session, agent_id, chunk_type=None):
         return ["allowed chunk"]
 
     async def _search(
@@ -67,7 +65,6 @@ def make_verify_cbac(
     ):
         return [SimpleNamespace(score=0.5, chunk_text="allowed chunk")]
 
-    monkeypatch.setattr(cbac_mod, "policy_hash_matches", _hash_matches)
     monkeypatch.setattr(cbac_mod, "get_policy_chunks", _get_chunks)
     monkeypatch.setattr(cbac_mod, "vector_search", _search)
     monkeypatch.setattr(cbac_mod, "hybrid_search", _search)
@@ -384,12 +381,23 @@ def test_drift_deny_is_recorded(rows, decisions, tmp_path, monkeypatch):
 
 def test_infra_failure_deny_is_recorded(rows, decisions, tmp_path, monkeypatch):
     """The path that folds no trust because it is not the agent's fault still
-    produced a deny the caller has to be able to explain later."""
+    produced a deny the caller has to be able to explain later.
+
+    Nothing indexed *and* the chain down is the only way to reach it: with a
+    policy already in Postgres the Provenance Layer is never called, which is
+    the point of reading the DB first.
+    """
+    import cbac_service.cbac as cbac_mod
+
     cbac = make_verify_cbac(tmp_path, monkeypatch)
+
+    async def _no_chunks(session, agent_id, chunk_type=None):
+        return []
 
     def boom(agent_id):
         raise RuntimeError("provenance node down")
 
+    monkeypatch.setattr(cbac_mod, "get_policy_chunks", _no_chunks)
     monkeypatch.setattr(cbac, "_get_latest_agent_policy", boom)
     result = asyncio.run(
         cbac.verify_cbac(

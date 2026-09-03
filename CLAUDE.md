@@ -73,7 +73,7 @@ Guard (cbac/) --HTTP--> cbac_service (FastAPI)
                                 ├── pgvector 0.8.6 (semantic search)
                                 ├── pg_textsearch 1.4.0 (BM25 keyword search)
                                 ├── policy_chunks table (embeddings + text)
-                                ├── policy_meta table (cache invalidation)
+                                ├── policy_meta table (what was indexed)
                                 ├── cbac_decisions table (audit log)
                                 └── lhi_records table (trust history)
 ```
@@ -91,11 +91,12 @@ The service uses **PostgreSQL 18** with two extensions:
 - `chunk_text` — the original text (needed for Tier 2 NLI)
 - `chunk_type` — `allowed` or `forbidden`
 - `embedding` — vector(384), the searchable embedding
-- `policy_hash` — for cache invalidation
+- `policy_hash` — the hash of the policy text these chunks came from
 - `section` / `chunk_index` — ordering and provenance
 
-**`policy_meta`** — one row per agent, lightweight cache check:
-- `policy_hash` — compared against on-chain hash at runtime
+**`policy_meta`** — one row per agent, written by `index_policy`:
+- `policy_hash` — which policy text the indexed chunks came from. Recorded, not
+  compared: nothing on the decision path re-reads the chain to check it
 - `encoder_model` / `nli_model` — detect if models changed
 - `chunk_count` / `cached_at` — operational metadata
 
@@ -170,9 +171,13 @@ Class `CBAC`. On each request:
    checks if the agent's intended action contradicts the user intent.
    Contradiction ≥ 0.60 → immediate deny.
 
-2. **Policy fetch + cache check**: Fetches the agent's latest policy from the
-   Provenance Layer. Compares the policy hash against `policy_meta` in Postgres.
-   If stale or missing → `index_policy` (chunk, classify, encode, store).
+2. **Policy load**: Reads the agent's chunks from Postgres. On a hit that is the
+   whole step — no network call, and decisions keep working while the Provenance
+   Layer is down. Only an agent with nothing indexed reaches the chain, and then
+   `index_policy` (chunk, classify, encode, store) runs before the tiers.
+   **Nothing re-reads the chain afterwards**: the indexed copy decides until
+   `POST /cbac/v1/policies/precompute` replaces it, so publishing a new policy
+   card is half of a policy update and re-indexing is the other half.
 
 3. **Tier 1 — Cosine gap** (via pgvector): Encodes the intent, runs
    `vector_search(allowed)` and `vector_search(forbidden)`. If

@@ -186,10 +186,3 @@ so a client that forges one corrupts its own trace and nothing else.
 The context travels as headers because that is the only per-call channel MCP
 client adapters expose today. `_meta` is the protocol-native place for it;
 `context_from_headers` is the only piece that would change.
-
-## A working example
-
-`examples/github_agent_workflow/` runs all of this end to end: an agent that
-only labels its calls, a gateway that decides them, a CBAC-unaware MCP server,
-and a real third-party MCP server on the same policy. `agent_check.py` drives
-every path and asserts on the verdicts, with no LLM in the loop.
