@@ -108,7 +108,7 @@ class CBACMiddleware(Middleware):
             obj = await server.get_tool(tool_name)
             tool_description = (obj.description or "").partition("\n")[0] or None
 
-        status_code, interaction_hash = await authorize(
+        result = await authorize(
             agent_id,
             tool_name,
             tool_args,
@@ -119,11 +119,13 @@ class CBACMiddleware(Middleware):
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )
-        # The code is the verdict. Anything outside the allow set blocks —
-        # including a code this guard has never heard of, and the None that
-        # means no verdict was reached at all.
+        _, status_code, _ = result
+        # Gating on the code rather than the decision: it refuses a code this
+        # gateway has never heard of, where "not allow" would let a future
+        # verdict word through. The 9000s (no verdict reached) are outside the
+        # set too, so they block.
         if status_code not in ALLOW_STATUS_CODES:
-            raise ToolError(denial_body(status_code, interaction_hash))
+            raise ToolError(denial_body(*result))
         return await call_next(context)
 
     async def on_read_resource(self, context, call_next):
@@ -153,7 +155,7 @@ class CBACMiddleware(Middleware):
                     description = first or None
                     break
 
-        status_code, interaction_hash = await authorize(
+        result = await authorize(
             agent_id,
             name or key,
             args,
@@ -164,8 +166,9 @@ class CBACMiddleware(Middleware):
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )
+        _, status_code, _ = result
         if status_code not in ALLOW_STATUS_CODES:
-            raise ResourceError(denial_body(status_code, interaction_hash))
+            raise ResourceError(denial_body(*result))
         return await call_next(context)
 
     # ``prompts/get`` is deliberately not gated. Prompts are user-controlled in

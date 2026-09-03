@@ -302,7 +302,7 @@ async def authorize(
     intent_id: str | None = None,
     cbac_url: str = "https://cbac-service.agentdna.io",
     cbac_timeout: float = 300,
-) -> tuple[int, str]:
+) -> tuple[str, int, str]:
     """Authorize one call. Every input is an argument (decision only).
 
     For enforcement points that already hold the governance context as
@@ -311,20 +311,21 @@ async def authorize(
     routing what they already hold through a contextvar only to read it back
     would be a detour.
 
-    Returns ``(status_code, interaction_hash)``, always both, never ``None``.
-    The code *is* the verdict -- ``cbac_service.error_codes`` when the service
-    reached one, where each code names the outcome of one pipeline layer -- and
-    which codes an enforcement point treats as permission is the enforcement
-    point's call. Never raises, so a caller that forgets to check the code
-    fails **open**; that check is its whole job.
+    Returns ``(decision, status_code, interaction_hash)``, always all three,
+    never ``None``. Never raises either, so a caller that forgets to check
+    fails **open**; checking is an enforcement point's whole job.
+
+    ``decision`` is the service's own word -- ``"allow"``, ``"deny"``, or
+    ``"error"`` when no verdict was reached. ``status_code`` is the same answer
+    machine-readable and one layer finer: ``cbac_service.error_codes`` names
+    *which* check produced it, so two denies can be told apart. Gate on whichever
+    suits: ``decision == "allow"`` needs nothing else, a code set is exact about
+    what it accepts and refuses a code it does not know.
 
     When no verdict was reached the code is one of this module's 9100s --
     :data:`NO_SERVICE_CONFIGURED`, :data:`UNRECOGNIZED_RESPONSE`,
     :data:`TRANSPORT_FAILED`, :data:`VERDICT_WITHOUT_CODE` -- rather than
-    ``None``, so an enforcement point tests one thing (is this code permission?)
-    instead of two, and the reason still reaches a log or a dashboard. A caller
-    that needs to tell "blocked by policy" from "could not ask" tests the range,
-    not a null.
+    ``None``, so the reason still reaches a log or a dashboard.
 
     ``interaction_hash`` is ``""`` whenever no audit row was written to have
     one -- every no-verdict case, and a service-side failure outside the
@@ -363,4 +364,4 @@ async def authorize(
         cbac_url,
         cbac_timeout=cbac_timeout,
     )
-    return (result.status_code, result.hash)
+    return (result.decision, result.status_code, result.hash)
