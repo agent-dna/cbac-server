@@ -114,6 +114,13 @@ router = APIRouter(prefix=API_PREFIX)
 async def on_validation_error(request: Request, exc: RequestValidationError):
     """Malformed bodies and query params answer in the same envelope as
     everything else, rather than in FastAPI's own error shape."""
+    # jsonable_encoder for the same reason as below: an error's ``ctx`` can hold
+    # the original exception object, which the JSON renderer cannot serialize.
+    logger.warning(
+        "request validation failed",
+        path=request.url.path,
+        errors=jsonable_encoder(exc.errors()),
+    )
     return api_response(
         # jsonable_encoder because an error's ``ctx`` can hold the original
         # exception object, which json.dumps cannot serialize.
@@ -132,6 +139,7 @@ async def health() -> JSONResponse:
             await session.execute(text("SELECT 1"))
         return api_response(data={"status": "ok"}, message="ok")
     except Exception as exc:
+        logger.exception("health check failed")
         return api_response(
             data={"status": "error"},
             message=str(exc),
@@ -269,6 +277,9 @@ async def list_cbac_decisions(
                 session, agent_id=agent_id, limit=limit, offset=offset
             )
     except Exception as exc:
+        logger.exception(
+            "decision list failed", agent_id=agent_id, limit=limit, offset=offset
+        )
         return api_response(message=str(exc), success=False, status_code=500)
 
     decisions = [_decision_json(record) for record in records]
@@ -289,6 +300,7 @@ async def read_cbac_decision(decision_id: int) -> JSONResponse:
         async with get_session() as session:
             record = await get_cbac_decision(session, decision_id=decision_id)
     except Exception as exc:
+        logger.exception("decision lookup failed", decision_id=decision_id)
         return api_response(message=str(exc), success=False, status_code=500)
 
     if record is None:
@@ -327,6 +339,9 @@ async def read_cbac_decision_by_hash(interaction_hash: str) -> JSONResponse:
                 session, interaction_hash=interaction_hash.lower()
             )
     except Exception as exc:
+        logger.exception(
+            "decision lookup by hash failed", interaction_hash=interaction_hash
+        )
         return api_response(message=str(exc), success=False, status_code=500)
 
     if record is None:
@@ -372,6 +387,7 @@ async def read_lhi_scores(body: LHIScoresRequest) -> JSONResponse:
                 session, agent_ids=body.agent_ids
             )
     except Exception as exc:
+        logger.exception("lhi score lookup failed", agent_ids=body.agent_ids)
         return api_response(message=str(exc), success=False, status_code=500)
 
     agents: dict[str, list[dict]] = {agent_id: [] for agent_id in body.agent_ids}
@@ -403,8 +419,10 @@ async def precompute_policy(body: PrecomputePolicyRequest) -> JSONResponse:
                 policy=body.policy,
             )
     except Exception as exc:
+        logger.exception("policy precompute failed")
         return api_response(message=str(exc), success=False, status_code=500)
 
+    logger.info("policy indexed", chunks_stored=count)
     return api_response(
         data={"agent_id": body.agent_id, "chunks_stored": count},
         message=f"indexed {count} chunk(s) for {body.agent_id}",
