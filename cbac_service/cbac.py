@@ -1,7 +1,9 @@
 import asyncio
 import base64
 import hashlib
-from collections.abc import Callable
+import json
+import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import numpy as np
@@ -11,6 +13,7 @@ from agentdna.types import AgentCard
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cbac_service import error_codes as ec
 from cbac_service.chunking import flatten_policy_chunks
 from cbac_service.config import (
     ALLOW_GAP,
@@ -29,13 +32,15 @@ from cbac_service.config import (
 from cbac_service.db.repository import (
     get_latest_trust,
     get_policy_chunks,
+    insert_cbac_decision,
     insert_lhi_record,
-    policy_hash_matches,
     save_policy_chunks,
 )
 from cbac_service.db.search import hybrid_search, vector_search
 from cbac_service.skills import (
+    VALID_LLM_DECISIONS,
     CBACResult,
+    LLMVerdict,
     _intended_action_text,
 )
 
@@ -51,14 +56,69 @@ def _policy_hash(policy: str) -> str:
     return hashlib.sha256(policy.encode()).hexdigest()
 
 
+def _interaction_hash(
+    agent_id: str,
+    decision: str,
+    reason: str,
+    intended_action: str,
+    user_intent: str | None,
+    callee_name: str | None,
+    callee_type: str | None,
+    error_code: int | None,
+    salt: str,
+    intent_id: str | None = None,
+) -> str:
+    """Content hash over one full ``cbac_decisions`` row, computed by
+    :meth:`CBAC._record_decision` immediately before insert.
+
+    Same construction as :func:`_policy_hash` — sha256 over a canonical
+    string — extended here to a JSON array rather than a plain join so a
+    value that happens to contain whatever separator we'd otherwise pick
+    (a comma, a pipe) can't collide two different rows onto the same hash.
+    Field order is fixed by this function, not sorted, since this is a
+    positional row fingerprint, not a dict digest. ``intent_id`` —  it is
+    appended last (before ``salt``) so a historical hash computed before
+    this field existed cannot collide with one that includes it.
+
+    ``salt`` is a fresh random value the caller generates per row (see
+    ``_record_decision`` — ``uuid.uuid4()``), not a derived or fixed value.
+    Its only job is to guarantee the hash is unique per row: two decisions
+    with byte-for-byte identical content (a genuine retry of the same
+    interaction) get *different* hashes, deliberately, because the hash is
+    now a per-row identifier, not a content fingerprint — do not reuse it
+    for dedup/retry detection, since it can no longer do that job. This
+    function stays deterministic and unit-testable given a fixed ``salt``;
+    the randomness lives at the call site, not in here.
+    """
+    payload = json.dumps(
+        [
+            agent_id,
+            decision,
+            reason,
+            intended_action,
+            user_intent,
+            callee_name,
+            callee_type,
+            error_code,
+            intent_id,
+            salt,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class CBAC:
     def __init__(
         self,
         provenance: Provenance,
-        cbac_url: str = "https://cbac-admin.agentdna.io",
         encoder_name: str = ENCODER_MODEL,
         nli_model_name: str = NLI_MODEL,
-        llm_backend: Callable | None = None,
+        # Contract: an async callable taking (intent_text, policy_text) and
+        # returning an LLMVerdict — never a bare string. See _tiered_decision's
+        # Tier 3 branch for what happens when a backend doesn't honor this.
+        llm_backend: Callable[[str, str], Awaitable[LLMVerdict]] | None = None,
         allow_gap: float = ALLOW_GAP,
         deny_gap: float = DENY_GAP,
         hhem_model_name: str = HHEM_MODEL,
@@ -67,7 +127,6 @@ class CBAC:
         lhi_lambda_down: float = LHI_LAMBDA_DOWN,
     ):
         self.provenance = provenance
-        self.cbac_url = cbac_url
         self._encoder_name = encoder_name
         self._nli_model_name = nli_model_name
         self._llm_backend = llm_backend
@@ -216,14 +275,15 @@ class CBAC:
         4. Encode all chunks with the bi-encoder.
         5. Persist to the policy_chunks table via the repository layer.
 
-        Always recomputes — callers that want a cache check do it themselves
-        (``verify_cbac`` compares the on-chain hash before calling).
+        Always recomputes, replacing whatever was indexed before. That makes
+        this the *only* way an agent's policy changes after the first decision:
+        ``verify_cbac`` reads the indexed copy and consults the Provenance Layer
+        only when there is none, so a card republished on chain reaches
+        decisions when this runs and not before. Behind
+        ``POST /cbac/v1/policies/precompute`` for exactly that reason.
 
-        Passing ``policy`` warms the cache for a policy the chain does not carry
-        yet. ``verify_cbac`` still re-reads the chain on every request, so a
-        cached policy that disagrees with the chain is replaced on the next
-        authorization — this is a cache warm, never a way to override the policy
-        a decision is made against.
+        Passing ``policy`` indexes that text instead of the agent's card —
+        which also means it decides real calls until something re-indexes.
 
         Returns the number of chunks stored.
         """
@@ -275,11 +335,11 @@ class CBAC:
         self,
         user_intent: str,
         agent_action: str,
-    ) -> tuple[tuple[str, str] | None, float]:
+    ) -> tuple[tuple[str, str, int] | None, float]:
         """NLI drift check: does the agent's action contradict the user's intent?
 
-        Returns ``((decision, reason), intent_score)`` if contradiction is
-        strong enough to deny, else ``(None, intent_score)``.
+        Returns ``((decision, reason, error_code), intent_score)`` if
+        contradiction is strong enough to deny, else ``(None, intent_score)``.
         """
         scores = await asyncio.to_thread(self._nli_scores, user_intent, agent_action)
         contradiction = scores.get("contradiction", 0.0)
@@ -292,6 +352,7 @@ class CBAC:
                         f"Check 1 drift: user intent {user_intent!r} contradicts agent action "
                         f"{agent_action!r} (NLI contradiction={contradiction:.2f})"
                     ),
+                    ec.CHECK1_DRIFT_DENY,
                 ),
                 intent_score,
             )
@@ -304,11 +365,11 @@ class CBAC:
         session: AsyncSession,
         agent_id: str,
         intent_text: str,
-    ) -> tuple[str, str, float | None]:
+    ) -> tuple[str, str, int, float | None]:
         """Tier 1 (cosine gap) → Tier 2 (NLI entailment) → Tier 3 (LLM).
 
         Uses pgvector search for Tier 1 instead of in-memory numpy operations.
-        Returns ``(decision, reason, policy_score)``.
+        Returns ``(decision, reason, error_code, policy_score)``.
         """
 
         # Encode only the intent at runtime (~5 ms on CPU).
@@ -343,6 +404,7 @@ class CBAC:
                     f"Tier 1 cosine gap {gap:+.3f} > +{self._allow_gap} "
                     f"(allowed={allowed_score:.3f}, forbidden={forbidden_score:.3f})"
                 ),
+                ec.TIER1_GAP_ALLOW,
                 gap_score,
             )
         if gap < -self._deny_gap:
@@ -352,6 +414,7 @@ class CBAC:
                     f"Tier 1 cosine gap {gap:+.3f} < -{self._deny_gap} "
                     f"(intent closer to forbidden than allowed policy)"
                 ),
+                ec.TIER1_GAP_DENY,
                 gap_score,
             )
 
@@ -374,7 +437,12 @@ class CBAC:
             top_chunk = None
 
         if not top_chunk:
-            return ("deny", "Tier 2: no allowed policy chunks found", None)
+            return (
+                "deny",
+                "Tier 2: no allowed policy chunks found",
+                ec.TIER2_NO_ALLOWED_CHUNKS,
+                None,
+            )
 
         t2_scores = await asyncio.to_thread(self._nli_scores, top_chunk, intent_text)
         entailment = t2_scores.get("entailment", 0.0)
@@ -384,47 +452,64 @@ class CBAC:
             return (
                 "allow",
                 f"Tier 2 NLI entailment={entailment:.2f} vs {top_chunk!r}",
+                ec.TIER2_ENTAILMENT_ALLOW,
                 entailment,
             )
         if contradiction >= CONTRADICTION_THRESHOLD:
             return (
                 "deny",
                 f"Tier 2 NLI contradiction={contradiction:.2f} vs {top_chunk!r}",
+                ec.TIER2_CONTRADICTION_DENY,
                 entailment,
             )
 
         # Tier 3: LLM judgment (optional).
         if self._llm_backend is None:
             return (
-                "advise",
+                "deny",
                 (
                     f"Tier 1/2 inconclusive (gap={gap:+.3f}, "
                     f"entailment={entailment:.2f}, contradiction={contradiction:.2f}); "
-                    "no LLM backend configured — caller must decide"
+                    "no LLM backend configured"
                 ),
+                ec.TIER3_NO_BACKEND_DENY,
                 None,
             )
 
         # Gather policy text for LLM context.
         all_chunks = await get_policy_chunks(session, agent_id)
         policy_text = "\n".join(all_chunks)
-        
-        #TODO:- llm decision should be structure with clear allow or deny with reason.
-        #string matching would lead to error. 
-        try:
-            llm_decision = await self._llm_backend(intent_text, policy_text)
-        except Exception as e:
-            return ("advise", f"Tier 3 LLM error: {e}", None)
 
-        verdict = str(llm_decision).lower()
-        if any(w in verdict for w in ("deny", "reject", "not allow", "prohibited")):
-            return ("deny", f"Tier 3 LLM: {llm_decision}", None)
-        if any(
-            w in verdict
-            for w in ("allow", "permit", "approve", "authorise", "authorize")
-        ):
-            return ("allow", f"Tier 3 LLM: {llm_decision}", None)
-        return ("advise", f"Tier 3 LLM inconclusive: {llm_decision}", None)
+        try:
+            verdict = await self._llm_backend(intent_text, policy_text)
+        except Exception as e:
+            return ("deny", f"Tier 3 LLM error: {e}", ec.TIER3_LLM_ERROR_DENY, None)
+
+        # `llm_backend` is contracted to return an LLMVerdict (see skills.py),
+        # not free text — a misbehaving backend (wrong type, or a decision
+        # outside the known three) degrades to "deny" rather than raising or
+        # silently guessing from prose.
+        decision = getattr(verdict, "decision", None)
+        reason_text = getattr(verdict, "reason", None)
+        if not isinstance(verdict, LLMVerdict) or decision not in VALID_LLM_DECISIONS:
+            return (
+                "deny",
+                f"Tier 3 LLM returned an unrecognised verdict: {verdict!r}",
+                ec.TIER3_LLM_MALFORMED_DENY,
+                None,
+            )
+
+        code = {
+            "allow": ec.TIER3_LLM_ALLOW,
+            "deny": ec.TIER3_LLM_DENY,
+            "advise": ec.TIER3_LLM_ADVISE_DENY,
+        }[decision]
+        # A backend that itself returns "advise" is folded to deny too — the
+        # pipeline no longer has a caller-must-decide state; `decision` (not
+        # `final_decision`) still appears in the reason so the audit log shows
+        # what the backend actually said.
+        final_decision = "deny" if decision == "advise" else decision
+        return (final_decision, f"Tier 3 LLM ({decision}): {reason_text}", code, None)
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -460,6 +545,11 @@ class CBAC:
                 hallucination_score=result.hallucination_score,
             )
         except Exception:
+            # The audit write runs next on this same session. A failed insert
+            # leaves the transaction pending-rollback, so without this the trust
+            # fold takes the decision record down with it -- and `cbac_decisions`
+            # is the one table that must have no skip conditions.
+            await session.rollback()
             logger.warning(
                 "lhi trust update failed",
                 callee_name=callee_name,
@@ -468,7 +558,120 @@ class CBAC:
             )
         return result
 
+    async def _record_decision(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intent_text: str,
+        user_intent: str | None,
+        callee_name: str,
+        callee_type: str,
+        result: CBACResult,
+        intent_id: str | None = None,
+    ) -> str | None:
+        """Append the verdict to the ``cbac_decisions`` audit log.
+
+        Never gates the decision, on the same grounds as :meth:`_fold_trust`:
+        the verdict is already settled, and failing to *write down* what was
+        decided must not change what was decided. A failed insert is logged.
+
+        Unlike the trust fold this has no skip conditions — every verdict is
+        recorded, including the infrastructure-failure denies and calls with no
+        callee, which is exactly what ``lhi_records`` cannot give us.
+
+        ``interaction_hash`` is computed here, over the exact row about to be
+        inserted, immediately before the insert — not earlier in the pipeline
+        — so it always reflects the final decision/reason/error_code, not an
+        intermediate value from a tier that ended up being superseded. A
+        fresh ``uuid.uuid4()`` is folded in as a per-row salt so the hash is
+        guaranteed unique per row, including for two decisions with
+        byte-for-byte identical content (e.g. a caller retry) — this is a
+        per-row identifier, not a dedup key; see :func:`_interaction_hash`.
+
+        ``intent_id``
+
+        Returns the ``interaction_hash`` that was written, or ``None`` if the
+        insert failed — :meth:`verify_cbac` stamps this onto the result so a
+        caller gets the hash back without a second lookup.
+        """
+        # NULL rather than "" for what the caller never supplied, so
+        # "no callee" stays distinguishable from "a callee named ''".
+        user_intent_val = user_intent or None
+        callee_name_val = callee_name or None
+        callee_type_val = callee_type if callee_name else None
+        try:
+            interaction_hash = _interaction_hash(
+                agent_id=agent_id,
+                decision=result.decision,
+                reason=result.reason,
+                intended_action=intent_text,
+                user_intent=user_intent_val,
+                callee_name=callee_name_val,
+                callee_type=callee_type_val,
+                error_code=result.error_code,
+                salt=str(uuid.uuid4()),
+                intent_id=intent_id,
+            )
+            await insert_cbac_decision(
+                session,
+                agent_id=agent_id,
+                decision=result.decision,
+                reason=result.reason,
+                intended_action=intent_text,
+                user_intent=user_intent_val,
+                callee_name=callee_name_val,
+                callee_type=callee_type_val,
+                error_code=result.error_code,
+                interaction_hash=interaction_hash,
+                intent_id=intent_id,
+            )
+            return interaction_hash
+        except Exception:
+            logger.warning(
+                "cbac decision record failed",
+                decision=result.decision,
+                exc_info=True,
+            )
+            return None
+
     async def verify_cbac(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intended_action: Any,
+        user_intent: str | None = None,
+        callee_name: str = "",
+        callee_type: str = "tool",
+        intent_id: str | None = None,
+    ) -> CBACResult:
+        """Decide, then write the verdict to the audit log.
+
+        The decision itself is :meth:`_decide`; this wrapper exists so the
+        recording happens at exactly one place. ``_decide`` has seven distinct
+        return paths, and every one of them must be logged — threading the
+        write through each is how a path silently stops being audited.
+
+        ``intent_id`` is the caller's own opaque correlation id (minted
+        upstream, at the workflow's first envelope, not by CBAC) — it plays no
+        part in the decision itself, so it bypasses ``_decide`` entirely and
+        goes straight into the audit write, which is also where it is hashed.
+        """
+        result = await self._decide(
+            session, agent_id, intended_action, user_intent, callee_name, callee_type
+        )
+        result.interaction_hash = await self._record_decision(
+            session,
+            agent_id,
+            _intended_action_text(intended_action),
+            user_intent,
+            callee_name,
+            callee_type,
+            result,
+            intent_id,
+        )
+        return result
+
+    async def _decide(
         self,
         session: AsyncSession,
         agent_id: str,
@@ -490,7 +693,7 @@ class CBAC:
         ``intended_action`` text and denies immediately on a strong
         contradiction (``CONTRADICTION_THRESHOLD``).
 
-        Once a decision is *reached* — allow, deny or advise alike — its
+        Once a decision is *reached* — allow or deny alike — its
         component scores are folded into the (agent → callee) trust score via
         :meth:`_fold_trust`, and the result carries the new ``trust``. All three
         components are known at this point, so there is nothing left to wait for
@@ -499,7 +702,8 @@ class CBAC:
 
         The early returns *above* the decision are infrastructure failures
         (policy lookup down, no policy, no chunks), not judgments about the
-        agent, so they deliberately record nothing.
+        agent, so they deliberately fold no trust. They are still *audited* —
+        :meth:`verify_cbac` logs every path to ``cbac_decisions`` regardless.
 
         Parameters
         ----------
@@ -518,13 +722,15 @@ class CBAC:
 
         Returns
         -------
-        CBACResult with ``decision`` in ``{"allow", "deny", "advise"}``.
+        CBACResult with ``decision`` in ``{"allow", "deny"}``.
         Fail-closed: any unrecoverable error resolves to ``deny``.
         """
         intent_text = _intended_action_text(intended_action)
         if not intent_text.strip():
             return CBACResult(
-                decision="deny", reason="Intended action carries no analysable content"
+                decision="deny",
+                reason="Intended action carries no analysable content",
+                error_code=ec.GUARD_INTENDED_ACTION_EMPTY,
             )
 
         # Check 1: NLI drift — only runs when caller supplies the root user intent.
@@ -532,54 +738,59 @@ class CBAC:
         if user_intent:
             drift, intent_score = await self._check1_drift(user_intent, intent_text)
             if drift is not None:
-                decision, reason = drift
+                decision, reason, error_code = drift
                 return await self._fold_trust(
                     session,
                     agent_id,
                     callee_name,
                     callee_type,
                     CBACResult(
-                        decision=decision, reason=reason, intent_score=intent_score
+                        decision=decision,
+                        reason=reason,
+                        intent_score=intent_score,
+                        error_code=error_code,
                     ),
                 )
 
-        # Fetch current policy from chain — always, so we can detect updates.
-        try:
-            current_policy = await asyncio.to_thread(
-                self._get_latest_agent_policy, agent_id
-            )
-        except Exception as e:
-            return CBACResult(
-                decision="deny",
-                reason=f"Policy lookup failed for agent {agent_id}: {e}",
-            )
-        if not current_policy:
-            return CBACResult(
-                decision="deny", reason=f"No policy available for agent {agent_id}"
-            )
-
-        current_hash = _policy_hash(current_policy)
-
-        # Check DB cache — recompute if stale.
-        cache_valid = await policy_hash_matches(session, agent_id, current_hash)
-        if not cache_valid:
+        all_chunks = await get_policy_chunks(session, agent_id)
+        if not all_chunks:
             try:
-                await self.index_policy(session, agent_id, policy=current_policy)
+                policy = await asyncio.to_thread(
+                    self._get_latest_agent_policy, agent_id
+                )
+            except Exception as e:
+                return CBACResult(
+                    decision="deny",
+                    reason=f"Policy lookup failed for agent {agent_id}: {e}",
+                    error_code=ec.GUARD_POLICY_LOOKUP_FAILED,
+                )
+            if not policy:
+                return CBACResult(
+                    decision="deny",
+                    reason=f"No policy available for agent {agent_id}",
+                    error_code=ec.GUARD_NO_POLICY_AVAILABLE,
+                )
+            try:
+                await self.index_policy(session, agent_id, policy=policy)
             except Exception as e:
                 return CBACResult(
                     decision="deny",
                     reason=f"Policy unavailable for agent {agent_id}: {e}",
+                    error_code=ec.GUARD_POLICY_INDEX_FAILED,
                 )
+            all_chunks = await get_policy_chunks(session, agent_id)
 
-        # Check that chunks actually exist.
-        all_chunks = await get_policy_chunks(session, agent_id)
+        # Still nothing means the policy indexed to no usable chunks — there is
+        # nothing to decide against, which is a deny, not an empty allow.
         if not all_chunks:
             return CBACResult(
-                decision="deny", reason="Policy carries no analysable content"
+                decision="deny",
+                reason="Policy carries no analysable content",
+                error_code=ec.GUARD_POLICY_NO_CONTENT,
             )
 
         # Run the tiered decision pipeline (DB-backed search).
-        decision, reason, policy_score = await self._tiered_decision(
+        decision, reason, error_code, policy_score = await self._tiered_decision(
             session, agent_id, intent_text
         )
 
@@ -607,6 +818,7 @@ class CBAC:
                 hallucination_score=hallucination,
                 intent_score=intent_score,
                 policy_score=policy_score,
+                error_code=error_code,
             ),
         )
 

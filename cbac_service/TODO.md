@@ -35,18 +35,18 @@ carry the reasoning from the design discussion so it isn't re-litigated.
       hidden in snake_case tool names (`close_pull_request` vs "do not close
       anything" → contradiction 0.01, caught at 0.95 as prose), and HHEM
       scores every tool-syntax string as ungrounded.
-      **Implemented (2026-08-03):** the guard's `_default_intent` renders
-      "The agent wants to <verb phrase>, with k = v, …" — verb phrase = the
-      wrapped function's docstring first line, else the de-snaked tool name.
-      All three scorers receive this one full-prose string; no wire change.
+      **Implemented (2026-08-03):** `render_intent` renders "The agent wants to
+      <verb phrase>, with k = v, …" — verb phrase = the callee's description
+      (docstring or schema first line), else the de-snaked callee name. All
+      three scorers receive this one full-prose string.
       **Decision:** HHEM scores the params too (they are the LLM-generated
       content). Accepted tradeoff, measured: with params in view, legitimate
       params_added calls (HHEM 0.09) are inseparable from hijacks (0.05), so
       hallucination thresholds must stay advisory. The verb-only view
       (faithful 0.53 / params_added 0.62 vs hijack 0.04) remains a one-line
       switch in `verify_cbac` — `intent_text.split(", with ", 1)[0]` — via
-      the `_action_summary` helper kept in guard.py, if separation matters
-      later.
+      the `_action_summary` helper alongside `render_intent` in `skills.py`,
+      if separation matters later.
 
 - [x] **Record violation / denial evidence** (done 2026-08-14, as a side
       effect of folding LHI into `verify_cbac`). A denied call used to write

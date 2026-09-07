@@ -17,8 +17,15 @@ if _repo_root not in sys.path:
 from cbac_service.config import DATABASE_URL
 from cbac_service.db.base import Base
 
-# Import models so their tables are registered on Base.metadata.
-from cbac_service.db.models import PolicyChunk, PolicyMeta  # noqa: F401
+# Import models so their tables are registered on Base.metadata. Every model
+# must be listed: one left out is invisible to --autogenerate, which then
+# proposes dropping its table.
+from cbac_service.db.models import (  # noqa: F401
+    CBACDecision,
+    LHIRecord,
+    PolicyChunk,
+    PolicyMeta,
+)
 
 # ── Alembic config ────────────────────────────────────────────────────────────
 config = context.config

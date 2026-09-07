@@ -21,21 +21,34 @@ dependencies = [
   "alembic>=1.13.0",
   "pgvector>=0.3.6",
   "greenlet>=3.0.0",
+  # The guard, from cbac/ in this checkout — see [tool.uv.sources] below.
+  "cbac",
 ]
 
-# Deployed from a checkout (uvicorn cbac_service.cbac:app); not published as a wheel.
+# Deployed from a checkout (uvicorn cbac_service.cbac:app).
 [tool.uv]
 package = false
 
+# The guard is its own distribution (published to PyPI as `cbac`); the service
+# depends on it from this checkout rather than from the index.
+[tool.uv.workspace]
+members = ["cbac"]
+
+[tool.uv.sources]
+cbac = { workspace = true }
+
 [dependency-groups]
-# cbac/mcp.py imports mcp.types. Declared directly rather than via an
-# agent-dna extra, which the published wheel doesn't ship.
 dev = [
     "pytest>=8.0.0",
     "mcp>=2.0.0",
     "ruff==0.16.3",
     "pyright==1.1.411",
 ]
+
+[tool.ruff]
+# The guard is first-party even though it lives in its own project directory:
+# without this, isort files `cbac` and `cbac.mcp` into different groups.
+src = [".", "cbac/src"]
 
 [tool.ruff.lint]
 # The decision pipeline is fail-closed by design: any error becomes a `deny`, and
@@ -50,6 +63,12 @@ ignore = ["BLE001"]
 venvPath = "."
 venv = ".venv"
 
+# examples/ installs its own venv from its own requirements.txt (langgraph,
+# fastmcp, the LLM providers) — none of which belong in this repo's lock file.
+# Checking it against the root venv would report every one as unresolved.
+# Defaults are replaced, not merged, so the usual ignores are repeated here.
+exclude = ["**/node_modules", "**/__pycache__", "**/.*", "examples"]
+
 # Test doubles — SimpleNamespace fakes, None sessions, monkeypatched repositories —
 # deliberately don't satisfy production signatures; that is what makes them usable
 # as doubles. Everything else still type-checks here.
@@ -57,6 +76,16 @@ venv = ".venv"
 root = "cbac_service/tests"
 # `root` also re-roots import resolution, so `from cbac_service.cbac import ...`
 # stops resolving without the repo root added back (mirrors pytest's pythonpath).
+extraPaths = ["."]
+reportArgumentType = "none"
+reportAttributeAccessIssue = "none"
+
+# The benchmark harness drives the pipeline with the same doubles the tests use:
+# a SimpleNamespace Provenance, a monkeypatched encoder, a None session. Only
+# scripts/cbac_benchmark/ is exempt — the rest of scripts/ still type-checks, which
+# is what catches a stale caller when a pipeline signature changes.
+[[tool.pyright.executionEnvironments]]
+root = "scripts/cbac_benchmark"
 extraPaths = ["."]
 reportArgumentType = "none"
 reportAttributeAccessIssue = "none"

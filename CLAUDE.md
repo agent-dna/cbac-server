@@ -3,8 +3,26 @@
 Guidance for this repo. It holds two things:
 
 - `cbac_service/` — the decision service (this file is mostly about it).
-- `cbac/` — the framework-agnostic guard + optional MCP glue. `import cbac` gets
-  it; this repo owns it outright.
+- `cbac/` — the framework-agnostic guard + optional MCP glue, its own
+  distribution (`cbac` on PyPI) with its own `pyproject.toml`. The import
+  package is `cbac/src/cbac/`; the service depends on it as a **uv workspace
+  member**, so `import cbac` in this checkout always resolves to that source,
+  never to a published wheel.
+
+## Writing docs and comments
+
+`README.md`, every doc here, and every **code comment and docstring** describe the
+code **as it currently stands**, never how it got there. Verify each claim against
+the actual files before writing it — endpoints against `main.py`, env vars against
+`config.py`, commands against `pyproject.toml` and `.github/workflows/` — rather
+than reconstructing from a conversation or from a previous version of the text. No
+"we used to", no "removed X because it's no longer needed", no "this previously
+returned Y", no rationale that only makes sense as a diff.
+
+Explaining *why the current code is the way it is* stays — that is what makes a
+comment worth reading ("fail-closed by design", "asarray narrows the declared
+union"). Restating it as a change does not. When resolving a doc merge conflict,
+re-check *both* sides against current code; neither side is presumed right.
 
 ## What this is
 
@@ -19,14 +37,31 @@ app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
   `ENCODER_MODEL`, `LHI_WEIGHTS`, `DATABASE_URL`, …). Change a value here and
   redeploy.
 - `chunking.py` — structure-aware policy-text chunking (`chunk_body_text`).
-- `skills.py` — `skill.md` parsing + the CBAC result dataclasses.
+- `skills.py` — `skill.md` parsing, `render_intent`, the CBAC result dataclasses.
+- `entity.py` — pydantic request models for the HTTP API.
 - **Not published as a wheel** (`[tool.uv] package = false`). Deployed from a
   checkout: `uvicorn cbac_service.main:app`.
+- Every response is `{success, message, data}` (`main.api_response`). `success`
+  means the request was *processed*, **not** that the action was allowed — a
+  deny is a successful call, and the verdict is `data.decision`. Request bodies
+  are pydantic models in `entity.py`; a schema violation answers in the same
+  envelope with 422 via the `RequestValidationError` handler.
 - Endpoints:
-  - **`POST /authorize-cbac`** — main decision gate. Also folds the decision
+  - **`POST /cbac/v1/authorize`** — main decision gate. Also folds the decision
     into the caller→callee trust score, so it is the *only* call a guard makes.
-  - **`POST /precompute-policy`** — explicitly trigger embedding precomputation.
-  - **`GET /health`** — DB connectivity check.
+    Always HTTP 200, including the fail-closed `"error"` verdict: a 5xx would
+    invite a retry, and the trust fold is not idempotent.
+  - **`POST /cbac/v1/policies/precompute`** — explicitly trigger embedding precomputation.
+  - **`GET /cbac/v1/decisions?agent_id=&limit=&offset=`** — an agent's decision
+    history, newest first.
+  - **`GET /cbac/v1/decisions/{id}`** — one decision by id.
+  - **`GET /cbac/v1/decisions/by-hash/{interaction_hash}`** — one decision by
+    its interaction hash.
+  - **`POST /cbac/v1/lhi-scores`** — current trust for a batch of agents
+    (`{"agent_ids": [...]}`), one entry per caller→callee edge. A POST for a
+    read because the id batch is the body.
+  - **`GET /health`** — DB connectivity check. Unversioned on purpose: probes
+    are wired once at deploy time and must not track API versions.
 - Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`).
 
 ## Architecture
@@ -38,7 +73,9 @@ Guard (cbac/) --HTTP--> cbac_service (FastAPI)
                                 ├── pgvector 0.8.6 (semantic search)
                                 ├── pg_textsearch 1.4.0 (BM25 keyword search)
                                 ├── policy_chunks table (embeddings + text)
-                                └── policy_meta table (cache invalidation)
+                                ├── policy_meta table (what was indexed)
+                                ├── cbac_decisions table (audit log)
+                                └── lhi_records table (trust history)
 ```
 
 ## Database
@@ -54,13 +91,31 @@ The service uses **PostgreSQL 18** with two extensions:
 - `chunk_text` — the original text (needed for Tier 2 NLI)
 - `chunk_type` — `allowed` or `forbidden`
 - `embedding` — vector(384), the searchable embedding
-- `policy_hash` — for cache invalidation
+- `policy_hash` — the hash of the policy text these chunks came from
 - `section` / `chunk_index` — ordering and provenance
 
-**`policy_meta`** — one row per agent, lightweight cache check:
-- `policy_hash` — compared against on-chain hash at runtime
+**`policy_meta`** — one row per agent, written by `index_policy`:
+- `policy_hash` — which policy text the indexed chunks came from. Recorded, not
+  compared: nothing on the decision path re-reads the chain to check it
 - `encoder_model` / `nli_model` — detect if models changed
 - `chunk_count` / `cached_at` — operational metadata
+
+**`cbac_decisions`** — one row per verdict, the **audit log**:
+- `agent_id` / `decision` / `reason` — who, what, why
+- `intended_action` — the *flattened* action text, i.e. what the scorers saw
+- `user_intent` / `callee_name` / `callee_type` — context; NULL when not supplied
+- `created_at`
+
+**`lhi_records`** — one row per decision, the **trust history** (see the LHI
+section below).
+
+⚠️ **These two are not interchangeable, and the difference is easy to get
+wrong.** `cbac_decisions` is *complete*: every verdict `verify_cbac` reaches is
+recorded, including the infrastructure-failure denies and calls with no callee.
+`lhi_records` is deliberately *skipped* in exactly those cases (no
+`callee_name`, no measured component, the infra-failure early returns), because
+a trust score must not be moved by things that are not evidence about the agent.
+So only `cbac_decisions` can answer "what did we decide, and why".
 
 ### Indexes
 - `policy_chunks_embedding_idx` — HNSW (vector_cosine_ops)
@@ -84,8 +139,12 @@ everything from there, not from inside `cbac_service/`:
 - `uv sync --locked` — install from `uv.lock`. `agent-dna` resolves from PyPI
   like any other dependency; there is no path source to the sibling checkout, so
   library edits are **not** picked up live — publish, then bump the pin here.
-  The `dev` group declares `mcp` directly, which `cbac/mcp.py` needs (the
-  published `agent-dna` wheel ships no `mcp` extra).
+  `cbac` is the exception: it is a workspace member (`[tool.uv.workspace]`,
+  `[tool.uv.sources]`), installed from `cbac/` in this checkout, so guard edits
+  *are* live.
+- `uv build --package cbac` — build the guard's sdist + wheel into `dist/`. It
+  declares one dependency (`requests`) and ships only `cbac/src/cbac/`; the
+  service is not published (`[tool.uv] package = false`).
 - `uv run pytest` — runs `cbac_service/tests/` (`[tool.pytest.ini_options]`,
   `pythonpath = ["."]`).
 - `ruff` and `pyright` are pinned **exactly**, not floored: CI and the local
@@ -112,9 +171,13 @@ Class `CBAC`. On each request:
    checks if the agent's intended action contradicts the user intent.
    Contradiction ≥ 0.60 → immediate deny.
 
-2. **Policy fetch + cache check**: Fetches the agent's latest policy from the
-   Provenance Layer. Compares the policy hash against `policy_meta` in Postgres.
-   If stale or missing → `index_policy` (chunk, classify, encode, store).
+2. **Policy load**: Reads the agent's chunks from Postgres. On a hit that is the
+   whole step — no network call, and decisions keep working while the Provenance
+   Layer is down. Only an agent with nothing indexed reaches the chain, and then
+   `index_policy` (chunk, classify, encode, store) runs before the tiers.
+   **Nothing re-reads the chain afterwards**: the indexed copy decides until
+   `POST /cbac/v1/policies/precompute` replaces it, so publishing a new policy
+   card is half of a policy update and re-indexing is the other half.
 
 3. **Tier 1 — Cosine gap** (via pgvector): Encodes the intent, runs
    `vector_search(allowed)` and `vector_search(forbidden)`. If
@@ -126,7 +189,9 @@ Class `CBAC`. On each request:
    cross-encoder. Entailment ≥ 0.55 → allow, contradiction ≥ 0.60 → deny.
 
 5. **Tier 3 — LLM backend** (optional): If configured, sends intent + full
-   policy text to an LLM for judgment. Otherwise returns `"advise"`.
+   policy text to an LLM for judgment. Otherwise returns `"deny"`. A
+   configured backend that itself returns `"advise"` is also folded to
+   `"deny"` — the pipeline has no caller-must-decide state.
 
 6. **Hallucination score** (HHEM): Attached after the decision, never gates it.
 
@@ -136,10 +201,21 @@ Class `CBAC`. On each request:
    decision — a failed trust update is logged, not raised. Skipped when no
    `callee_name` was supplied, or when no component was measured. The early
    returns *above* the decision (policy lookup down, no policy, no chunks) are
-   infrastructure failures, not evidence about the agent, and record nothing.
+   infrastructure failures, not evidence about the agent, and fold no trust.
 
-Decisions are `"allow" | "deny" | "advise"` and the pipeline is **fail-closed**
-(any error → `deny`).
+8. **Decision recorded** (`_record_decision` → `insert_cbac_decision`): the
+   verdict plus its action context is appended to `cbac_decisions`. Unlike the
+   trust fold this has **no skip conditions** — every path is audited, including
+   the infra-failure denies above. Also never gates: failing to write down what
+   was decided must not change what was decided.
+
+`verify_cbac` is a thin wrapper that calls `_decide` (the pipeline above) and
+then records. `_decide` has seven return paths and the wrapper exists so the
+audit write happens in exactly one place — threading it through each return is
+how a path silently stops being audited.
+
+Decisions are `"allow" | "deny"` and the pipeline is **fail-closed** (any
+error, or an inconclusive/misbehaving Tier 3, → `deny`).
 
 ## Scoring attached to a decision
 
@@ -158,8 +234,8 @@ Decisions are `"allow" | "deny" | "advise"` and the pipeline is **fail-closed**
   post-execution step and no `/compute-lhi` endpoint: every component is known
   the moment a decision is reached, so a guard makes exactly **one** HTTP call
   per action and no score ever round-trips through the client. **Every decision
-  records** — allow, deny and advise alike — so an agent probing forbidden
-  actions loses trust instead of keeping a pristine record.
+  records** — allow and deny alike — so an agent probing forbidden actions
+  loses trust instead of keeping a pristine record.
 
   The mean **renormalizes over the observed components** (`s = Σ wᵢxᵢ / Σ wᵢ`)
   rather than skipping records with a missing one: the components are not
