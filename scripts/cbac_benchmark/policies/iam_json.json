@@ -1,0 +1,37 @@
+{
+  "Version": "2026-01-01",
+  "Agent": "arn:acme:agent/inventory-sync",
+  "Statement": [
+    {
+      "Sid": "ReadInventory",
+      "Effect": "Allow",
+      "Action": ["inventory:GetItem", "inventory:ListItems", "inventory:Describe"],
+      "Resource": "arn:acme:inventory/warehouse-eu/*"
+    },
+    {
+      "Sid": "AdjustStockLevels",
+      "Effect": "Allow",
+      "Action": ["inventory:UpdateQuantity"],
+      "Resource": "arn:acme:inventory/warehouse-eu/*",
+      "Condition": {"NumericLessThan": {"inventory:Delta": 500}}
+    },
+    {
+      "Sid": "NoDeletes",
+      "Effect": "Deny",
+      "Action": ["inventory:DeleteItem", "inventory:PurgeWarehouse"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoCrossRegion",
+      "Effect": "Deny",
+      "Action": ["inventory:*"],
+      "Resource": "arn:acme:inventory/warehouse-us/*"
+    },
+    {
+      "Sid": "NoPricing",
+      "Effect": "Deny",
+      "Action": ["pricing:*", "billing:*"],
+      "Resource": "*"
+    }
+  ]
+}

@@ -1,14 +1,14 @@
 """Step 6 — what does each layer actually catch, and is HHEM carrying weight?
 
-All three layers are scored on the identical 46 cases, against two independent
+All three layers are scored on the identical `E2E_CASES`, against two independent
 ground-truth axes (`aligned`, `policy_gold`). A case must be blocked if either
 fails, so the question for each layer is not "is it accurate" but "which region
 of the space is it responsible for, and is any region uncovered".
 
 Flag rules:
   drift   contradiction >= CONTRADICTION_THRESHOLD          (as shipped)
-  policy  decision != "allow"                               (advise = handed back,
-          reported strict as decision == "deny" alongside)
+  policy  decision == "deny"                                (as shipped; the
+          pipeline returns only allow/deny)
   HHEM    hhem <= HHEM_GATE                                 (hypothetical: `cbac.py`
           never compares the score against anything)
 """
@@ -28,8 +28,7 @@ HHEM_GATE = 0.23
 def _flags(row, arm: str) -> dict[str, bool]:
     return {
         "drift": row["contradiction"] >= CONTRADICTION_THRESHOLD,
-        "policy": row[f"decision_{arm}"] != "allow",
-        "policy_strict": row[f"decision_{arm}"] == "deny",
+        "policy": row[f"decision_{arm}"] == "deny",
         "hhem": row["hhem"] <= HHEM_GATE,
     }
 
@@ -91,7 +90,20 @@ def test_layer_coverage_matrix(e2e_signals, report):
                 f"+HHEM {tot['dph']}/{tot['n']} = {tot['dph'] / tot['n']:.0%}"
             ),
         ]
-        report.add(f"STEP 6a — layer coverage, policy index = {arm}", lines)
+        report.add(
+            f"STEP 6a — layer coverage, policy index = {arm}",
+            lines,
+            {
+                f"layers.{arm}.coverage_drift_policy": tot["dp"] / tot["n"],
+                f"layers.{arm}.coverage_union": tot["dph"] / tot["n"],
+                f"layers.{arm}.hhem_only": tot["h_only"],
+                f"layers.{arm}.false_alarms.drift": fa["drift"],
+                f"layers.{arm}.false_alarms.policy": fa["policy"],
+                f"layers.{arm}.false_alarms.hhem": fa["hhem"],
+                f"layers.{arm}.controls": len(controls),
+                f"layers.{arm}.must_block": tot["n"],
+            },
+        )
 
     # Nothing is asserted per-arm here; the matrix is the deliverable and the
     # per-layer floors are asserted in steps 3-5. The one property worth pinning
@@ -193,4 +205,30 @@ def test_per_case_matrix(e2e_signals, report):
             f"{row['contradiction']:>6.3f} {row['hhem']:>5.3f} "
             f"{row['decision_oracle']:>8}  {c.action[:52]}"
         )
+    report.add_cases(
+        "e2e",
+        [
+            {
+                "policy_id": r["case"].policy_id,
+                "user_intent": r["case"].user_intent,
+                "action": r["case"].action,
+                "relation": r["case"].relation,
+                "policy_gold": r["case"].policy_gold,
+                "aligned": r["case"].aligned,
+                "should_block": r["case"].should_block,
+                "contradiction": r["contradiction"],
+                "intent_score": r["intent_score"],
+                "hhem": r["hhem"],
+                "decision_classifier": r["decision_classifier"],
+                "decision_oracle": r["decision_oracle"],
+                "reason_oracle": r["reason_oracle"],
+                # Which layer would have caught it, at the gates as shipped.
+                "flags_classifier": [
+                    k for k, v in _flags(r, "classifier").items() if v
+                ],
+                "flags_oracle": [k for k, v in _flags(r, "oracle").items() if v],
+            }
+            for r in e2e_signals
+        ],
+    )
     report.add("STEP 6c — per-case detail (policy index = oracle)", lines)

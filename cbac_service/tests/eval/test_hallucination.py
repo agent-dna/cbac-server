@@ -50,7 +50,11 @@ def test_hhem_separates_unsupported_actions(e2e_signals, report):
         "  note: `cbac.py` defines no HHEM threshold — the score is attached and folded",
         "  into trust, never compared against anything. The gate above is hypothetical.",
     ]
-    report.add("STEP 5 — HHEM grounding of the action in the user request", lines)
+    report.add(
+        "STEP 5 — HHEM grounding of the action in the user request",
+        lines,
+        {"hhem.auc": a, "hhem.best_gate": t},
+    )
 
     assert a >= MIN_AUC, (
         f"HHEM separates supported from unsupported actions at AUC {a:.2f}; as a "

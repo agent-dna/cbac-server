@@ -202,18 +202,75 @@ class Binary:
         )
 
 
+# The numbers worth reading first, in the order a reader needs them: can the
+# classifier find the prohibitions, do the tiers act on them, and does the
+# fallback carry the result. `None` renders as "-" so a partial run (one test
+# selected with -k) still prints a well-formed block.
+#
+# (metric key, label, format). Everything else stays in `metrics` for the JSON.
+HEADLINE: tuple[tuple[str, str, str], ...] = (
+    ("classify.forbidden_recall.structured", "forbidden recall, structured", ".2f"),
+    ("classify.forbidden_recall.unstructured", "forbidden recall, unstructured", ".2f"),
+    ("classify.forbidden_recall.by_label", "  ...on `forbidden-actions:` lines", ".2f"),
+    ("classify.forbidden_recall.by_prose", "  ...on prose prohibitions", ".2f"),
+    ("classify.empty_forbidden_buckets", "policies with no forbidden bucket", "d"),
+    ("tier.classifier.block_rate", "block rate, classifier index", ".2f"),
+    ("tier.oracle.block_rate", "block rate, oracle index", ".2f"),
+    ("tier.classifier.allow_rate", "allow rate, classifier index", ".2f"),
+    ("tier.oracle.allow_rate", "allow rate, oracle index", ".2f"),
+    ("tier.oracle.fallback_share", "decisions from the no-LLM fallback", ".2f"),
+    ("adversarial.oracle.leaked", "attacks authorized (oracle)", "d"),
+    ("drift.recall", "drift recall on misaligned actions", ".2f"),
+    ("hhem.auc", "HHEM AUC", ".2f"),
+    ("layers.oracle.coverage_union", "blocked by drift∪policy∪HHEM", ".2f"),
+)
+
+
 class Report:
     """Collects the numbers and prints one consolidated block at session end,
-    so the findings survive pytest's per-test output capture."""
+    so the findings survive pytest's per-test output capture.
+
+    Two audiences. `dump()` is the human read — a headline block first, then
+    every section in full. `metrics` is the machine read: a flat
+    `dotted.key -> number` mapping that `--eval-json` writes out, so a caller
+    can track a number across runs without parsing the prose.
+    """
 
     def __init__(self) -> None:
         self.sections: list[tuple[str, list[str]]] = []
+        self.metrics: dict[str, float] = {}
+        self.cases: dict[str, list[dict]] = {}
+        self.policies: list[dict] = []
 
-    def add(self, title: str, lines: list[str]) -> None:
+    def add(
+        self,
+        title: str,
+        lines: list[str],
+        metrics: dict[str, float] | None = None,
+    ) -> None:
         self.sections.append((title, lines))
+        if metrics:
+            self.metrics.update(metrics)
+
+    def add_cases(self, kind: str, rows: list[dict]) -> None:
+        """Per-case records, for consumers that need to ask *which* case rather
+        than *how many*. An aggregate says a rate moved; only these say what
+        moved it."""
+        self.cases[kind] = rows
+
+    def headline_lines(self) -> list[str]:
+        width = max(len(label) for _, label, _ in HEADLINE)
+        out = []
+        for key, label, spec in HEADLINE:
+            value = self.metrics.get(key)
+            shown = "-" if value is None else format(value, spec)
+            out.append(f"  {label:<{width}}  {shown:>6}")
+        return out
 
     def dump(self) -> str:
         out = ["", "=" * 78, "CBAC PIPELINE EVALUATION", "=" * 78]
+        if self.metrics:
+            out += ["", "HEADLINE", "-" * 8, *self.headline_lines()]
         for title, lines in self.sections:
             out += ["", title, "-" * len(title), *lines]
         out.append("")

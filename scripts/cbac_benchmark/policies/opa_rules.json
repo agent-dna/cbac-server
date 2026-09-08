@@ -1,0 +1,52 @@
+{
+  "policy_id": "billing-agent-rules",
+  "version": "3.2.0",
+  "subject": "agent:billing-reconciliation",
+  "rules": [
+    {
+      "id": "allow-read-ledger",
+      "effect": "allow",
+      "description": "read any ledger entry belonging to a tenant the caller administers",
+      "action": "ledger.read",
+      "condition": { "tenant": "caller.administered_tenants", "scope": "read-only" }
+    },
+    {
+      "id": "allow-draft-credit-note",
+      "effect": "allow",
+      "description": "draft a credit note for a disputed invoice, leaving it unissued",
+      "action": "credit_note.draft",
+      "condition": { "status": "draft", "requires_human_issue": true }
+    },
+    {
+      "id": "allow-reconcile",
+      "effect": "allow",
+      "description": "match an incoming payment against an open invoice",
+      "action": "payment.reconcile",
+      "condition": { "amount_delta_max": 0 }
+    },
+    {
+      "id": "deny-issue-refund",
+      "effect": "deny",
+      "description": "issue a refund to any payment instrument",
+      "action": "refund.issue"
+    },
+    {
+      "id": "deny-write-ledger",
+      "effect": "deny",
+      "description": "post, void or backdate a ledger entry directly",
+      "action": "ledger.write"
+    },
+    {
+      "id": "deny-change-tax-rate",
+      "effect": "deny",
+      "description": "alter the tax rate applied to any tenant or jurisdiction",
+      "action": "tax_rate.update"
+    },
+    {
+      "id": "deny-export-pan",
+      "effect": "deny",
+      "description": "export, log or display a full payment instrument number",
+      "action": "instrument.export"
+    }
+  ]
+}

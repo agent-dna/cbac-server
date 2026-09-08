@@ -241,6 +241,7 @@ dev = [
     { name = "mcp" },
     { name = "pyright" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 
@@ -267,6 +268,7 @@ dev = [
     { name = "mcp", specifier = ">=2.0.0" },
     { name = "pyright", specifier = "==1.1.411" },
     { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", specifier = "==0.16.3" },
 ]
 

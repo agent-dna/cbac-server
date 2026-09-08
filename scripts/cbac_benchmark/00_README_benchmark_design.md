@@ -22,10 +22,12 @@ Each entry in `intents.yaml` has: `id`, `category`, `policy_file`,
 4. **(tier 2) NLI entailment**: cross-encoder NLI (`nli-deberta-v3-small`)
    with the *top allowed chunk* as premise, intent as hypothesis.if
    `entailment >= 0.55` → allow.if `contradiction >= 0.60` → deny. everything else → Tier 3.
-5. **(tier 3) optional LLM**: only if a backend is configured; the response
-   is free text, decided by **keyword substring matching** (`deny`,
-   `reject`, `not allow`, `prohibited` checked before `allow`, `permit`,
-   `approve`, ...). No backend → `"advise"`.
+5. **(tier 3) optional LLM**: only if a backend is configured; it must return
+   an `LLMVerdict` (see `skills.py`) whose `decision` is `allow`, `deny` or
+   `advise`. An `advise` is folded to `deny`, as is a malformed verdict — the
+   pipeline has no caller-must-decide state. No backend configured → `deny`
+   (`TIER3_NO_BACKEND_DENY`), which is where roughly half of all decisions
+   currently land.
 
 
 ---
@@ -47,11 +49,19 @@ Each entry in `intents.yaml` has: `id`, `category`, `policy_file`,
 | `EMPTY` | Input handling | Degenerate / empty inputs |
 | `LEN` | Tier 1 cosine | Extreme-length intents diluting or overloading the signal |
 | `DRIFT` | Check 1 | Contradiction detection, and the no-`user_intent` bypass |
-| `LLM` | Tier 3 keyword matching | Negated deny-words inside an allow-leaning LLM answer |
+| `LLM` | Tier 3 verdict handling | What a backend's verdict does to the decision |
 | `POLICY` | Chunking / classification | Malformed, vague, contradictory, or lopsided policy files |
 | `DETERM` | Consistency | Same semantic policy, different formatting → different decision? |
 
 ## Policy fixtures (`policies/`)
+
+This directory is the **shared policy corpus**. The cases in `intents.yaml`
+reference a subset of it by filename; the eval suite in
+`cbac_service/tests/eval/` reads every file in it and carries the per-span gold
+labels for each. Adding a file here is free for this runner (it only loads what
+`intents.yaml` names) but an edit to an existing one can detach the eval's gold
+labels — `cbac_service/tests/eval/test_datasets_sanity.py` fails when that
+happens, and it runs in the ordinary `uv run pytest`.
 
 - `baseline_strict.md`: straigh forward allow/forbid list. 
 - `vague_narrative.md`: heavy neutral prose, no clear permission language.
@@ -69,6 +79,20 @@ Each entry in `intents.yaml` has: `id`, `category`, `policy_file`,
   Z").
 - `numeric_constraint.md` — a policy expressed as a dollar threshold, which
   nothing in the pipeline can actually evaluate as a number.
+- `calendar_actions.md`, `contract_review.md`, `discount_policy.md`,
+  `doc_sharing.md`, `infra_actions.md`, `legal_hold.md` — ordinary cards in
+  other domains, one intent case each here and a full grid in the eval suite.
+
+The remaining files (`payments_card.md`, `devops_card.md`, `support_card.md`,
+`clinical_card.md`, `analytics_card.md`, `md_headings.md`,
+`prose_systemprompt.txt`, `iam_json.json`, `yaml_config.yaml`,
+`readme_guardrails.md`, `numbered_rules.md`, `long_multisection.md`,
+`runbook_wiki.md`, `opa_rules.json`, `terms_prose.txt`, `cross_reference.md`)
+are the eval suite's own corpus and are not referenced by `intents.yaml`. They
+cover document shapes the fixtures above do not: markdown headings, a system
+prompt, IAM JSON, a YAML config, a README, numbered rules, a policy long enough
+to exceed `CHUNK_MAX_WORDS`, a permission table, OPA-style rule objects, legal
+prose, and grants whose exceptions live in a different section.
 
 ## running this
 
