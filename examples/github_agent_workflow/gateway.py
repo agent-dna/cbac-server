@@ -71,10 +71,9 @@ CBAC_TIMEOUT = float(os.environ.get("CBAC_TIMEOUT", "600"))
 # the authenticated principal (OAuth subject, mTLS SAN, API key) to an agent id
 # instead, in the two lines where the hooks read the header.
 AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
-# Which MCP server the forwarded call lands on, when the call carries no
-# X-CBAC-Mcp-Did — the labelled id wins, same as the agent id above. Recorded on
-# the trust record, never scored, so taking the client's word for it costs
-# nothing a forged value could exploit.
+# Which MCP server the forwarded call lands on. The gateway routes the call, so
+# it is the only party that knows this for a fact — config here, never a header
+# the agent could misreport. Recorded on the trust record, never scored.
 MCP_DID = os.environ.get("CBAC_MCP_DID", UPSTREAM_URL)
 
 # The service's pipeline codes (``cbac_service.error_codes``) that this gateway
@@ -104,7 +103,6 @@ class CBACMiddleware(Middleware):
         agent_id = (ctx.agent_id if ctx else "") or AGENT_ID
         user_intent = ctx.user_intent if ctx else ""
         intent_id = ctx.intent_id if ctx else ""
-        mcp_did = (ctx.mcp_did if ctx else "") or MCP_DID
         message = context.message
         tool_name, tool_args = message.name, dict(message.arguments or {})
 
@@ -116,7 +114,7 @@ class CBACMiddleware(Middleware):
 
         result = await authorize(
             agent_id,
-            mcp_did,
+            MCP_DID,
             tool_name,
             tool_args,
             user_intent,
@@ -147,7 +145,6 @@ class CBACMiddleware(Middleware):
         agent_id = (ctx.agent_id if ctx else "") or AGENT_ID
         user_intent = ctx.user_intent if ctx else ""
         intent_id = ctx.intent_id if ctx else ""
-        mcp_did = (ctx.mcp_did if ctx else "") or MCP_DID
         # A URI carries its arguments inside it — github://acme/api/… — so it
         # is both the lookup key and the whole argument set.
         key = str(context.message.uri)
@@ -165,7 +162,7 @@ class CBACMiddleware(Middleware):
 
         result = await authorize(
             agent_id,
-            mcp_did,
+            MCP_DID,
             name or key,
             args,
             user_intent,

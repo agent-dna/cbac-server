@@ -73,15 +73,13 @@ class GovernanceContext:
 
     ``agent_id`` (whose policy is checked) and ``user_intent`` are the two
     inputs the CBAC call needs beyond the intended action. ``intent_id`` — CBAC never parses or validates it, only threads it
-    through to the audit row and its hash. ``mcp_did`` names the MCP server the
-    call is bound for; CBAC does not parse it either, only records it on the
-    trust row.
+    through to the audit row and its hash.
+
     """
 
     agent_id: str
     user_intent: str = ""
     intent_id: str = ""
-    mcp_did: str = ""
 
 
 _governance_ctx: contextvars.ContextVar[GovernanceContext | None] = (
@@ -99,7 +97,6 @@ def cbac_context(
     agent_id: str,
     user_intent: str = "",
     intent_id: str = "",
-    mcp_did: str = "",
 ) -> Iterator[GovernanceContext]:
     """Open a governance scope. Set once at the request entry point.
 
@@ -109,10 +106,7 @@ def cbac_context(
     and every guarded call inside the scope carries it unchanged.
     """
     holder = GovernanceContext(
-        agent_id=agent_id,
-        user_intent=user_intent,
-        intent_id=intent_id,
-        mcp_did=mcp_did,
+        agent_id=agent_id, user_intent=user_intent, intent_id=intent_id
     )
     token = _governance_ctx.set(holder)
     try:
