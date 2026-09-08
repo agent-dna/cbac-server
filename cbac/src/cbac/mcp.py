@@ -40,6 +40,7 @@ __all__ = [
     "CBAC_AGENT_HEADER",
     "CBAC_INTENT_HEADER",
     "CBAC_INTENT_ID_HEADER",
+    "CBAC_MCP_DID_HEADER",
     "cbac_context",
     "cbac_headers",
     "cbac_propagate",
@@ -61,9 +62,14 @@ __all__ = [
 # upstream at the workflow's first envelope. CBAC never parses or validates it,
 # only threads it to the audit row and its hash -- so a client that forges one
 # corrupts its own trace and nothing else.
+# ``mcp_did`` names the MCP server the call is bound for. Client-supplied like
+# the rest, and descriptive only -- CBAC records it on the trust row and decides
+# nothing by it. A gateway that routes to a fixed upstream knows the real answer
+# from its own config and should prefer that over the header.
 CBAC_AGENT_HEADER = "X-CBAC-Agent-Id"
 CBAC_INTENT_HEADER = "X-CBAC-User-Intent"
 CBAC_INTENT_ID_HEADER = "X-CBAC-Intent-Id"
+CBAC_MCP_DID_HEADER = "X-CBAC-Mcp-Did"
 
 # Headers are latin-1 and size-capped by every HTTP stack in the path, while a
 # user intent is arbitrary UTF-8 of arbitrary length. Percent-encode, then cap
@@ -98,6 +104,8 @@ def cbac_headers() -> dict[str, str]:
     # not put an empty header on every call it makes.
     if ctx.intent_id:
         headers[CBAC_INTENT_ID_HEADER] = quote(ctx.intent_id, safe="")
+    if ctx.mcp_did:
+        headers[CBAC_MCP_DID_HEADER] = quote(ctx.mcp_did, safe="")
     return headers
 
 
@@ -136,6 +144,7 @@ def context_from_headers(headers: dict[str, str]) -> GovernanceContext | None:
         agent_id=unquote(agent_id or ""),
         user_intent=unquote(intent or ""),
         intent_id=unquote(lowered.get(CBAC_INTENT_ID_HEADER.lower()) or ""),
+        mcp_did=unquote(lowered.get(CBAC_MCP_DID_HEADER.lower()) or ""),
     )
 
 

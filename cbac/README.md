@@ -62,10 +62,12 @@ from cbac import authorize
 
 result = await authorize(
     agent_id,
+    mcp_did,
     callee_name,
     args,
     user_intent,
     description,
+    intent_id,
     callee_type="mcp",
     cbac_url=CBAC_URL,
     cbac_timeout=CBAC_TIMEOUT,
@@ -79,10 +81,12 @@ first line. Pass it: the service uses it as the verb phrase and falls back to
 the de-snaked `callee_name` without it, and an enforcement point that has the
 real description scores far better than one working from the name alone.
 
-`callee_type` (`"tool"`, `"agent"`, `"mcp"`) labels the other end of the edge
-whose trust score the service updates while deciding. `intent_id` is your own
-opaque correlation id, threaded unchanged to the audit row and its hash — CBAC
-never parses it.
+`callee_type` (`"mcp_tool"`, `"tool"`, `"agent"`) labels the other end of the
+edge whose trust score the service updates while deciding. `mcp_did` names the
+MCP server the call is bound for; it is recorded on the trust row and comes back
+from `POST /cbac/v1/lhi-scores`, but it is not part of the edge key and nothing
+scores it. `intent_id` is your own opaque correlation id, threaded unchanged to
+the audit row and its hash — CBAC never parses it.
 
 ## What goes on the wire
 
@@ -90,7 +94,8 @@ Mechanical facts, not a rendered sentence:
 
 ```json
 {
-  "agent_id": "...", "callee_name": "...", "callee_type": "tool",
+  "agent_id": "...", "mcp_did": "...",
+  "callee_name": "...", "callee_type": "mcp_tool",
   "callee_description": "...", "arguments": {"repo": "acme/api"},
   "user_intent": "...", "intent_id": null
 }
@@ -163,6 +168,7 @@ policy — deny it outright, or decide it on policy alone with no drift signal.
 | `X-CBAC-Agent-Id` | whose policy applies |
 | `X-CBAC-User-Intent` | what the user actually asked for |
 | `X-CBAC-Intent-Id` | the caller's correlation id, when there is one |
+| `X-CBAC-Mcp-Did` | the MCP server the call is bound for, when the client names one |
 
 All are percent-encoded (headers are latin-1 and size-capped; a user intent is
 arbitrary UTF-8), and the intent is capped at 4096 encoded characters without
@@ -170,8 +176,8 @@ ever cutting an escape in half — a truncated intent is still a usable drift
 signal, a rejected request is not. `cbac_headers()` produces them from the
 ambient context and returns `{}` when governance is off, for clients whose
 transport takes headers on the connection rather than per call. The intent id
-is sent only when the workflow minted one, so a deployment that uses no
-correlation ids puts no empty header on every call.
+and the MCP server id are sent only when there is one, so a deployment that
+uses neither puts no empty headers on every call.
 
 **Trust boundary.** Both values are client-supplied. `user_intent` is
 unverifiable by anyone — only the client knows what the user asked — so CBAC
@@ -181,7 +187,9 @@ about; a gateway that cannot trust its callers should derive it from its
 authenticated principal (OAuth subject, mTLS SAN, API key) and treat the header
 as a fallback for a trusted network only. `intent_id` is neither identity nor
 evidence — CBAC never parses it, only threads it to the audit row and its hash,
-so a client that forges one corrupts its own trace and nothing else.
+so a client that forges one corrupts its own trace and nothing else. `mcp_did`
+is descriptive in the same way, and a gateway that routes to a fixed upstream
+already knows the true answer from its own config — prefer that over the header.
 
 The context travels as headers because that is the only per-call channel MCP
 client adapters expose today. `_meta` is the protocol-native place for it;

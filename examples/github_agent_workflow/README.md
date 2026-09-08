@@ -335,6 +335,7 @@ Per tool call, agent → gateway (MCP `tools/call`, plus two headers):
 ```
 X-CBAC-Agent-Id:    github-worker
 X-CBAC-User-Intent: Close%20issue%20%233%20in%20owner/repo
+X-CBAC-Mcp-Did:     http%3A//127.0.0.1%3A8765/mcp/
 ```
 
 Gateway → decision service, one POST per call:
@@ -342,6 +343,7 @@ Gateway → decision service, one POST per call:
 ```json
 {
   "agent_id":           "github-worker",
+  "mcp_did":            "http://127.0.0.1:8765/mcp/",
   "callee_name":        "github_close_issue",
   "callee_type":        "mcp",
   "callee_description": "Close an existing GitHub issue.",

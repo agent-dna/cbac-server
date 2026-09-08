@@ -520,6 +520,7 @@ class CBAC:
         callee_name: str,
         callee_type: str,
         result: CBACResult,
+        mcp_did: str = "",
     ) -> CBACResult:
         """Fold a reached decision's component scores into the edge's trust and
         stamp the new value onto ``result``.
@@ -543,6 +544,7 @@ class CBAC:
                 intent_score=result.intent_score,
                 policy_score=result.policy_score,
                 hallucination_score=result.hallucination_score,
+                mcp_did=mcp_did,
             )
         except Exception:
             # The audit write runs next on this same session. A failed insert
@@ -641,8 +643,9 @@ class CBAC:
         intended_action: Any,
         user_intent: str | None = None,
         callee_name: str = "",
-        callee_type: str = "tool",
+        callee_type: str = "mcp_tool",
         intent_id: str | None = None,
+        mcp_did: str = "",
     ) -> CBACResult:
         """Decide, then write the verdict to the audit log.
 
@@ -655,9 +658,20 @@ class CBAC:
         upstream, at the workflow's first envelope, not by CBAC) — it plays no
         part in the decision itself, so it bypasses ``_decide`` entirely and
         goes straight into the audit write, which is also where it is hashed.
+
+        ``mcp_did`` plays no part in the decision either, but unlike
+        ``intent_id`` it lands on the *trust* record rather than the audit row,
+        and that write happens inside ``_decide`` — so it does have to travel
+        through the pipeline.
         """
         result = await self._decide(
-            session, agent_id, intended_action, user_intent, callee_name, callee_type
+            session,
+            agent_id,
+            intended_action,
+            user_intent,
+            callee_name,
+            callee_type,
+            mcp_did,
         )
         result.interaction_hash = await self._record_decision(
             session,
@@ -678,7 +692,8 @@ class CBAC:
         intended_action: Any,
         user_intent: str | None = None,
         callee_name: str = "",
-        callee_type: str = "tool",
+        callee_type: str = "mcp_tool",
+        mcp_did: str = "",
     ) -> CBACResult:
         """Semantic intent verification against the agent's on-chain policy.
 
@@ -717,8 +732,12 @@ class CBAC:
             The root user request. Enables Check-1 drift + hallucination score.
         callee_name / callee_type:
             The other end of the edge whose trust this decision updates
-            (``"tool"`` / ``"agent"`` / ``"mcp"``). No ``callee_name`` means no
-            trust update.
+            (``"mcp_tool"`` / ``"tool"`` / ``"agent"``). No ``callee_name``
+            means no trust update.
+        mcp_did:
+            The MCP server the call is bound for. Not part of the edge key and
+            not scored — recorded on the trust row so the history says which
+            server the edge was exercised through.
 
         Returns
         -------
@@ -750,6 +769,7 @@ class CBAC:
                         intent_score=intent_score,
                         error_code=error_code,
                     ),
+                    mcp_did,
                 )
 
         all_chunks = await get_policy_chunks(session, agent_id)
@@ -820,6 +840,7 @@ class CBAC:
                 policy_score=policy_score,
                 error_code=error_code,
             ),
+            mcp_did,
         )
 
     async def compute_lhi(
@@ -831,6 +852,7 @@ class CBAC:
         intent_score: float | None,
         policy_score: float | None,
         hallucination_score: float | None,
+        mcp_did: str = "",
     ) -> float | None:
         """Update and return the LHI (Local Heuristic Intelligence) trust
         score for one (agent → callee) edge.
@@ -865,7 +887,10 @@ class CBAC:
         the current trust is simply the edge's latest row (see
         ``repository.get_latest_trust`` / ``get_trust_history``). Unobserved
         components are stored as NULL, never as a substituted value, so the
-        row stays honest about what was measured.
+        row stays honest about what was measured. ``mcp_did`` rides along on
+        the row as descriptive metadata — it names the MCP server the call went
+        to, is not part of the edge key, and enters none of the arithmetic
+        above.
         """
         scores = {
             "intent": intent_score,
@@ -904,6 +929,9 @@ class CBAC:
             policy_score=policy_score,
             hallucination_score=hallucination_score,
             trust=trust,
+            # NULL rather than "" for a caller that named no MCP server, the
+            # same convention the audit row uses for its optional fields.
+            mcp_did=mcp_did or None,
         )
 
         # ponytail: on-chain mirror of the record is parked — the DB is the

@@ -208,6 +208,8 @@ def test_reached_decision_folds_trust(rows, decisions, tmp_path, monkeypatch):
     assert 0.0 <= result.trust <= 1.0
     assert len(rows) == 1
     assert (rows[0].callee_name, rows[0].callee_type) == ("github_tool", "tool")
+    # No mcp_did supplied: NULL on the row, not "".
+    assert rows[0].mcp_did is None
     # Tier 3 produces no numeric policy signal — stored NULL, renormalized away.
     assert rows[0].policy_score is None
     assert rows[0].trust == pytest.approx(result.trust)
@@ -440,3 +442,20 @@ def test_record_failure_does_not_change_decision(
     assert result.decision == "deny"
     assert result.trust is not None  # trust fold still happened
     assert decisions == []
+
+
+def test_mcp_did_lands_on_the_trust_record(rows, decisions, tmp_path, monkeypatch):
+    """It rides the pipeline only to be recorded — it names the MCP server the
+    call went to, is not part of the edge key, and gates nothing."""
+    cbac = make_verify_cbac(tmp_path, monkeypatch)
+    asyncio.run(
+        cbac.verify_cbac(
+            session=None,
+            agent_id=AGENT_ID,
+            intended_action="read pull requests",
+            user_intent="Please show me the pull requests",
+            mcp_did="did:mcp:github",
+            **CALLEE,
+        )
+    )
+    assert rows[0].mcp_did == "did:mcp:github"

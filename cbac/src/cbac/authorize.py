@@ -73,12 +73,15 @@ class GovernanceContext:
 
     ``agent_id`` (whose policy is checked) and ``user_intent`` are the two
     inputs the CBAC call needs beyond the intended action. ``intent_id`` — CBAC never parses or validates it, only threads it
-    through to the audit row and its hash.
+    through to the audit row and its hash. ``mcp_did`` names the MCP server the
+    call is bound for; CBAC does not parse it either, only records it on the
+    trust row.
     """
 
     agent_id: str
     user_intent: str = ""
     intent_id: str = ""
+    mcp_did: str = ""
 
 
 _governance_ctx: contextvars.ContextVar[GovernanceContext | None] = (
@@ -96,6 +99,7 @@ def cbac_context(
     agent_id: str,
     user_intent: str = "",
     intent_id: str = "",
+    mcp_did: str = "",
 ) -> Iterator[GovernanceContext]:
     """Open a governance scope. Set once at the request entry point.
 
@@ -105,7 +109,10 @@ def cbac_context(
     and every guarded call inside the scope carries it unchanged.
     """
     holder = GovernanceContext(
-        agent_id=agent_id, user_intent=user_intent, intent_id=intent_id
+        agent_id=agent_id,
+        user_intent=user_intent,
+        intent_id=intent_id,
+        mcp_did=mcp_did,
     )
     token = _governance_ctx.set(holder)
     try:
@@ -133,6 +140,7 @@ def _stringify(args: dict[str, Any]) -> dict[str, str]:
 
 def _payload(
     agent_id: str,
+    mcp_did: str,
     callee_name: str,
     args: dict[str, Any],
     user_intent: str | None,
@@ -143,11 +151,13 @@ def _payload(
     """The ``/cbac/v1/authorize`` request body. One definition, every entry point.
 
     Facts only — the service turns them into the text it scores. ``intent_id``
-    is opaque to the service too — it is never worded into anything, only
-    stored and hashed.
+    and ``mcp_did`` are opaque to the service too — neither is worded into
+    anything: ``intent_id`` is stored and hashed on the audit row, ``mcp_did``
+    is stored on the trust record.
     """
     return {
         "agent_id": agent_id,
+        "mcp_did": mcp_did,
         "callee_name": callee_name,
         "callee_type": callee_type,
         "callee_description": description,
@@ -294,12 +304,13 @@ async def _authorize(
 
 async def authorize(
     agent_id: str,
+    mcp_did: str,
     callee_name: str,
     args: dict[str, Any],
     user_intent: str | None = None,
     description: str | None = None,
-    callee_type: str = "tool",
     intent_id: str | None = None,
+    callee_type: str = "mcp_tool",
     cbac_url: str = "https://cbac-service.agentdna.io",
     cbac_timeout: float = 300,
 ) -> tuple[str, int, str]:
@@ -337,10 +348,12 @@ async def authorize(
     and falls back to the de-snaked ``callee_name`` without it. Passing it is
     worth the lookup — an enforcement point that has the callee's real
     description scores far better than one working from the name alone.
-    ``callee_type`` labels the other end of the edge (``"tool"``, ``"agent"``,
-    ``"mcp"``) whose trust score the service updates while deciding.
-    ``intent_id`` is the caller's own opaque correlation id, threaded through
-    unchanged to the audit row and its hash.
+    ``callee_type`` labels the other end of the edge (``"mcp_tool"``,
+    ``"tool"``, ``"agent"``) whose trust score the service updates while
+    deciding. ``intent_id`` is the caller's own opaque correlation id, threaded
+    through unchanged to the audit row and its hash. ``mcp_did`` identifies the
+    MCP server the call is going to; the service stores it on the trust record
+    and never words it into anything it scores.
 
     ``cbac_url`` defaults to the hosted reference service; pass a different
     one for a self-hosted deployment. ``cbac_timeout`` defaults to 300s — a
@@ -354,6 +367,7 @@ async def authorize(
     result = await _authorize(
         _payload(
             agent_id,
+            mcp_did,
             callee_name,
             args,
             user_intent,
