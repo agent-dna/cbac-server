@@ -342,6 +342,7 @@ Gateway → decision service, one POST per call:
 ```json
 {
   "agent_id":           "github-worker",
+  "mcp_did":            "http://127.0.0.1:8765/mcp/",
   "callee_name":        "github_close_issue",
   "callee_type":        "mcp",
   "callee_description": "Close an existing GitHub issue.",

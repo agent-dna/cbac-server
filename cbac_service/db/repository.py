@@ -219,16 +219,20 @@ async def insert_lhi_record(
     policy_score: float | None,
     hallucination_score: float | None,
     trust: float,
+    mcp_did: str | None = None,
 ) -> LHIRecord:
     """Append one interaction's scores + resulting trust. Commits.
 
     An unmeasured component is stored as NULL — `trust` already renormalizes
-    over the observed ones, so nothing here substitutes a value.
+    over the observed ones, so nothing here substitutes a value. ``mcp_did``
+    is stored verbatim; it names the MCP server the call went to and plays no
+    part in the edge key or the arithmetic.
     """
     record = LHIRecord(
         agent_id=agent_id,
         callee_name=callee_name,
         callee_type=callee_type,
+        mcp_did=mcp_did,
         intent_score=intent_score,
         policy_score=policy_score,
         hallucination_score=hallucination_score,

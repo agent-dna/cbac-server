@@ -86,7 +86,12 @@ class LHIRecord(Base):
     callee_name: Mapped[str] = mapped_column(String, nullable=False)
     callee_type: Mapped[str] = mapped_column(
         String, nullable=False
-    )  # 'tool' | 'agent' | 'mcp'
+    )  # 'mcp_tool' | 'tool' | 'agent'
+    # Which MCP server the call was bound for. Recorded, not part of the edge
+    # key: the edge stays (agent_id, callee_name, callee_type), so a callee that
+    # moves servers keeps its accumulated trust and the row still says where it
+    # was earned. NULL when the caller named no server.
+    mcp_did: Mapped[str | None] = mapped_column(String, nullable=True)
     # Nullable on purpose: a component the pipeline could not measure is stored
     # as NULL, never as a substituted value, so the record stays honest about
     # what was observed. `trust` renormalizes over whichever ones are present.

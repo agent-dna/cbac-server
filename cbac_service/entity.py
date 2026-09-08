@@ -26,8 +26,14 @@ class AuthorizeRequest(BaseModel):
     """
 
     agent_id: str
+    # The MCP server the call is bound for. Opaque to the decision — never
+    # worded into the scored text — and stored on the trust record so
+    # /lhi-scores can say which server an edge's trust was earned against.
+    # Defaults to "" for a caller with no MCP server behind it (an in-process
+    # tool guard, a bare curl probe); stored NULL rather than "".
+    mcp_did: str = ""
     callee_name: str = ""
-    callee_type: str = "tool"
+    callee_type: str = "mcp_tool"
     callee_description: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
     user_intent: str | None = None

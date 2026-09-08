@@ -30,7 +30,7 @@ Run:
     python gateway.py
 
 Env: MCP_UPSTREAM_URL, MCP_THIRDPARTY_URL, CBAC_GATEWAY_HOST/PORT, CBAC_URL,
-CBAC_AGENT_ID.
+CBAC_AGENT_ID, CBAC_MCP_DID.
 """
 
 from __future__ import annotations
@@ -71,6 +71,10 @@ CBAC_TIMEOUT = float(os.environ.get("CBAC_TIMEOUT", "600"))
 # the authenticated principal (OAuth subject, mTLS SAN, API key) to an agent id
 # instead, in the two lines where the hooks read the header.
 AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
+# Which MCP server the forwarded call lands on. The gateway routes the call, so
+# it is the only party that knows this for a fact — config here, never a header
+# the agent could misreport. Recorded on the trust record, never scored.
+MCP_DID = os.environ.get("CBAC_MCP_DID", UPSTREAM_URL)
 
 # The service's pipeline codes (``cbac_service.error_codes``) that this gateway
 # treats as permission. Everything else blocks: a deny code, a code minted after
@@ -110,6 +114,7 @@ class CBACMiddleware(Middleware):
 
         result = await authorize(
             agent_id,
+            MCP_DID,
             tool_name,
             tool_args,
             user_intent,
@@ -157,6 +162,7 @@ class CBACMiddleware(Middleware):
 
         result = await authorize(
             agent_id,
+            MCP_DID,
             name or key,
             args,
             user_intent,

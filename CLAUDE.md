@@ -58,8 +58,9 @@ app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
   - **`GET /cbac/v1/decisions/by-hash/{interaction_hash}`** — one decision by
     its interaction hash.
   - **`POST /cbac/v1/lhi-scores`** — current trust for a batch of agents
-    (`{"agent_ids": [...]}`), one entry per caller→callee edge. A POST for a
-    read because the id batch is the body.
+    (`{"agent_ids": [...]}`), one entry per caller→callee edge, each carrying
+    the `mcp_did` its latest record was written with. A POST for a read because
+    the id batch is the body.
   - **`GET /health`** — DB connectivity check. Unversioned on purpose: probes
     are wired once at deploy time and must not track API versions.
 - Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`).
@@ -107,7 +108,10 @@ The service uses **PostgreSQL 18** with two extensions:
 - `created_at`
 
 **`lhi_records`** — one row per decision, the **trust history** (see the LHI
-section below).
+section below). Also carries `mcp_did` — which MCP server the call was bound
+for, supplied on `/authorize` and returned by `/lhi-scores`. Descriptive only:
+it is not part of the edge key and enters none of the trust arithmetic, so a
+callee that moves servers keeps its accumulated trust.
 
 ⚠️ **These two are not interchangeable, and the difference is easy to get
 wrong.** `cbac_decisions` is *complete*: every verdict `verify_cbac` reaches is
@@ -248,8 +252,9 @@ error, or an inconclusive/misbehaving Tier 3, → `deny`).
   adding or removing a component needs no retuning.
 
   Trust is tracked **per caller→callee edge** — the edge key is (`agent_id`,
-  `callee_name`, `callee_type`) — and stored in the **`lhi_records` table, one
-  row per decision**. The table *is* the trust history: rows are append-only, an
+  `callee_name`, `callee_type`); `mcp_did` rides along on the row but is *not*
+  part of the key — and stored in the **`lhi_records` table, one row per
+  decision**. The table *is* the trust history: rows are append-only, an
   edge's current trust is its latest row (`repository.get_latest_trust`), and
   `get_trust_history` reads the series. `compute_lhi` is **async and takes an
   `AsyncSession`** like the rest of the pipeline.

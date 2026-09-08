@@ -194,6 +194,7 @@ async def authorize_cbac(body: AuthorizeRequest) -> JSONResponse:
                 callee_name=body.callee_name,
                 callee_type=body.callee_type,
                 intent_id=body.intent_id,
+                mcp_did=body.mcp_did,
             )
         decision, reason, status_code = (
             result.decision,
@@ -359,6 +360,7 @@ def _lhi_record_json(record: LHIRecord) -> dict:
     return {
         "callee_name": record.callee_name,
         "callee_type": record.callee_type,
+        "mcp_did": record.mcp_did,
         "intent_score": record.intent_score,
         "policy_score": record.policy_score,
         "hallucination_score": record.hallucination_score,
