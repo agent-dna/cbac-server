@@ -21,7 +21,7 @@ import pytest
 import cbac_service.error_codes as ec
 from cbac_service.config import CONTRADICTION_THRESHOLD
 from cbac_service.tests.eval.corpus import DENY, GRAY
-from cbac_service.tests.eval.harness import best_threshold
+from cbac_service.tests.eval.harness import Binary, best_threshold
 from cbac_service.tests.eval.runner import ARMS
 
 
@@ -81,34 +81,38 @@ def _decidable(cases):
 
 
 def test_confusion_matrix(run, report):
+    """The 2x2, and the three numbers that summarise it.
+
+    "Positive" is *blocked*. Recall is the share of actions that had to be
+    stopped and were; precision is the share of what was stopped that deserved
+    it. Recall alone is free — a layer reaches 1.0 by denying everything, and
+    precision is what that costs. F1 is the pair in one number.
+    """
     lines, metrics = [], {}
     for arm in ARMS:
-        rows = _decidable(run.cases)
-        tp = sum(c.should_block and c.arms[arm].final_decision == DENY for c in rows)
-        fn = sum(c.should_block and c.arms[arm].final_decision != DENY for c in rows)
-        fp = sum(
-            not c.should_block and c.arms[arm].final_decision == DENY for c in rows
-        )
-        tn = sum(
-            not c.should_block and c.arms[arm].final_decision != DENY for c in rows
-        )
+        b = Binary()
+        for c in _decidable(run.cases):
+            b.add(predicted=c.arms[arm].final_decision == DENY, actual=c.should_block)
         lines += [
             f"  {arm}",
             f"    {'':<18}{'CBAC blocked':>14}{'CBAC allowed':>14}",
-            f"    {'must block':<18}{tp:>14}{fn:>14}",
-            f"    {'must pass':<18}{fp:>14}{tn:>14}",
+            f"    {'must block':<18}{b.tp:>14}{b.fn:>14}",
+            f"    {'must pass':<18}{b.fp:>14}{b.tn:>14}",
+            (f"    precision {b.precision:.2f}  recall {b.recall:.2f}  F1 {b.f1:.2f}"),
             (
-                f"    accuracy {(tp + tn) / len(rows):.2f}  "
-                f"recall {tp / (tp + fn):.2f}  false alarm {fp / (fp + tn):.2f}"
+                f"    accuracy {(b.tp + b.tn) / b.n:.2f}  "
+                f"false alarm {b.fp / (b.fp + b.tn):.2f}  n={b.n}"
             ),
             "",
         ]
         metrics |= {
-            f"final.{arm}.accuracy": (tp + tn) / len(rows),
-            f"final.{arm}.recall": tp / (tp + fn),
-            f"final.{arm}.false_alarm_rate": fp / (fp + tn),
-            f"final.{arm}.wrong_allows": fn,
-            f"final.{arm}.wrong_denies": fp,
+            f"final.{arm}.accuracy": (b.tp + b.tn) / b.n,
+            f"final.{arm}.precision": b.precision,
+            f"final.{arm}.recall": b.recall,
+            f"final.{arm}.f1": b.f1,
+            f"final.{arm}.false_alarm_rate": b.fp / (b.fp + b.tn),
+            f"final.{arm}.wrong_allows": b.fn,
+            f"final.{arm}.wrong_denies": b.fp,
         }
     report.add("STAGE 5a — final decision", lines, metrics)
 

@@ -94,15 +94,29 @@ input[type=search] { font: 13px var(--sans); padding: 7px 10px; border-radius: 7
   border: 1px solid var(--line); background: var(--panel); color: var(--ink);
   min-width: 220px; }
 .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+/* Every matrix is laid out identically so the five panels read as one grid:
+   fixed columns, so a longer row label cannot shift the numbers, and a caption
+   reserving two lines, so a title that wraps does not push its table out of
+   line with its neighbours'. */
+.cm { table-layout: fixed; }
 .cm caption { text-align: left; font: 600 12px/1.4 var(--sans); color: var(--ink-2);
-  padding: 0 0 8px; }
+  padding: 0 0 8px; min-height: 2.8em; }
+/* Absolute, not em: `em` resolves against each cell's own font-size, and the
+   header row is smaller than the body, so the two would disagree about how wide
+   a column is. The header also drops the uppercase treatment the wider tables
+   use — "forbidden" plus padding does not fit a column this narrow in caps. */
+.cm th:not(:first-child), .cm td:not(:first-child) { width: 80px; }
+.cm th, .cm td { padding: 7px 8px; }
+.cm thead th { text-transform: none; letter-spacing: 0; font-size: 11.5px; }
+.cm th:first-child, .cm td:first-child { overflow-wrap: anywhere; padding-left: 0; }
 .cm td.v { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-.cm.prf { margin-top: 8px; border-top: 1px solid var(--line); }
-.cm.prf td { padding: 7px 0; border: 0; text-align: left; color: var(--ink-3);
-  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
-.cm.prf td.v { text-align: left; padding-right: 14px; color: var(--ink);
-  font-size: 13px; text-transform: none; letter-spacing: 0; }
-.panel .sub { margin-top: 2px; }
+.prf { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line);
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.prf b { display: block; color: var(--ink-3); font: 600 10px/1.6 var(--sans);
+  text-transform: uppercase; letter-spacing: 0.05em; }
+.prf span { font-family: var(--mono); font-variant-numeric: tabular-nums;
+  font-size: 13px; }
+.panel .sub { margin-top: 8px; }
 .cm .bad { color: var(--leak); font-weight: 600; }
 .cm .meh { color: var(--over); font-weight: 600; }
 .bar { height: 6px; border-radius: 3px; background: var(--ok-bar); display: block; }
@@ -344,7 +358,11 @@ function renderBoard() {
 
 // ── confusion matrices ───────────────────────────────────────────────────────
 
-function matrix(title, rows, getDecision, getGold, note) {
+const VERDICT_LABELS = { pos: "blocked", neg: "allowed",
+                         rowPos: "must block", rowNeg: "must pass" };
+
+function matrix(title, rows, getDecision, getGold, note, labels) {
+  const L = labels || VERDICT_LABELS;
   let tp = 0, fn = 0, fp = 0, tn = 0;
   for (const c of rows) {
     const gold = getGold(c);
@@ -365,18 +383,64 @@ function matrix(title, rows, getDecision, getGold, note) {
   const f1 = (precision + recall) ? (2 * precision * recall) / (precision + recall) : NaN;
   return `<div class="panel pad"><table class="cm">
     <caption>${title}</caption>
-    <thead><tr><th></th><th>blocked</th><th>allowed</th></tr></thead>
+    <thead><tr><th></th><th>${L.pos}</th><th>${L.neg}</th></tr></thead>
     <tbody>
-      <tr><td>must block</td><td class="v">${tp}</td><td class="v bad">${fn}</td></tr>
-      <tr><td>must pass</td><td class="v meh">${fp}</td><td class="v">${tn}</td></tr>
+      <tr><td>${L.rowPos}</td><td class="v">${tp}</td><td class="v bad">${fn}</td></tr>
+      <tr><td>${L.rowNeg}</td><td class="v meh">${fp}</td><td class="v">${tn}</td></tr>
     </tbody></table>
-    <table class="cm prf"><tbody>
-      <tr><td>precision</td><td class="v">${pct(precision)}</td>
-          <td>recall</td><td class="v">${pct(recall)}</td>
-          <td>F1</td><td class="v">${pct(f1)}</td></tr>
-    </tbody></table>
+    <div class="prf">
+      <div><b>precision</b><span>${pct(precision)}</span></div>
+      <div><b>recall</b><span>${pct(recall)}</span></div>
+      <div><b>F1</b><span>${pct(f1)}</span></div>
+    </div>
     <div class="sub">accuracy ${pct(acc)} · n=${n}${note ? " · " + note : ""}</div>
     </div>`;
+}
+
+// Stage 1, as a matrix: did `_classify_chunks` put each of the policy's
+// capabilities in the right bucket? "Positive" is *forbidden*, so it reads the
+// same way as the four verdict matrices — precision is what share of what it
+// called a prohibition really was one.
+//
+// Scored per capability, not per chunk. Shapes collapse differently — a
+// legal-prose paragraph holds five rules in one chunk while a bulleted list
+// holds one each — so a chunk-level rate rewards a shape for producing fewer,
+// bigger chunks. Every rendering has the same capabilities to get right, which
+// is what makes the two halves of a pair comparable. These are the same counts
+// as STAGE 1a in the text report.
+//
+// A capability the chunker severed, or buried in a chunk carrying both
+// polarities, is counted as *not* filed forbidden: it is unreachable end to
+// end, however good the classifier is. The sub-line says how many.
+const BUCKET = {
+  ok: c => c.gold,
+  misfiled: c => (c.gold === "forbidden" ? "allowed" : "forbidden"),
+};
+
+function classificationMatrix() {
+  const arm = state.arm;
+  if (arm === "oracle") {
+    return `<div class="panel pad"><table class="cm"><caption>Policy index —
+      how each capability was filed</caption></table>
+      <div class="sub">The oracle index <em>is</em> the gold labelling, taken
+      from the spec rather than produced by <code>_classify_chunks</code>.
+      There is nothing to score against it. Pick <b>structured</b> or
+      <b>unstructured</b> to see what the classifier did.</div></div>`;
+  }
+  const caps = DATA.caps.filter(c => c.arm === arm);
+  const unreachable = caps.filter(c => !BUCKET[c.status]).length;
+  const inert = DATA.chunks.filter(c => c.arm === arm && c.gold === "neutral");
+  const leaked = inert.filter(c => c.bucket === "forbidden").length;
+  return matrix(
+    "Policy index — how each capability was filed",
+    caps,
+    c => ((BUCKET[c.status] || (() => "allowed"))(c) === "forbidden" ? "deny" : "allow"),
+    c => (c.gold === "forbidden" ? "deny" : "allow"),
+    `${unreachable} unreachable before any classifier ran · ${inert.length} ` +
+    `inert spans (${inert.length - leaked} filed as a grant) · does not move ` +
+    `with the action text`,
+    { pos: "forbidden", neg: "allowed",
+      rowPos: "prohibition", rowNeg: "grant" });
 }
 
 function renderMatrices() {
@@ -391,6 +455,7 @@ function renderMatrices() {
            c => c.policy_gold, "gold: does the policy permit it"),
     matrix("HHEM (gates nothing)", rows, c => c.hhem <= hhemGate() ? "deny" : "allow",
            c => c.aligned ? "allow" : "deny", "cutoff " + hhemGate().toFixed(3) + ", fitted here"),
+    classificationMatrix(),
   ].join("");
 }
 

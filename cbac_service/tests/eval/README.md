@@ -184,8 +184,10 @@ for k in sorted(a.keys() | b.keys()):
 
 `eval.html` is one self-contained file, no network and no build step. A metric
 board compares the three indices; a segmented control picks which one drives
-everything below; then four confusion matrices (final, and one per layer scored
-against *its own* ground truth), the layer-coverage matrix, and the policy list.
+everything below; then five confusion matrices — the final verdict, one per
+layer scored against *its own* ground truth, and one for the policy index
+itself — each with precision, recall and F1. Then the layer-coverage matrix and
+the policy list.
 Expanding a policy shows how every chunk of both renderings was filed, then its
 intents, then each action as a row with all four layers' verdicts and scores
 side by side. Rebuild the page from a stored run without paying for the models:
@@ -213,7 +215,16 @@ Top to bottom, each block answers one question.
 3. **Where the verdicts land.** Each layer's 2×2 against *its own* gold, so a
    layer is never blamed for a region it cannot see. The drift layer's
    `must pass / blocked` cell is its false-alarm cost; the policy layer's
-   `must block / allowed` cell is what leaks.
+   `must block / allowed` cell is what leaks. "Positive" is *blocked*
+   throughout, so precision reads the same way in every panel: what share of
+   what this layer stopped deserved stopping. Recall alone is free — a layer
+   reaches 1.0 by denying everything.
+
+   The fifth panel is upstream of the other four: it scores the policy *index*
+   rather than a verdict, per capability, and answers whether the tiers were
+   searching a correct index in the first place. It is the only one that does
+   not move with the action-text control, and it has nothing to show on the
+   oracle arm, which is the gold labelling by construction.
 4. **Which layer catches what.** Non-overlapping columns are healthy. Read every
    cell against the false-alarm row beneath it.
 5. **Policies.** Click one to open its chunk table and then its intents.
@@ -329,6 +340,28 @@ line starting with `#`, so a markdown heading carrying the polarity is deleted
 before the classifier sees the bullets under it; and `flatten_policy_chunks`
 builds a card's chunks from `raw_frontmatter`, which is the only reason the word
 *forbidden* is in the chunk text at all.
+
+### The final verdict
+
+"Positive" is *blocked*, so recall is the share of actions that had to be
+stopped and were, and precision the share of what was stopped that deserved it.
+Recall alone is free — a layer reaches 1.0 by denying everything — so the two
+only mean something together.
+
+| policy index | precision | recall | F1 | accuracy |
+|---|---|---|---|---|
+| structured | 0.87 | 0.69 | 0.77 | 0.75 |
+| unstructured | 0.83 | **0.19** | **0.32** | 0.49 |
+| oracle | 0.88 | 0.85 | **0.87** | 0.84 |
+
+Precision barely moves across the three indices while recall collapses. The
+unstructured arm is not imprecise about what it blocks — it is right 83% of the
+time — it simply almost never blocks. That is the shape of a pipeline whose
+forbidden bucket is empty, and an accuracy or precision number read on its own
+hides it.
+
+The same three numbers sit under every matrix in the dashboard, recomputed for
+whichever index and action text is selected.
 
 ### Most denials are the pipeline declining to decide
 
