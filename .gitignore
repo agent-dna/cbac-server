@@ -219,3 +219,8 @@ __marimo__/
 
 # Working notes, not part of the deliverable
 TODO.md
+
+# Evaluation build artifacts
+eval.html
+eval.json
+eval.txt

@@ -29,15 +29,17 @@ def main() -> None:
     args = ap.parse_args()
 
     data = json.loads(args.json.read_text())
-    missing = [k for k in ("cases", "policies", "metrics") if k not in data]
+    missing = [k for k in ("cases", "specs", "caps", "chunks") if k not in data]
     if missing:
         raise SystemExit(
             f"{args.json} has no {', '.join(missing)} — it predates the per-case "
             f"export. Re-run the eval with --eval-json."
         )
     args.out.write_text(build(data))
-    total = sum(len(v) for v in data["cases"].values())
-    print(f"wrote {args.out} — {total} cases, {len(data['policies'])} policies")
+    print(
+        f"wrote {args.out} — {len(data['cases'])} actions, "
+        f"{len(data['specs'])} policies"
+    )
 
 
 if __name__ == "__main__":

@@ -43,8 +43,7 @@ dev = [
     "mcp>=2.0.0",
     "ruff==0.16.3",
     "pyright==1.1.411",
-    # Read by scripts/cbac_benchmark/run_benchmark.py and by the eval suite,
-    # which share scripts/cbac_benchmark/intents.yaml as one corpus.
+    # The eval suite's policy corpus is YAML (cbac_service/tests/eval/corpus/).
     "pyyaml>=6.0",
 ]
 
@@ -79,16 +78,6 @@ exclude = ["**/node_modules", "**/__pycache__", "**/.*", "examples"]
 root = "cbac_service/tests"
 # `root` also re-roots import resolution, so `from cbac_service.cbac import ...`
 # stops resolving without the repo root added back (mirrors pytest's pythonpath).
-extraPaths = ["."]
-reportArgumentType = "none"
-reportAttributeAccessIssue = "none"
-
-# The benchmark harness drives the pipeline with the same doubles the tests use:
-# a SimpleNamespace Provenance, a monkeypatched encoder, a None session. Only
-# scripts/cbac_benchmark/ is exempt — the rest of scripts/ still type-checks, which
-# is what catches a stale caller when a pipeline signature changes.
-[[tool.pyright.executionEnvironments]]
-root = "scripts/cbac_benchmark"
 extraPaths = ["."]
 reportArgumentType = "none"
 reportAttributeAccessIssue = "none"

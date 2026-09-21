@@ -161,7 +161,7 @@ See `.env.sample` for the full list. Key ones:
 - `DATABASE_URL` — async Postgres connection string
 - `AGENTDNA_API_KEY` — Provenance Layer access
 - `CBAC_SERVICE_HOST` / `CBAC_SERVICE_PORT` — binding
-- `HYBRID_SEARCH_ENABLED` — toggle BM25 fusion (default: true)
+- `HYBRID_SEARCH_ENABLED` — toggle BM25 fusion (default: false)
 
 ## The decision pipeline (`cbac.py`)
 
@@ -263,3 +263,41 @@ error, or an inconclusive/misbehaving Tier 3, → `deny`).
   functions faked in-memory via the shared `rows` fixture in
   `tests/conftest.py`, no DB needed); the fold into `verify_cbac` by
   `cbac_service/tests/test_cbac_verify.py` — keep both green when touching it.
+
+## Evaluating the pipeline
+
+`cbac_service/tests/eval/` measures each stage of the decision pipeline against
+a corpus written from the **policy author's** point of view, not from what
+`cbac.py` computes. A failing assertion there is a finding about the pipeline,
+not a broken test, so its exit code is not a gate and it is opt-in behind
+`--run-eval` (it loads all three models).
+
+Thirty-two policies, each rendered as **two documents carrying the identical
+capability sentences** — a skill card and one of sixteen unstructured shapes,
+two policies per shape. That pairing is the point: it makes a
+structured-vs-unstructured difference attributable to document shape rather than
+to content. Agent actions are stored as the mechanical facts a guard posts
+(`callee`, `args`, `description`) and rendered through the production
+`render_intent`, so the eval scores the same text the service does — including
+the fact that a supplied description replaces the callee name entirely.
+
+A second, independent axis runs alongside the document shape: every action is
+scored both as sent (`description`) and with its description stripped
+(`no_description`), because `render_intent` phrases a call as
+`description or callee_name` and that description arrives from the thing being
+gated. Both are scored under all three policy indices, so a difference is
+attributable to the text and not to the index.
+
+Forty-three of the 422 actions are attacks tagged with the technique they use
+(homoglyph, bundling, indirect injection, …) and scored apart, because averaging
+attacks into a block rate makes that number a statement about the mixing ratio.
+
+Every stage runs on every action, **including the ones `_decide` skips** — it
+returns as soon as Check 1 denies, so only a separate `_tiered_decision` call
+can say whether the policy layer would also have caught an action. The final
+verdict still comes from `_decide` itself; re-composing the layers in the
+harness would measure a copy.
+
+`--eval-html` writes a self-contained dashboard, `--eval-json` the raw per-stage
+rows, `--eval-db` adds a real-Postgres arm. See the suite's own README for the
+current findings.

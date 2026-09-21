@@ -203,25 +203,34 @@ class Binary:
 
 
 # The numbers worth reading first, in the order a reader needs them: can the
-# classifier find the prohibitions, do the tiers act on them, and does the
-# fallback carry the result. `None` renders as "-" so a partial run (one test
-# selected with -k) still prints a well-formed block.
+# classifier find the prohibitions, is that a property of the document shape,
+# do the tiers act on what it found, and do the user-alignment layers see what
+# the policy cannot. `None` renders as "-" so a partial run (one test selected
+# with -k) still prints a well-formed block.
 #
 # (metric key, label, format). Everything else stays in `metrics` for the JSON.
 HEADLINE: tuple[tuple[str, str, str], ...] = (
-    ("classify.forbidden_recall.structured", "forbidden recall, structured", ".2f"),
-    ("classify.forbidden_recall.unstructured", "forbidden recall, unstructured", ".2f"),
-    ("classify.forbidden_recall.by_label", "  ...on `forbidden-actions:` lines", ".2f"),
-    ("classify.forbidden_recall.by_prose", "  ...on prose prohibitions", ".2f"),
-    ("classify.empty_forbidden_buckets", "policies with no forbidden bucket", "d"),
-    ("tier.classifier.block_rate", "block rate, classifier index", ".2f"),
-    ("tier.oracle.block_rate", "block rate, oracle index", ".2f"),
-    ("tier.classifier.allow_rate", "allow rate, classifier index", ".2f"),
-    ("tier.oracle.allow_rate", "allow rate, oracle index", ".2f"),
-    ("tier.oracle.fallback_share", "decisions from the no-LLM fallback", ".2f"),
-    ("adversarial.oracle.leaked", "attacks authorized (oracle)", "d"),
+    ("classify.structured.forbidden_recall", "forbidden recall, skill card", ".2f"),
+    ("classify.unstructured.forbidden_recall", "forbidden recall, other shape", ".2f"),
+    ("classify.paired.mean_delta", "  ...paired delta, same policies", "+.2f"),
+    ("classify.structured.recall_frontmatter_key", "  ...on frontmatter keys", ".2f"),
+    ("classify.unstructured.recall_prose", "  ...on marked prose", ".2f"),
+    ("classify.forbid_e.above_floor", "prohibitions clearing the 0.40 floor", ".2f"),
+    (
+        "classify.unstructured.empty_forbidden_buckets",
+        "policies with no forbidden bucket",
+        "d",
+    ),
+    ("policy.structured.block_rate", "block rate, skill-card index", ".2f"),
+    ("policy.oracle.block_rate", "block rate, oracle index", ".2f"),
+    ("policy.oracle.allow_rate", "allow rate, oracle index", ".2f"),
+    ("policy.oracle.block_rate.explicit", "  ...on stated prohibitions", ".2f"),
+    ("policy.oracle.block_rate.unlisted", "  ...on unlisted actions (free)", ".2f"),
+    ("policy.oracle.fallback_share", "decisions from the no-LLM fallback", ".2f"),
     ("drift.recall", "drift recall on misaligned actions", ".2f"),
-    ("hhem.auc", "HHEM AUC", ".2f"),
+    ("drift.auc.contradiction", "  ...AUC of the gated signal", ".2f"),
+    ("hhem.auc.aligned", "HHEM AUC on the same actions", ".2f"),
+    ("final.oracle.accuracy", "final accuracy, oracle index", ".2f"),
     ("layers.oracle.coverage_union", "blocked by drift∪policy∪HHEM", ".2f"),
 )
 

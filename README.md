@@ -13,7 +13,7 @@ the caller→callee trust score, so a guard makes exactly one call per action.
 |---|---|
 | `cbac_service/` | The decision service — FastAPI app, decision engine, DB layer. All ML dependencies live here. |
 | `cbac/` | The framework-agnostic guard + optional MCP glue. Imports none of the ML stack. |
-| `scripts/` | `test_lifecycle.py` integration script and `cbac_benchmark/`. |
+| `scripts/` | `test_lifecycle.py` integration script and `eval_dashboard.py`. |
 
 `pyproject.toml`, `uv.lock`, and `.venv` live at the **repo root**. Run everything
 from there — except Alembic and Docker Compose, which read config relative to
@@ -134,10 +134,19 @@ PYTHONPATH=. uv run python scripts/test_lifecycle.py
 | Format | `uv run ruff format cbac cbac_service` |
 | Lint | `uv run ruff check cbac cbac_service` |
 | Type check | `uv run pyright` |
+| Evaluate the pipeline | `uv run pytest cbac_service/tests/eval --run-eval -q --eval-html eval.html` |
 
-CI runs exactly those last four (see `.github/workflows/`). `ruff` and `pyright`
-are pinned to exact versions in `pyproject.toml` so CI and local checks never
-diverge — bump them there.
+CI runs `pytest`, `ruff format`, `ruff check` and `pyright` (see
+`.github/workflows/`). `ruff` and `pyright` are pinned to exact versions in
+`pyproject.toml` so CI and local checks never diverge — bump them there.
+
+The evaluation suite is separate from the unit tests and opt-in behind
+`--run-eval`, because it loads the encoder, NLI and HHEM models. It measures
+each stage of the decision pipeline against a corpus written from the policy
+author's point of view, so its failures are findings about the pipeline rather
+than broken tests — its exit code is not a gate. `--eval-html` writes a
+self-contained dashboard. See
+[`cbac_service/tests/eval/README.md`](cbac_service/tests/eval/README.md).
 
 ## Configuration
 
@@ -149,7 +158,7 @@ All settings are environment variables; defaults live in `cbac_service/config.py
 | `AGENTDNA_API_KEY` | `""` | Provenance Layer access |
 | `CBAC_SERVICE_HOST` | `127.0.0.1` | Bind address (`python -m` entrypoint only) |
 | `CBAC_SERVICE_PORT` | `8767` | Bind port (`python -m` entrypoint only) |
-| `HYBRID_SEARCH_ENABLED` | `true` | Toggle BM25 fusion alongside vector search |
+| `HYBRID_SEARCH_ENABLED` | `false` | Toggle BM25 fusion alongside vector search |
 | `VECTOR_INDEX_TYPE` | `hnsw` | `hnsw` (low latency) or `ivfflat` (large scale) |
 | `RRF_K` | `60` | Reciprocal Rank Fusion constant; higher = less aggressive re-ranking |
 
