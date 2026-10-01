@@ -39,6 +39,10 @@ services:
       # Named volume, namespaced by the project name above. Set PG_DATA_PATH to
       # bind-mount a host directory instead.
       - ${PG_DATA_PATH:-pgdata}:/var/lib/postgresql
+    # Comes back after a host reboot or a daemon restart, but stays down if it
+    # was stopped deliberately — `always` would undo a maintenance stop at the
+    # next boot.
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cbac_user} -d ${POSTGRES_DB:-cbac}"]
       interval: 5s
