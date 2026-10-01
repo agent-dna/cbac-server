@@ -27,9 +27,7 @@ services:
     # Fixed tag, deliberately not per-environment: every stack runs the identical
     # image, built once.
     image: cbac-postgres:pg18
-    # Spelled out rather than left to compose's `<project>-postgres-1`, so
-    # `docker exec`/`docker logs` take a predictable name.
-    container_name: cbac-${CBAC_ENV:-dev}-postgres
+    container_name: ${CBAC_ENV:-dev}-cbac-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-cbac_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cbac_pass}

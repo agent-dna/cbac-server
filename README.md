@@ -139,7 +139,7 @@ and data directory all arrive at run time — so `test-prod` reuses the `dev` bu
 | | `.env.dev` | `.env.test-prod` |
 |---|---|---|
 | compose project | `cbac-dev` | `cbac-test-prod` |
-| container | `cbac-dev-postgres` | `cbac-test-prod-postgres` |
+| container | `dev-cbac-postgres` | `test-prod-cbac-postgres` |
 | host port → 5432 | `5432` | `5433` |
 | data (`PG_DATA_PATH`) | `…/dev/pgdump/cbac_service` | `…/test_prod/pgdump/cbac_service` |
 | service port | `8000` | `8768` |
