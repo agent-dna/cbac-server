@@ -149,6 +149,9 @@ activemq-data/
 
 # Environments
 .env
+# Per-environment files (.env.dev, .env.test-prod) hold real credentials.
+.env.*
+!.env.sample
 .envrc
 .venv
 env/

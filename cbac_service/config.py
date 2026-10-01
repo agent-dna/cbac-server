@@ -2,7 +2,8 @@
 #
 # Every environment variable this service reads is read *here*, once, and each
 # constant is named after the variable it comes from — so `.env.sample` and this
-# file are the same list, and nothing has to be grepped for. The guard (`cbac/`)
+# file are the same list, bar the block `.env.sample` marks as docker-compose-only,
+# and nothing has to be grepped for. The guard (`cbac/`)
 # is the exception by construction: it is a separate distribution that cannot
 # import this module, so it reads its own three variables per call.
 

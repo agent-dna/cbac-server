@@ -1,35 +1,51 @@
-# Docker Compose for local development — Postgres 18 with pgvector + pg_textsearch.
+# Postgres 18 with pgvector + pg_textsearch — one stack per environment.
+#
+# The environment is a single variable, `CBAC_ENV`. It names the compose project,
+# so the container, the network and the data volume are all namespaced by it: two
+# environments on the same host never touch each other's data. The image is the
+# same for every environment — nothing environment-specific is baked into
+# `Dockerfile.postgres` — so the second stack is a cache hit, not a second build.
 #
 # Usage:
 #   cd cbac_service
-#   docker compose up -d
-#   alembic upgrade head
-#   uvicorn cbac_service.main:app
+#   docker compose --env-file .env.dev       up -d
+#   docker compose --env-file .env.test-prod up -d
 #
-# First run builds the custom Postgres image (~2-3 min). Subsequent runs are instant.
+# The same env file configures alembic and the service itself:
+#   uv run --env-file .env.dev alembic upgrade head
 #
-# Connect manually:
+# Connect manually (dev defaults):
 #   psql postgresql://cbac_user:cbac_pass@localhost:5432/cbac
+
+name: cbac-${CBAC_ENV:-dev}
 
 services:
   postgres:
     build:
       context: .
       dockerfile: Dockerfile.postgres
-    container_name: cbac-postgres
+    # Fixed tag, deliberately not per-environment: every stack runs the identical
+    # image, built once.
+    image: cbac-postgres:pg18
+    # Spelled out rather than left to compose's `<project>-postgres-1`, so
+    # `docker exec`/`docker logs` take a predictable name.
+    container_name: cbac-${CBAC_ENV:-dev}-postgres
     environment:
-      POSTGRES_USER: cbac_user
-      POSTGRES_PASSWORD: cbac_pass
-      POSTGRES_DB: cbac
+      POSTGRES_USER: ${POSTGRES_USER:-cbac_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cbac_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-cbac}
     ports:
-      - "5432:5432"
+      # The host port differs per environment; inside the container it is always 5432.
+      - "${PG_PORT:-5432}:5432"
     volumes:
-      - ${PG_DATA_PATH:-cbac_pgdata}:/var/lib/postgresql
+      # Named volume, namespaced by the project name above. Set PG_DATA_PATH to
+      # bind-mount a host directory instead.
+      - ${PG_DATA_PATH:-pgdata}:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cbac_user -d cbac"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cbac_user} -d ${POSTGRES_DB:-cbac}"]
       interval: 5s
       timeout: 3s
       retries: 5
 
 volumes:
-  cbac_pgdata:
+  pgdata:

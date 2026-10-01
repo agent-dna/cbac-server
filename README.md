@@ -43,9 +43,12 @@ instead of silently re-resolving — the same thing CI does.
 
 ```bash
 cd cbac_service
-docker compose build
-docker compose up -d
+docker compose --env-file .env.dev build
+docker compose --env-file .env.dev up -d
 ```
+
+The env file picks the environment — `.env.dev` here, `.env.test-prod` for the
+other stack. See [Environments](#environments).
 
 Compose **builds** rather than pulls: `Dockerfile.postgres` compiles
 `pg_textsearch` from source on top of `pgvector/pgvector:pg18` (~2-3 min on first
@@ -53,7 +56,7 @@ run), because no published image carries PG18 + pgvector + pg_textsearch
 together. Force a clean rebuild after Dockerfile changes:
 
 ```bash
-docker compose build --no-cache
+docker compose --env-file .env.dev build --no-cache
 ```
 
 Both extensions are created automatically on first startup via
@@ -61,29 +64,35 @@ Both extensions are created automatically on first startup via
 `shared_preload_libraries = 'pg_textsearch'` to `postgresql.conf.sample`, which
 that extension requires at server start.
 
-The data lands in a Docker named volume (`cbac_pgdata`). To keep it on a host
-path you control instead — somewhere you can back up, or a disk with room —
-set `PG_DATA_PATH`:
+The data lands wherever `PG_DATA_PATH` in the env file points — a host directory
+you can back up, on a disk with room. Either the variable or a Docker named
+volume, never both: an unset (or empty) `PG_DATA_PATH` falls back to the named
+volume `cbac-$CBAC_ENV_pgdata`, and a set one replaces it. The two are separate
+databases, so a path used for the first time starts empty and needs its own
+`alembic upgrade head` — switching back to the named volume finds everything as
+it was. On Linux the directory must exist and be writable by the container's
+postgres user (uid 999):
 
 ```bash
-PG_DATA_PATH="PATH" docker compose up -d
+mkdir -p "$PG_DATA_PATH" && chown -R 999:999 "$PG_DATA_PATH"
 ```
 
-Either the variable or the named volume, never both: an unset (or empty)
-`PG_DATA_PATH` falls back to `cbac_pgdata`, and a set one replaces it. The two
-are separate databases, so a path used for the first time starts empty and
-needs its own `alembic upgrade head` — switching back to the named volume finds
-everything as it was. On Linux the directory must be writable by the
-container's postgres user (uid 999); Docker Desktop handles that itself.
+Docker Desktop handles the ownership itself, but only for paths it is allowed to
+share.
 
 ### 3. Run database migrations
 
-Still inside `cbac_service/`:
+Still inside `cbac_service/` — `alembic.ini` resolves `db/migrations` relative to
+it:
 
 ```bash
-export DATABASE_URL="postgresql+asyncpg://cbac_user:cbac_pass@localhost:5432/cbac"
-uv run alembic upgrade head
+uv run --env-file .env.dev alembic upgrade head
 ```
+
+`--env-file` rather than exporting the variables by hand, because it fails on a
+missing or unreadable file. A half-loaded environment is worse than no
+environment: `DATABASE_URL` silently falls back to the `config.py` default, which
+is the dev database, and the migration lands on the wrong environment.
 
 ### 4. Start the service
 
@@ -91,18 +100,17 @@ From the **project root**:
 
 ```bash
 cd cbac-server
-export DATABASE_URL="postgresql+asyncpg://cbac_user:cbac_pass@localhost:5432/cbac"
-uv run uvicorn cbac_service.main:app
+uv run --env-file cbac_service/.env.dev uvicorn cbac_service.main:app
 ```
 
 Serves on `http://localhost:8000`, with API docs at
 [`/docs`](http://localhost:8000/docs). Add `--reload` for development.
 
-Alternatively, run the module's own entrypoint, which reads `CBAC_SERVICE_HOST`
-and `CBAC_SERVICE_PORT` and so defaults to port **8767**:
+Alternatively, run the module's own entrypoint, which binds to
+`CBAC_SERVICE_HOST` and `CBAC_SERVICE_PORT` from that same env file:
 
 ```bash
-uv run python -m cbac_service.main
+uv run --env-file cbac_service/.env.dev python -m cbac_service.main
 ```
 
 > Run it as `python -m cbac_service.main`, not `python -m main` from inside
@@ -117,18 +125,50 @@ vector/BM25/hybrid search, tiered decisions — against the live Docker Postgres
 
 ```bash
 cd cbac-server
-export DATABASE_URL="postgresql+asyncpg://cbac_user:cbac_pass@localhost:5432/cbac"
-PYTHONPATH=. uv run python scripts/test_lifecycle.py
+PYTHONPATH=. uv run --env-file cbac_service/.env.dev python scripts/test_lifecycle.py
 ```
+
+## Environments
+
+One image, one compose file, one variable: `CBAC_ENV`. It names the compose
+project, so the container, the network and the named volume are namespaced by it
+and two environments on the same host cannot reach each other's data. Nothing
+environment-specific is baked into `Dockerfile.postgres` — credentials, host port
+and data directory all arrive at run time — so `test-prod` reuses the `dev` build.
+
+| | `.env.dev` | `.env.test-prod` |
+|---|---|---|
+| compose project | `cbac-dev` | `cbac-test-prod` |
+| container | `cbac-dev-postgres` | `cbac-test-prod-postgres` |
+| host port → 5432 | `5432` | `5433` |
+| data (`PG_DATA_PATH`) | `…/dev/pgdump/cbac_service` | `…/test_prod/pgdump/cbac_service` |
+| service port | `8000` | `8768` |
+
+Both files are gitignored — they hold real credentials. `.env.sample` is the
+checked-in reference for the full variable list; anything identical across
+environments belongs in `config.py`, not in these files.
+
+Every command takes the environment the same way — one `--env-file` flag:
+
+```bash
+cd cbac_service
+docker compose --env-file .env.test-prod up -d           # Postgres
+uv run --env-file .env.test-prod alembic upgrade head    # schema
+```
+
+Each environment is a separate, empty database on first start, so each needs its
+own `alembic upgrade head`. Never let the flag fall off: without it `DATABASE_URL`
+reverts to the `config.py` default and the command silently hits **dev**.
 
 ## Useful Commands
 
+Shown for `dev` — swap the env file for the other environment.
+
 | Task | Command |
 |------|---------|
-| Stop Postgres | `cd cbac_service && docker compose down` |
-| Stop + destroy data | `cd cbac_service && docker compose down -v` (named volume only — a `PG_DATA_PATH` directory survives) |
-| Start with data on a host path | `cd cbac_service && PG_DATA_PATH="PATH" docker compose up -d` |
-| Rebuild Postgres image | `cd cbac_service && docker compose build --no-cache` |
+| Stop Postgres | `cd cbac_service && docker compose --env-file .env.dev down` |
+| Stop + destroy data | `cd cbac_service && docker compose --env-file .env.dev down -v` (named volume only — a `PG_DATA_PATH` directory survives) |
+| Rebuild Postgres image | `cd cbac_service && docker compose --env-file .env.dev build --no-cache` |
 | Connect via psql | `psql postgresql://cbac_user:cbac_pass@localhost:5432/cbac` |
 | Run tests | `uv run pytest` |
 | Format | `uv run ruff format cbac cbac_service` |

@@ -3,9 +3,13 @@
 # Stage 1: Build pg_textsearch from source
 # Stage 2: Final image with pgvector (from base image) + pg_textsearch (copied from builder)
 #
+# Nothing here is environment-specific — credentials, port and data directory are
+# all supplied at run time — so dev and test-prod share this one image and differ
+# only in their container, volume and env file. See docker-compose.yml.
+#
 # Usage:
-#   docker compose up -d
-#   (or: docker build -f Dockerfile.postgres -t cbac-postgres .)
+#   docker compose --env-file .env.dev up -d
+#   (or: docker build -f Dockerfile.postgres -t cbac-postgres:pg18 .)
 
 # ── Stage 1: Build pg_textsearch ──────────────────────────────────────────────
 
