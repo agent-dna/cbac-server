@@ -221,6 +221,6 @@ __marimo__/
 TODO.md
 
 # Evaluation build artifacts
-eval.html
-eval.json
-eval.txt
+eval*.html
+eval*.json
+eval*.txt

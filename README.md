@@ -13,7 +13,7 @@ the caller→callee trust score, so a guard makes exactly one call per action.
 |---|---|
 | `cbac_service/` | The decision service — FastAPI app, decision engine, DB layer. All ML dependencies live here. |
 | `cbac/` | The framework-agnostic guard + optional MCP glue. Imports none of the ML stack. |
-| `scripts/` | `test_lifecycle.py` integration script and `eval_dashboard.py`. |
+| `scripts/` | Developer tools — pipeline inspectors, the lifecycle smoke test, the dashboard rebuilder. See [`scripts/README.md`](scripts/README.md). |
 
 `pyproject.toml`, `uv.lock`, and `.venv` live at the **repo root**. Run everything
 from there — except Alembic and Docker Compose, which read config relative to
@@ -109,17 +109,6 @@ uv run python -m cbac_service.main
 > `cbac_service/`. The package imports itself absolutely (`from
 > cbac_service.config import ...`), so it must be importable by its full package
 > name. `cbac_service.main:app` is also the deployment entrypoint.
-
-### 5. Run the lifecycle integration test
-
-Exercises the full pipeline — chunking, NLI classification, embedding,
-vector/BM25/hybrid search, tiered decisions — against the live Docker Postgres:
-
-```bash
-cd cbac-server
-export DATABASE_URL="postgresql+asyncpg://cbac_user:cbac_pass@localhost:5432/cbac"
-PYTHONPATH=. uv run python scripts/test_lifecycle.py
-```
 
 ## Useful Commands
 
