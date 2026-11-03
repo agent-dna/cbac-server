@@ -5,7 +5,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Float, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -186,3 +196,78 @@ class CBACDecision(Base):
             f"<CBACDecision(id={self.id}, agent_id={self.agent_id!r}, "
             f"decision={self.decision!r}, error_code={self.error_code})>"
         )
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class PolicyVersion(Base):
+    """One upload of an agent's v2 policy and what the policy parser made of it.
+
+    Append-only. ``status`` is ``pending`` (awaiting approval), ``active`` (the
+    one deciding), or ``superseded``; an agent's active version is its latest
+    ``active`` row. The row keeps the parser's inputs (``tool_schemas``,
+    ``trusted_data``) next to its validated output (``catalog``,
+    ``deny_rules``) and everything validation threw out (``rejected``,
+    ``unenforceable``), so a reviewer reads one row to see what the gate will
+    and will not enforce.
+    """
+
+    __tablename__ = "policy_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    # The policy text itself: approval re-indexes its chunks for policy drift.
+    policy: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    tool_schemas: Mapped[list] = mapped_column(JSONB, nullable=False)
+    trusted_data: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # tool name -> {"resources": [{arg, action, kind}], "free_text": [arg]}
+    catalog: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # [{action, match: "exact"|"glob", resource, source}]; exact rules are
+    # also OpenFGA deny tuples while this version is active.
+    deny_rules: Mapped[list] = mapped_column(JSONB, nullable=False)
+    rejected: Mapped[list] = mapped_column(JSONB, nullable=False)
+    unenforceable: Mapped[list] = mapped_column(JSONB, nullable=False)
+    parser_model: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_policy_versions_agent_status_id", "agent_id", "status", "id"),
+    )
+
+
+class CBACIntent(Base):
+    """One user query, its intent id, and the grants parsed from it.
+
+    Written once, by the first ``/cbac/v2/authorize`` call that carries a new
+    ``intent_id``, and never updated: the 1:1 binding of ``intent_id`` to
+    ``user_query`` is what keeps a later call from swapping in a different
+    query. ``grants`` is the readable form of the allow tuples written to
+    OpenFGA for this intent; ``dropped`` is what validation refused.
+    """
+
+    __tablename__ = "cbac_intents"
+
+    intent_id: Mapped[str] = mapped_column(String, primary_key=True)
+    agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    user_query: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_version_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("policy_versions.id"), nullable=False
+    )
+    grants: Mapped[list] = mapped_column(JSONB, nullable=False)
+    dropped: Mapped[list] = mapped_column(JSONB, nullable=False)
+    parser_model: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )

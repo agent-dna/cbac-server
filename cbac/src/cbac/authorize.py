@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import json
 import os
 
 # functools and inspect are only needed by the commented-out decorator below.
@@ -371,5 +372,52 @@ async def authorize(
         ),
         cbac_url,
         cbac_timeout=cbac_timeout,
+    )
+    return (result.decision, result.status_code, result.hash)
+
+
+async def authorize_call(
+    agent_id: str,
+    intent_id: str,
+    user_query: str,
+    tool: str,
+    args: dict[str, Any],
+    mcp_did: str = "",
+    callee_type: str = "mcp_tool",
+    cbac_url: str = "https://cbac-service.agentdna.io",
+    cbac_timeout: float = 300,
+) -> tuple[str, int, str]:
+    """Authorize one tool call against the v2 gate (``/cbac/v2/authorize``).
+
+    Same contract as :func:`authorize`: returns ``(decision, status_code,
+    interaction_hash)``, never raises, and the 9100s mean no verdict was
+    reached. The v2 codes are the service's 4000s; ``4301`` and ``4302`` are
+    the only allows.
+
+    ``intent_id`` and ``user_query`` travel together on every call of a
+    workflow: the service parses the query into grants the first time it sees
+    the id, and denies any later call that pairs the id with a different
+    query. ``args`` goes out as JSON, structure intact — the service checks
+    list-valued recipients one by one — with anything JSON cannot encode
+    (a ``datetime``) sent as its ``str``.
+    """
+    try:
+        arguments = json.loads(json.dumps(args, default=str))
+    except (TypeError, ValueError):
+        # Unencodable even as str (a circular structure): nothing to send.
+        return ("error", TRANSPORT_FAILED, "")
+    result = await _authorize(
+        {
+            "agent_id": agent_id,
+            "intent_id": intent_id,
+            "user_query": user_query,
+            "tool": tool,
+            "arguments": arguments,
+            "callee_type": callee_type,
+            "mcp_did": mcp_did,
+        },
+        cbac_url,
+        "/cbac/v2/authorize",
+        cbac_timeout,
     )
     return (result.decision, result.status_code, result.hash)

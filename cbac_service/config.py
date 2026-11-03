@@ -74,6 +74,39 @@ LHI_LAMBDA_DOWN = 0.70
 CHUNK_MAX_WORDS = 120
 NLI_BATCH_SIZE = 64
 
+# ── v2 gate: OpenFGA ──────────────────────────────────────────────────────────
+# The OpenFGA server holding the allow/deny tuples, and the store name the
+# service finds or creates at startup. One store per environment, so dev and
+# test-prod never share tuples. No default for the store name: an env file
+# that forgets it must fail closed, not quietly write into another
+# environment's store.
+OPENFGA_API_URL: str = os.environ.get("OPENFGA_API_URL", "http://localhost:8080")
+OPENFGA_STORE_NAME: str = os.environ.get("OPENFGA_STORE_NAME", "")
+# OpenFGA's pre-shared key (its OPENFGA_AUTHN_PRESHARED_KEYS). Whoever can write
+# to the store can mint grants, so docker-compose refuses to start OpenFGA
+# without one; empty here only suits an OpenFGA run with authn off.
+OPENFGA_API_TOKEN: str = os.environ.get("OPENFGA_API_TOKEN", "")
+
+# How long an intent's allow tuples stay live, from the first call that parsed
+# its query. Enforced by OpenFGA itself (the non_expired_grant condition).
+INTENT_TTL_SECONDS: int = int(os.environ.get("INTENT_TTL_SECONDS", "3600"))
+
+# ── v2 gate: parsers ──────────────────────────────────────────────────────────
+# "<backend>:<model>", backend one of "ollama" | "anthropic". The policy parser
+# runs once per upload and can afford a large model; the query parser runs on
+# the first call of every intent, so it sits on the latency path.
+POLICY_PARSER_MODEL: str = os.environ.get("POLICY_PARSER_MODEL", "ollama:qwen3:14b")
+QUERY_PARSER_MODEL: str = os.environ.get("QUERY_PARSER_MODEL", "ollama:qwen3:14b")
+OLLAMA_URL: str = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+# Empty lets the Anthropic SDK resolve credentials itself (an `ant auth login`
+# profile, ANTHROPIC_AUTH_TOKEN, ...).
+ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Shared secret for the v2 policy endpoints, sent as X-CBAC-Key. Those
+# endpoints write deny tuples and the argument mapping, so an unset key makes
+# them refuse every request rather than accept anyone's.
+CBAC_POLICY_KEY: str = os.environ.get("CBAC_POLICY_KEY", "")
+
 # ── Service binding & logging ─────────────────────────────────────────────────
 CBAC_SERVICE_HOST: str = os.environ.get("CBAC_SERVICE_HOST", "127.0.0.1")
 CBAC_SERVICE_PORT: int = int(os.environ.get("CBAC_SERVICE_PORT", "8767"))

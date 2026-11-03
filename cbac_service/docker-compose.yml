@@ -1,4 +1,5 @@
-# Postgres 18 with pgvector + pg_textsearch — one stack per environment.
+# Postgres 18 with pgvector + pg_textsearch, plus OpenFGA for the v2 gate's
+# tuples — one stack per environment.
 #
 # The environment is a single variable, `CBAC_ENV`. It names the compose project,
 # so the container, the network and the data volume are all namespaced by it: two
@@ -48,6 +49,44 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # One-shot: creates/upgrades OpenFGA's tables in its own `openfga` database
+  # inside the Postgres above (init-extensions.sql creates that database on a
+  # fresh volume). Postgres, not OpenFGA's memory datastore: a restart there
+  # would silently drop every deny tuple.
+  openfga-migrate:
+    image: openfga/openfga:v1.22.0
+    container_name: ${CBAC_ENV:-dev}-cbac-openfga-migrate
+    command: migrate
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://${POSTGRES_USER:-cbac_user}:${POSTGRES_PASSWORD:-cbac_pass}@postgres:5432/openfga?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  openfga:
+    # Pinned exactly, like the Postgres image: every environment runs the same
+    # authorization engine.
+    image: openfga/openfga:v1.22.0
+    container_name: ${CBAC_ENV:-dev}-cbac-openfga
+    command: run
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://${POSTGRES_USER:-cbac_user}:${POSTGRES_PASSWORD:-cbac_pass}@postgres:5432/openfga?sslmode=disable
+      # Whoever can write to the store can mint grants, so OpenFGA requires the
+      # same key the service sends (OPENFGA_API_TOKEN), and will not start
+      # without one.
+      OPENFGA_AUTHN_METHOD: preshared
+      OPENFGA_AUTHN_PRESHARED_KEYS: ${OPENFGA_API_TOKEN:?set OPENFGA_API_TOKEN in the env file}
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+    ports:
+      # HTTP API only, and on loopback only: the service is its one client.
+      - "127.0.0.1:${OPENFGA_HTTP_PORT:-8080}:8080"
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
 volumes:
   pgdata:

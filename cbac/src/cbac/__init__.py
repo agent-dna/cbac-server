@@ -8,6 +8,7 @@ framework's glue, not something every caller needs.
 from .authorize import (
     GovernanceContext,
     authorize,
+    authorize_call,
     cbac_context,
     get_context,
 )
@@ -15,6 +16,7 @@ from .authorize import (
 __all__ = [
     "GovernanceContext",
     "authorize",
+    "authorize_call",
     "cbac_context",
     "get_context",
 ]

@@ -30,9 +30,27 @@ re-check *both* sides against current code; neither side is presumed right.
 app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
 **none** of them.
 
+It runs **two gates** side by side:
+
+- **v2** (`/cbac/v2/*`, `CBAC.authorize_call`) — the IBAC gate: permissions
+  parsed from trusted inputs into exact OpenFGA tuples, each tool call mapped
+  to tuples deterministically, and deny-only semantic checks on free-text
+  arguments. See "The v2 pipeline" below.
+- **v1** (`/cbac/v1/authorize`, `CBAC.verify_cbac`) — the semantic-only gate:
+  the whole call scored against the policy text. See "The v1 pipeline".
+
+Modules:
+
 - `main.py` — the HTTP boundary: `app = FastAPI()`, the lazy `CBAC` singleton,
-  DB lifecycle via lifespan, and the `__main__` uvicorn runner.
-- `cbac.py` — the decision engine (class `CBAC`), no HTTP.
+  DB and OpenFGA lifecycle via lifespan, and the `__main__` uvicorn runner.
+- `cbac.py` — the decision engine (class `CBAC`), no HTTP. Both gates.
+- `ibac.py` — v2's deterministic half, pure functions: resource
+  normalization, OpenFGA object/user ids, catalog validation.
+- `parsers.py` — v2's two LLM parsers (`parse_policy`, `parse_query`), the
+  `chat_json` backend dispatch (Ollama over stdlib HTTP, or the Claude API),
+  and the validation of everything they return.
+- `fga.py` + `fga_model.json` — OpenFGA access: store binding, tuple writes,
+  checks.
 - `config.py` — pipeline tunables as module-level constants (`ALLOW_GAP`,
   `ENCODER_MODEL`, `LHI_WEIGHTS`, `DATABASE_URL`, …). Change a value here and
   redeploy.
@@ -47,7 +65,22 @@ app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
   are pydantic models in `entity.py`; a schema violation answers in the same
   envelope with 422 via the `RequestValidationError` handler.
 - Endpoints:
-  - **`POST /cbac/v1/authorize`** — main decision gate. Also folds the decision
+  - **`POST /cbac/v2/policies`** — `{agent_id, policy?, trusted_data?,
+    review_required?}`: upload a policy document (instructions + tool schemas
+    in one Markdown file, see "The v2 pipeline"; omitted, it is the agent's
+    card on the Provenance Layer) and optional trusted data; the policy parser
+    turns them into a new `policy_versions` row, activated at once unless
+    `review_required` (default `false`) holds it `pending` for approval. A
+    document that does not split is a 422. Requires `X-CBAC-Key:
+    $CBAC_POLICY_KEY`; an unset key refuses every request (503).
+  - **`GET /cbac/v2/policies/{agent_id}`** — the agent's active and pending
+    versions, for a reviewer. Same key.
+  - **`POST /cbac/v2/policies/{agent_id}/approve`** — `{"version_id": n}`:
+    activate a pending version (the optional human-review step). Same key.
+  - **`POST /cbac/v2/authorize`** — the v2 decision gate:
+    `{agent_id, intent_id, user_query, tool, arguments, callee_type, mcp_did}`
+    → `data` `{decision, status_code, hash}`. Always HTTP 200, like v1.
+  - **`POST /cbac/v1/authorize`** — the v1 decision gate. Also folds the decision
     into the caller→callee trust score, so it is the *only* call a guard makes.
     Always HTTP 200, including the fail-closed `"error"` verdict: a 5xx would
     invite a retry, and the trust fold is not idempotent.
@@ -68,15 +101,18 @@ app that the guard calls over HTTP. All the ML deps live here; `cbac/` imports
 ## Architecture
 
 ```
-Guard (cbac/) --HTTP--> cbac_service (FastAPI)
-                                     |
-                                PostgreSQL 18
-                                ├── pgvector 0.8.6 (semantic search)
-                                ├── pg_textsearch 1.4.0 (BM25 keyword search)
-                                ├── policy_chunks table (embeddings + text)
-                                ├── policy_meta table (what was indexed)
-                                ├── cbac_decisions table (audit log)
-                                └── lhi_records table (trust history)
+user -> agent -> gateway (cbac/ guard) --HTTP--> cbac_service (FastAPI) -> tool runs
+                                                   |
+                         ┌─────────────────────────┼─────────────────────┐
+                    OpenFGA v1.22.0         PostgreSQL 18           parser LLM
+                    (allow/deny tuples,     ├── pgvector 0.8.6      (Ollama or
+                     datastore: the         ├── pg_textsearch 1.4.0  Claude API)
+                     `openfga` database     ├── policy_chunks
+                     in this Postgres)      ├── policy_meta
+                                            ├── policy_versions (v2 policy + catalog)
+                                            ├── cbac_intents (intent -> query, grants)
+                                            ├── cbac_decisions (audit log)
+                                            └── lhi_records (trust history)
 ```
 
 ## Database
@@ -101,10 +137,32 @@ The service uses **PostgreSQL 18** with two extensions:
 - `encoder_model` / `nli_model` — detect if models changed
 - `chunk_count` / `cached_at` — operational metadata
 
-**`cbac_decisions`** — one row per verdict, the **audit log**:
-- `agent_id` / `decision` / `reason` — who, what, why
-- `intended_action` — the *flattened* action text, i.e. what the scorers saw
-- `user_intent` / `callee_name` / `callee_type` — context; NULL when not supplied
+**`policy_versions`** — one row per v2 policy upload, append-only:
+- `policy` / `policy_hash` — the document's instructions section (what gets
+  chunked for policy drift), and the hash of the whole document
+- `tool_schemas` / `trusted_data` — the document's tool schemas, and the
+  upload's trusted data (`{}` when none)
+- `catalog` — tool name → `{resources: [{arg, action, kind}], free_text: [arg],
+  description}`, validated
+- `deny_rules` — `[{action, match: exact|glob, resource, source}]`
+- `rejected` / `unenforceable` — what validation threw out, and the policy
+  statements no tuple can express
+- `status` — `pending` | `active` | `superseded`; the active version is the
+  agent's latest `active` row
+- `parser_model`, `created_at`, `approved_at`
+
+**`cbac_intents`** — one row per `intent_id`, written by the first v2 call that
+carries it and never updated: `agent_id`, `user_query`, `policy_version_id`,
+`grants` (readable form of the allow tuples), `dropped`, `parser_model`,
+`created_at`, `expires_at`.
+
+**`cbac_decisions`** — one row per verdict of either gate, the **audit log**:
+- `agent_id` / `decision` / `reason` / `error_code` — who, what, why, which check
+- `intended_action` — v1: the *flattened* action text the scorers saw; v2: the
+  call rendered by `render_intent`
+- `user_intent` / `intent_id` / `callee_name` / `callee_type` — context; NULL
+  when not supplied
+- `interaction_hash` — salted per-row id, returned to the caller
 - `created_at`
 
 **`lhi_records`** — one row per decision, the **trust history** (see the LHI
@@ -159,15 +217,107 @@ everything from there, not from inside `cbac_service/`:
 Alembic and docker-compose are the exception: both read config relative to
 `cbac_service/`, so `cd cbac_service` first for those two.
 
+`docker compose` starts Postgres, a one-shot `openfga-migrate`, and OpenFGA
+(`openfga/openfga:v1.22.0`, HTTP API on `127.0.0.1:$OPENFGA_HTTP_PORT`).
+OpenFGA's datastore is a separate `openfga` database in the same Postgres,
+created by `init-extensions.sql` on a fresh volume — an existing volume needs
+`CREATE DATABASE openfga;` once by hand. OpenFGA requires a pre-shared key
+(`OPENFGA_API_TOKEN`) and compose refuses to start it without one.
+
 ### Required environment variables
 
 See `.env.sample` for the full list. Key ones:
 - `DATABASE_URL` — async Postgres connection string
 - `AGENTDNA_API_KEY` — Provenance Layer access
 - `CBAC_SERVICE_HOST` / `CBAC_SERVICE_PORT` — binding
-- `HYBRID_SEARCH_ENABLED` — toggle BM25 fusion (default: true)
+- `HYBRID_SEARCH_ENABLED` — toggle BM25 fusion (default: false)
+- `OPENFGA_API_URL` / `OPENFGA_STORE_NAME` / `OPENFGA_API_TOKEN` — the v2 tuple
+  store; one store name per environment, and no default for it — an env file
+  that forgets it denies every v2 call rather than writing into another
+  environment's store
+- `POLICY_PARSER_MODEL` / `QUERY_PARSER_MODEL` — `"<backend>:<model>"`, backend
+  `ollama` or `anthropic` (default `ollama:qwen3:14b`); `OLLAMA_URL`,
+  `ANTHROPIC_API_KEY`
+- `CBAC_POLICY_KEY` — the v2 policy endpoints' shared secret
+- `INTENT_TTL_SECONDS` (default 3600)
 
-## The decision pipeline (`cbac.py`)
+Whether a policy upload waits for human review is not deployment config: it is
+the upload's own `review_required` field, decided per agent by the admin.
+
+## The v2 pipeline (`CBAC.authorize_call`)
+
+**Trusted inputs:** the admin's policy, the raw tool schemas, the agent's
+trusted data, and the user's query. **Untrusted:** everything the agent
+produces — which tool it calls and every argument. The query arrives in the
+`X-CBAC-User-Intent` header, set by the agent's runtime rather than its model.
+
+**Policy upload** (`upload_policy`, once per version). The policy is one
+Markdown document, split deterministically by
+`parsers.split_policy_document` — sections separated by lines that are exactly
+`---`, each opening with its title (a leading `#` is allowed):
+
+```
+---
+Policy Instructions
+<the policy, in prose>
+---
+Tool Schema
+<JSON: a list of MCP tools, or a tools/list result {"tools": [...]}>
+---
+```
+
+Both sections are required, each once; the JSON may be in a fenced code block.
+Then `parse_policy` makes one LLM pass over the instructions and the tools that
+returns the **catalog** (per tool: which top-level arguments are
+*resources* — `email | path | url | id`, each with an `<area>:<verb>` action —
+and which are *free text*), the **deny rules**, and the **unenforceable**
+statements. `ibac.validate_catalog` then checks it in code: every schema
+property classified (coverage — a forgotten `bcc` is an open channel), a
+property with `format: email|uri|…` must be a resource of that kind, one kind
+per action. A tool that fails is left out of the catalog, so calls to it are
+denied. Each deny rule's `source` must be a verbatim quote of the policy.
+Activation (`activate_policy_version`) re-indexes the policy chunks
+(`index_policy`, for policy drift), swaps the exact deny tuples in OpenFGA, and
+only then flips the rows. An upload with `review_required: true` stays
+`pending` — the previous active version keeps deciding — until
+`POST /cbac/v2/policies/{agent_id}/approve` activates it.
+
+**Per call**, in order:
+
+1. **Intent.** Empty `intent_id`/`user_query` → 4001. Under a transaction-scoped
+   advisory lock on the intent id: an unseen id runs `parse_query` (query +
+   trusted data → grants, each resource grounded in the query or trusted data),
+   writes the allow tuples, and stores the `cbac_intents` row; a seen id must
+   carry the same query and agent (4002) and be unexpired (4003). A failed
+   parse stores nothing (4004), so the next call retries.
+2. **Mapping.** The active version's catalog: unknown tool 4005, an argument
+   that is neither resource nor free text 4006, a resource that fails
+   `ibac.normalize` 4007, no resource value 4008, no active version 4009. A
+   tool with no resource arguments is the resource `tool:<name>#*`.
+3. **Glob deny rules**, matched in the service (OpenFGA cannot wildcard an
+   object id) → 4101.
+4. **OpenFGA**: each resource needs a live allow tuple and no deny tuple —
+   4102 deny tuple, 4103 not granted, 4104 OpenFGA error.
+5. **Semantic checks** on free-text arguments, **deny-only**: every word window
+   (`CHUNK_MAX_WORDS`) is scored, so nothing hides past the models' 512-token
+   cut. Intent drift (NLI contradiction vs the query) → 4201; policy drift
+   Tier 1 (gap < −`DENY_GAP`) → 4202, Tier 2 (contradiction vs the top allowed
+   chunk) → 4203; a model or search error → 4204. Anything short of a clear
+   deny passes — the call already holds an exact grant. HHEM is attached,
+   never gating.
+6. **Allow**: 4301 (no free text) or 4302 (free text passed).
+
+Tuple shapes (`fga_model.json`): allow `(user:<sha256(intent_id)>, can_invoke,
+tool_invocation:<sha256(agent_id, action#resource)>)` with a
+`non_expired_grant` condition; deny `(user:*, blocked, …)`. Object ids are
+hashed so OpenFGA's id limits never meet a raw email or URL, and agent-scoped
+so one agent's deny never matches another's call. The readable forms are in
+`policy_versions` and `cbac_intents`.
+
+`authorize_call` wraps `_authorize_call` the way `verify_cbac` wraps `_decide`:
+the trust fold and the audit write happen in one place for every path.
+
+## The v1 pipeline (`CBAC.verify_cbac`)
 
 Class `CBAC`. On each request:
 
@@ -183,13 +333,14 @@ Class `CBAC`. On each request:
    `POST /cbac/v1/policies/precompute` replaces it, so publishing a new policy
    card is half of a policy update and re-indexing is the other half.
 
-3. **Tier 1 — Cosine gap** (via pgvector): Encodes the intent, runs
+3. **Tier 1 — Cosine gap** (via pgvector, `_tier1_gap`): Encodes the intent, runs
    `vector_search(allowed)` and `vector_search(forbidden)`. If
    `max_allowed − max_forbidden > ALLOW_GAP` → allow. If gap < −`DENY_GAP` → deny.
    Otherwise escalate.
 
-4. **Tier 2 — NLI entailment**: Uses `hybrid_search` (pgvector + pg_textsearch
-   RRF fusion) to find the best allowed chunk candidate, then runs the NLI
+4. **Tier 2 — NLI entailment** (`_tier2_nli`): Uses `hybrid_search` (pgvector +
+   pg_textsearch RRF fusion, when `HYBRID_SEARCH_ENABLED`) to find the best
+   allowed chunk candidate, then runs the NLI
    cross-encoder. Entailment ≥ 0.55 → allow, contradiction ≥ 0.60 → deny.
 
 5. **Tier 3 — LLM backend** (optional): If configured, sends intent + full
@@ -268,3 +419,14 @@ error, or an inconclusive/misbehaving Tier 3, → `deny`).
   functions faked in-memory via the shared `rows` fixture in
   `tests/conftest.py`, no DB needed); the fold into `verify_cbac` by
   `cbac_service/tests/test_cbac_verify.py` — keep both green when touching it.
+
+  v2 folds trust the same way, from its semantic scores: a call decided at the
+  gate measures no component and writes no trust row.
+
+## v2 tests
+
+No OpenFGA, Postgres or LLM needed: `test_ibac.py` (normalization, catalog
+validation), `test_parsers.py` (validation behind a fake `chat_json`), and
+`test_authorize_v2.py` (the talk's injection replayed through `authorize_call`
+against in-memory fakes of OpenFGA and the repository, plus the guard↔route
+contract and the policy-key check).

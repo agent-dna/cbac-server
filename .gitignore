@@ -219,6 +219,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
+*eval*
 # Working notes, not part of the deliverable
 TODO.md
+
+fine-tune

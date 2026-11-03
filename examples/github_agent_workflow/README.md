@@ -7,7 +7,8 @@ Every MCP tool call the agent makes is authorized at that gateway. The agent
 process holds no policy, makes no decision, and cannot opt out.
 
 No AgentDNA, no provenance chain, no identity registration — the agent's policy
-is a markdown file the service reads from disk.
+is a markdown file, uploaded to the service as one policy document together
+with the tool schemas the gateway serves.
 
 ```
       "Close issue #3…"                    "Draft a summary…"
@@ -16,7 +17,7 @@ is a markdown file the service reads from disk.
                                 ▼
  ┌────────────────────────────────────────────────────────────────────┐
  │ agent process                                                      │
- │ cbac_context(agent_id, user_intent) — opened once, ambient         │
+ │ cbac_context(agent_id, user_intent, intent_id) — once, ambient     │
  │                                                                    │
  │   ┌────────────────────────────────────────────────────────────┐   │
  │   │                       LLM tool loop                        │   │
@@ -38,11 +39,11 @@ is a markdown file the service reads from disk.
     │ MCP server to the agent,      │ ← the PEP
     │ MCP client to each upstream   │
     └───────────────┬───────────────┘
-                    │  POST /cbac/v1/authorize
+                    │  POST /cbac/v2/authorize
                     ▼
   ┌───────────────────────────────────┐
   │   CBAC decision service   :8767   │
-  │       allow · deny · advise       │
+  │           allow · deny            │
   └─────────────────┬─────────────────┘
                     │
         deny ───────┴──────────── allow
@@ -95,28 +96,22 @@ An interceptor inside the agent process is opt-in, and a security control the
 developer can delete is not a control. So the demo splits the job:
 
 - The agent **labels** its calls with the governance context — who is acting
-  (`X-CBAC-Agent-Id`) and what the user actually asked for
-  (`X-CBAC-User-Intent`). `cbac_propagate` does only that. It calls no service,
-  makes no decision, and cannot deny anything.
-- The gateway **decides**. It reads the label, calls `/cbac/v1/authorize`, and
+  (`X-CBAC-Agent-Id`), what the user actually asked for
+  (`X-CBAC-User-Intent`), and which request this is (`X-CBAC-Intent-Id`).
+  `cbac_propagate` does only that. It calls no service, makes no decision, and
+  cannot deny anything.
+- The gateway **decides**. It reads the label, calls `/cbac/v2/authorize`, and
   either forwards the call upstream or returns a denial.
 
 Delete `cbac_propagate` and calls still go through the gateway — they just
-arrive with no user intent to check them against, so they are judged on policy
-alone and a forbidden one is still denied. `python agent_check.py` proves this:
-probe 2 is a client with the interceptor removed.
+arrive with no request to grant anything from, so every one is denied.
+`python agent_check.py` proves this: probe 2 is a client with the interceptor
+removed.
 
-Two more things fall out of the split:
-
-- **Better intent prose.** The gateway holds the upstream tool's real
-  description, so it asks CBAC about *"the agent wants to close an existing
-  GitHub issue, with repo = owner/repo, number = 3"*. A client-side interceptor
-  only sees the tool name and can manage no better than *"close issue"* — and
-  NLI scores the two very differently.
-- **Credential custody.** The gateway is also where the upstream credential
-  lives. That is what makes bypass pointless rather than merely inconvenient —
-  routing around the gateway routes around the only thing that can
-  authenticate upstream. See the next section.
+One more thing falls out of the split: **credential custody.** The gateway is
+also where the upstream credential lives. That is what makes bypass pointless
+rather than merely inconvenient — routing around the gateway routes around the
+only thing that can authenticate upstream. See the next section.
 
 ## Pointing straight at the MCP server
 
@@ -150,10 +145,12 @@ configure rather than run.
 
 ### Trust boundary
 
-`X-CBAC-User-Intent` is client-supplied and unverifiable — only the client
-knows what the user typed. CBAC treats it as *evidence* (a drift signal), never
-as identity, so a client that lies about it still gets its action scored
-against the policy.
+`X-CBAC-User-Intent` is set by the agent's runtime, never by its model — the
+LLM emits tool calls, not headers. It is the source of the request's grants:
+the service parses it once, on the first call carrying a new `X-CBAC-Intent-Id`,
+and denies any later call that pairs that id with a different query. A runtime
+that lies about it can ask for anything the policy allows; a model steered by
+injected content cannot change it.
 
 `X-CBAC-Agent-Id` decides *whose policy applies*. The gateway reads it off the
 call and falls back to `CBAC_AGENT_ID` when the call carries none — fine for a
@@ -166,11 +163,13 @@ SAN, API key — to an agent id in the two lines where the hooks read the header
 
 ```
 agent.py                    the agent + the (CBAC-unaware) MCP server
-agent_check.py              drives every path directly and asserts — no LLM
+agent_check.py              drives every path directly and asserts — no agent LLM
 gateway.py                  the CBAC gateway — the enforcement point, fronting
                             github-mcp and the public mcp.deepwiki.com
 service.py                  the CBAC decision service, started against the
                             policy files below instead of the Provenance Layer
+upload_policy.py            uploads the policy document: the policy + the
+                            gateway's tool schemas (v2)
 policies/github-worker.md   the policy CBAC decides against
 requirements.txt
 .env.sample
@@ -183,18 +182,22 @@ requirements.txt
 From the repo root:
 
 ```bash
-cd cbac_service && docker compose up -d && alembic upgrade head && cd ..
+cd cbac_service
+docker compose --env-file .env.dev up -d
+uv run --env-file .env.dev alembic upgrade head
+cd ..
 
-DATABASE_URL="postgresql+asyncpg://cbac_user:cbac_pass@localhost:5432/cbac" \
 HYBRID_SEARCH_ENABLED=true \
-  uv run python examples/github_agent_workflow/service.py
+  uv run --env-file cbac_service/.env.dev python examples/github_agent_workflow/service.py
 ```
 
 `service.py` is what makes this demo standalone. It starts the real
 `cbac_service` app — same pipeline, same endpoints, same Postgres — with one
-substitution: policy is read from `policies/{agent_id}.md` instead of resolved
-from the Provenance Layer, which would need an API key and a registered actor
-id. The substitution lives in the demo, not in the service: run
+substitution: wherever the service would resolve a policy from the Provenance
+Layer, which would need an API key and a registered actor id, it reads
+`policies/{agent_id}.md` instead. (The v2 gate the gateway uses gets its policy
+from `upload_policy.py`, which sends the file's text explicitly.) The
+substitution lives in the demo, not in the service: run
 `uvicorn cbac_service.main:app` directly and you get the production behaviour,
 because that is the only policy source the service itself knows.
 
@@ -205,28 +208,14 @@ dependencies live there, not in this directory's venv.
 is built from `Dockerfile.postgres` and ships `pg_textsearch`, so it works;
 set it to `false` if you point `DATABASE_URL` at a plain pgvector server.
 
-Check it decides correctly before involving an LLM:
+The v2 gate also needs OpenFGA (started by the same `docker compose`) and a
+parser model. The env file the service reads must set `OPENFGA_API_TOKEN`,
+`CBAC_POLICY_KEY`, and `POLICY_PARSER_MODEL` / `QUERY_PARSER_MODEL` (default
+`ollama:qwen3:14b`, which needs a local Ollama with that model pulled) — see
+`cbac_service/.env.sample`. Pass it with `uv run --env-file …`.
 
-```bash
-curl -s -XPOST localhost:8767/cbac/v1/authorize \
-  -H 'content-type: application/json' \
-  -d '{"agent_id":"github-worker","intended_action":"The agent wants to get a list of documentation topics for a GitHub repository, with repoName = modelcontextprotocol/python-sdk."}'
-# {"success":true,"message":"Tier 1 cosine gap 0.121 > 0.08 ...",
-#  "data":{"decision":"allow","error_code":3201}}
-
-curl -s -XPOST localhost:8767/cbac/v1/authorize \
-  -H 'content-type: application/json' \
-  -d '{"agent_id":"github-worker","intended_action":"The agent wants to close an existing GitHub issue, with repo = owner/repo, number = 3."}'
-# {"success":true,"message":"Tier 1 cosine gap -0.182 < -0.08 ...",
-#  "data":{"decision":"deny","error_code":3202}}
-```
-
-Note `success` is `true` on the deny: it reports that the call was *processed*,
-and the verdict is `data.decision`. The same verdict is on the
-`X-CBAC-Decision` header if you would rather not parse a body.
-
-The first call is slow — the service loads three transformer models and embeds
-the policy. Later calls hit the cached embeddings in Postgres.
+The service has no policy for `github-worker` until step 4 uploads one, and
+until then every call through the gateway is denied (`4009`).
 
 ### 2. Install and configure the example
 
@@ -252,7 +241,33 @@ you have no control over at all". The agent only ever talks to `:8766` — in a
 real deployment `:8765` has no route from the agent's network at all, which is
 what "Pointing straight at the MCP server" is about.
 
-### 4. Run it
+### 4. Upload the policy
+
+With the gateway up:
+
+```bash
+CBAC_POLICY_KEY=… python upload_policy.py
+```
+
+It builds the v2 policy document — the `Policy Instructions` section from
+`policies/github-worker.md`, the `Tool Schema` section from every tool and
+resource template listed through the gateway, names exactly as the gateway
+serves them, `github_close_issue` included — and posts it to
+`/cbac/v2/policies`. The
+response is the parsed version. Read it before running anything:
+
+- `catalog` — for each tool, which arguments are resources (the repository, the
+  issue number) and which are free text (a question).
+- `deny_rules` — each forbidden capability as a rule, with the policy sentence
+  it came from.
+- `rejected` — tools or rules that failed validation. A rejected tool is denied
+  on every call.
+- `unenforceable` — policy statements no rule can express.
+
+The policy parse is one LLM call over every schema; on a laptop-class local
+model it takes minutes.
+
+### 5. Run it
 
 ```bash
 # DENIED at the gateway — the call never reaches the MCP server
@@ -265,51 +280,38 @@ python agent.py "What docs exist for modelcontextprotocol/python-sdk?"
 python agent.py "Ask deepwiki how auth works in modelcontextprotocol/python-sdk"
 ```
 
-The `[cbac]` line is the gateway's verdict for that call. The denial comes back
-as a readable tool result rather than an exception, so the model can see it and
-report it:
-
-```
-[call] close_issue({'repo': 'owner/repo', 'number': 3})
-[cbac] DENIED — Tier 1 cosine gap -0.182 < -0.08 (intent closer to forbidden than allowed policy)
-[tool] {"status": "denied", "error": "Tier 1 cosine gap -0.182 < -0.08 (...)"}
-[ai]   I'm unable to close the issue due to a policy restriction.
-```
+The `[cbac]` line is the gateway's verdict for that call. The first request
+asks to close an issue; the user did ask for it, so it is granted, and the
+policy's deny rule for closing issues still blocks it (`4101`). The second is
+granted from the request and relayed (`4301`). The third is denied: the policy
+forbids asking an external AI service. The denial comes back as a readable
+tool result rather than an exception, so the model can see it and report it.
 
 The model must support tool calling. If you see an `[ai]` line containing
 `{"name": …, "arguments": …}` with no `[call]` line, no tool was invoked and
 CBAC was never consulted — that is a model problem, not a gateway problem.
 
-### 5. Check the wiring, and the bypass, without an LLM
+### 6. Check the wiring, and the bypass, without an agent LLM
 
 ```bash
 python agent_check.py
 ```
 
-Every path an agent can take, driven directly and asserted on:
+Every path an agent can take, driven directly and asserted on. Each probe opens
+its own request (`cbac_context` with a fresh `intent_id`), so the service parses
+each user request once:
 
-```
-[gateway      close_issue        ] {"status": "denied", "error": "Tier 1 cosine gap -0.182 < -0.08 (...)"}
-[gateway      close_issue        ] {"status": "denied", "error": "CBAC: call arrived with no governance
-                                    context (X-CBAC-User-Intent missing) …"}
-                                   ^ client skipped cbac_propagate
-[direct :8765 tools/list         ] ['close_issue']
-                                   ^ no check of its own — keeping this
-                                     port unroutable is the deployment's job
-[in-process   draft_summary      ] {'status': 'ok', 'repo': 'owner/repo', 'summary': 'fixed the parser'}
-                                   ^ never became MCP traffic — ungoverned
-[gateway      read_wiki_structure] [{'type': 'text', 'text': 'Available pages for modelcontext…
-[gateway      ask_question       ] {"status": "denied", "error": "Tier 1 cosine gap -0.103 < -0.08 (...)"}
-                                   ^ real third-party server, same policy
-[gateway      collaborators      ] {"status": "denied", "error": "Tier 1 cosine gap -0.113 < -0.08 (...)"}
-[gateway      review_checklist   ] text='Review the open pull requests in owner/repo. For each one…'
-                                   ^ a resource, gated; a prompt, not
+| # | probe | expected |
+| --- | --- | --- |
+| 1 | `close_issue`, labelled | denied — the policy's deny rule |
+| 2 | `close_issue`, client skipped `cbac_propagate` | denied — no intent (`4001`) |
+| 3 | `tools/list` straight at `:8765` | answers — the server has no check of its own |
+| 4 | `read_wiki_structure` on DeepWiki | relayed upstream, real content back |
+| 5 | `ask_question` on DeepWiki | denied — forbidden by policy |
+| 6 | the `collaborators` resource | denied |
+| 7 | the `review_checklist` prompt | comes back — prompts are not gated |
 
-OK — permitted calls relayed, forbidden ones blocked at the gateway:
-     by policy, and by the fail-closed check on a call that arrived
-     with no governance context. Tools and resources alike, and the
-     third-party server on the same policy as the local one.
-```
+plus `draft_summary`, in-process and never seen by the gateway.
 
 Probe 2 is the point of the demo: an agent that never installed the CBAC wiring
 still gets nothing through. Probe 3 shows what the MCP server does on its own,
@@ -317,66 +319,44 @@ which is nothing — the network keeps it out of reach, not the application.
 `draft_summary` is the honest limit: CBAC governs the MCP boundary, so a
 capability that never crosses it is never seen.
 
-Probes 5 and 6 close the gap between the stand-in and the real thing. DeepWiki
+Probes 4 and 5 close the gap between the stand-in and the real thing. DeepWiki
 was added to the gateway by URL alone — no decorator, no middleware, no
-cooperation from its operator, who has never heard of this repo — and the
-policy still decides its calls: `read_wiki_structure` is relayed and comes back
-with real content, `ask_question` dies at the gateway.
-
-DeepWiki's third tool, `read_wiki_contents`, is deliberately left unnamed by
-the policy. It escalates past Tier 1 and comes back `advise` — the gray zone,
-which is what an unconfigured Tier 3 returns. Name it in the policy and it
-resolves at Tier 1 like the others.
+cooperation from its operator — and the policy still decides its calls.
 
 ## What crosses the wire
 
-Per tool call, agent → gateway (MCP `tools/call`, plus two headers):
+Per tool call, agent → gateway (MCP `tools/call`, plus three headers):
 
 ```
 X-CBAC-Agent-Id:    github-worker
 X-CBAC-User-Intent: Close%20issue%20%233%20in%20owner/repo
+X-CBAC-Intent-Id:   9f1c…
 ```
 
 Gateway → decision service, one POST per call:
 
 ```json
 {
-  "agent_id":           "github-worker",
-  "mcp_did":            "http://127.0.0.1:8765/mcp/",
-  "callee_name":        "github_close_issue",
-  "callee_type":        "mcp",
-  "callee_description": "Close an existing GitHub issue.",
-  "arguments":          {"repo": "owner/repo", "number": "3"},
-  "user_intent":        "Close issue #3 in owner/repo"
+  "agent_id":    "github-worker",
+  "intent_id":   "9f1c…",
+  "user_query":  "Close issue #3 in owner/repo",
+  "tool":        "github_close_issue",
+  "arguments":   {"repo": "owner/repo", "number": 3},
+  "callee_type": "mcp",
+  "mcp_did":     "http://127.0.0.1:8765/mcp/"
 }
 ```
 
-Facts, not a sentence. The service turns them into the prose its scorers
-actually see — *"The agent wants to close an existing GitHub issue, with repo =
-owner/repo, number = 3."* — because NLI scores prose far better than
-`close_issue(repo=...)` call syntax, and because the wording is therefore part
-of the decision. Rendering it service-side is what stops two enforcement points
-from wording the same call differently and getting different verdicts; it also
-means a gateway written in another language has nothing to port.
+Facts, not a sentence. On the first call of a request the service parses
+`user_query` into exact grants; on every call it maps `arguments` to resources
+through the uploaded catalog and checks them against those grants and the
+policy's deny rules, then runs the deny-only semantic checks on any free-text
+argument. `tool` is the name the gateway serves, server prefix included, which
+is why the policy upload lists tools through the gateway.
 
-`callee_description` is the tool's own description, which the gateway looks up
-locally — a client-side interceptor only has what was on the wire, and without
-the description the de-snaked name lands in the verb slot instead. It survives
-the gateway's server-name prefixing, so `github_close_issue` still reads as
-*"close an existing GitHub issue"*; the prefix only shows up in `callee_name`,
-which is what the trust edge is keyed on — one edge per (agent, upstream tool),
-which is what you want.
-
-A caller that phrases the action itself sends `intended_action` instead, and
-the service scores that verbatim.
-
-`user_intent` is the root request, which lets the service also check the tool
-call for drift away from what the user actually asked for.
-
-Reaching a decision also folds the component scores into the (agent → callee)
+Reaching a decision also folds the semantic scores into the (agent → callee)
 trust score, service-side. There is no second call and nothing to report
-afterwards: one HTTP round-trip per action, and a denied call still leaves a
-record of having been denied.
+afterwards: one HTTP round-trip per action.
 
 ## Other deployments
 
@@ -397,19 +377,20 @@ network gateway.
 
 ## Editing the policy
 
-Change `policies/github-worker.md` and re-run. The service hashes the policy
-text, notices the change, and re-embeds it on the next authorization — no
-restart, no explicit invalidation.
+Change `policies/github-worker.md` and run `python upload_policy.py` again. Each
+upload is a new policy version, parsed and validated from scratch, and the
+service decides against it from the moment it activates — immediately, unless
+the upload sets `"review_required": true`, in which case it waits until
+approved with `POST /cbac/v2/policies/github-worker/approve`.
 
-Two things to keep in mind when writing bullets:
+Write prohibitions as plain sentences, one capability per sentence. The parser
+turns each into a deny rule and must quote the sentence it came from, so a rule
+can always be traced back to the line that produced it. Limits it cannot
+express as a rule — numbers, "only X" — come back under `unenforceable` rather
+than being dropped.
 
-- Phrase prohibitions as `<gerund> ... is prohibited and forbidden`. The
-  service classifies each chunk by NLI entailment, and "the agent must not X"
-  classifies as *allowed*.
-- Keep one capability per bullet and leave editorial prose out — every
-  sentence in the file becomes a chunk that an intent can match against.
-
-Inspect the split after any edit:
+The same text is also indexed as chunks for the policy-drift check on
+free-text arguments. Inspect them after any edit:
 
 ```sql
 SELECT chunk_type, chunk_text FROM policy_chunks

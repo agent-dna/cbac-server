@@ -11,56 +11,80 @@ standard library are the whole of it, `cbac.mcp` included.
 pip install cbac
 ```
 
+Two entry points, one per gate the service runs:
+
+| function | service route | decides by |
+| --- | --- | --- |
+| `authorize_call` | `POST /cbac/v2/authorize` | exact grants parsed from the user's query, OpenFGA, then deny-only semantic checks on free-text arguments |
+| `authorize` | `POST /cbac/v1/authorize` | semantic scoring of the whole call against the policy text |
+
 ## Where the service is
 
-Every call needs a URL to POST to. Either pass it, or set it in the
-environment:
+Both take `cbac_url` and `cbac_timeout` as arguments:
 
-| argument | environment | default |
+| argument | default | environment fallback |
 | --- | --- | --- |
-| `cbac_url` | `CBAC_URL` | *(none — no URL fails the call closed)* |
-| `cbac_endpoint` | `CBAC_PATH` | `/cbac/v1/authorize` |
-| `cbac_timeout` | `CBAC_TIMEOUT` | `100` (seconds) |
+| `cbac_url` | `https://cbac-service.agentdna.io` | `CBAC_URL`, read only when `cbac_url=""` |
+| `cbac_timeout` | `300` (seconds) | `CBAC_TIMEOUT`, read only when `cbac_timeout=0` |
 
+The route is fixed per function. `authorize` alone also honours `CBAC_PATH`
+(default `/cbac/v1/authorize`), for a v1 service mounted under another prefix.
 The environment is read **per call**, so a process that loads its `.env` after
-importing this package still gets it. An enforcement point that already reads
-its own settings passes them as arguments and skips the environment entirely.
-
-There is no baked-in host. With no URL from either source the call resolves to
-`decision="error"`, which every caller treats as *not allowed* — an agent's
-actions never go to whatever host happened to be compiled in.
+importing this package still gets it. With no URL from either source the call
+resolves to `"error"`, which every caller treats as *not allowed*.
 
 ## The result
 
-Every entry point returns an `AuthResult` and **never raises**:
+Both return a tuple and **never raise**:
 
 ```python
-@dataclass
-class AuthResult:
-    decision: str  # "allow" | "deny" | "error"
-    message: str  # why — the service's reason, or the failure
-    status_code: int | None  # the service's pipeline error code
-    hash: str | None  # the audit row's interaction_hash
+decision, status_code, interaction_hash = await authorize_call(...)
 ```
 
-`"error"` is this layer's own fail-closed value: no service configured, a
-network failure, a response that carried no verdict. `status_code` and `hash`
-are `None` on those paths, because there was no service-side verdict to carry
-them.
+- `decision` — `"allow"`, `"deny"`, or `"error"` when no verdict was reached.
+- `status_code` — the service's code for the check that decided
+  (`cbac_service.error_codes`: the 4000s for v2, the 3000s for v1), or one of
+  this package's own when there was no verdict to report: `9101` no service
+  configured, `9102` the response carried no decision, `9103` the request
+  failed, `9104` a decision came back without a code.
+- `interaction_hash` — the audit row's id, `""` when no row was written.
 
-**Proceed only on `"allow"`.** Treating anything else as permission defeats the
-point of a fail-closed gate.
+**Proceed only on `"allow"`** — or, stricter, only on the allow codes you know
+(`4301`/`4302` for v2), which also refuses a code minted after you wrote the
+check. Treating anything else as permission defeats the point of a fail-closed
+gate.
 
-## Authorizing a call
+## Authorizing a call (v2)
 
-`authorize` takes everything as arguments — for an enforcement point that
-parsed the governance context off the wire (a gateway) or read it from a queue
-message. Nothing is looked up ambiently.
+```python
+from cbac import authorize_call
+
+decision, code, _ = await authorize_call(
+    agent_id,
+    intent_id,  # one per user request, minted where the request arrives
+    user_query,  # that request, verbatim
+    tool,  # the tool's name as the policy's catalog lists it
+    args,  # the call's arguments, as the tool will receive them
+    mcp_did=MCP_DID,
+    callee_type="mcp",
+    cbac_url=CBAC_URL,
+)
+if decision != "allow":
+    ...  # blocked — do not run the call
+```
+
+Send the same `intent_id` and `user_query` on every call made for one user
+request. The first call with a new `intent_id` makes the service parse the
+query into that request's grants; every later call reuses them and is denied
+(`4002`) if it pairs the id with a different query. A new user request gets a
+new `intent_id`.
+
+## Authorizing a call (v1)
 
 ```python
 from cbac import authorize
 
-result = await authorize(
+decision, code, _ = await authorize(
     agent_id,
     mcp_did,
     callee_name,
@@ -70,47 +94,42 @@ result = await authorize(
     intent_id,
     callee_type="mcp",
     cbac_url=CBAC_URL,
-    cbac_timeout=CBAC_TIMEOUT,
 )
-if result.decision != "allow":
-    ...  # blocked — do not run the call
 ```
 
 `description` is the callee's own description — a schema field, a docstring's
-first line. Pass it: the service uses it as the verb phrase and falls back to
-the de-snaked `callee_name` without it, and an enforcement point that has the
-real description scores far better than one working from the name alone.
+first line. The service uses it as the verb phrase of the text it scores and
+falls back to the de-snaked `callee_name` without it. `intent_id` is only a
+correlation id here, threaded to the audit row and its hash.
 
-`callee_type` (`"mcp_tool"`, `"tool"`, `"agent"`) labels the other end of the
-edge whose trust score the service updates while deciding. `mcp_did` names the
-MCP server the call is bound for — your own routing config, not something the
-caller tells you; it is recorded on the trust row and comes back from
-`POST /cbac/v1/lhi-scores`, but it is not part of the edge key and nothing
-scores it. `intent_id` is your own opaque correlation id, threaded unchanged to
-the audit row and its hash — CBAC never parses it.
+In both, `callee_type` (`"mcp_tool"`, `"tool"`, `"agent"`) labels the other end
+of the edge whose trust score the service updates while deciding, and `mcp_did`
+names the MCP server the call is bound for — your own routing config, recorded
+on the trust row and returned by `POST /cbac/v1/lhi-scores`, never scored.
 
 ## What goes on the wire
 
-Mechanical facts, not a rendered sentence:
+Mechanical facts, never a rendered sentence. v2:
 
 ```json
 {
-  "agent_id": "...", "mcp_did": "...",
-  "callee_name": "...", "callee_type": "mcp_tool",
-  "callee_description": "...", "arguments": {"repo": "acme/api"},
-  "user_intent": "...", "intent_id": null
+  "agent_id": "...", "intent_id": "...", "user_query": "...",
+  "tool": "send_invite", "arguments": {"to": ["bob@company.com"], "body": "..."},
+  "callee_type": "mcp", "mcp_did": "..."
 }
 ```
 
-The service phrases those into the text its scorers see, so an enforcement
-point cannot word a call into a different verdict — and a port of this layer to
-another language needs no port of the rendering. Argument values are stringified
-first, so a `datetime` or a dataclass argument cannot fail the call closed on
-JSON encoding.
+`arguments` keeps its structure — the service checks each item of a
+list-valued recipient — and anything JSON cannot encode (a `datetime`) is sent
+as its `str`.
 
-The trust score (LHI) is folded in service-side while the decision is reached,
-so there is exactly one HTTP call per action and no component score ever
-round-trips through the client.
+v1 sends `agent_id`, `mcp_did`, `callee_name`, `callee_type`,
+`callee_description`, `arguments` (every value stringified), `user_intent` and
+`intent_id`; the service phrases them into the text its scorers see, so an
+enforcement point cannot word a call into a different verdict.
+
+Either way the trust score (LHI) is folded in service-side while the decision
+is reached, so there is exactly one HTTP call per action.
 
 ## MCP (`cbac.mcp`)
 
@@ -127,40 +146,50 @@ client = MultiServerMCPClient({...}, tool_interceptors=[cbac_propagate])
 ```
 
 `cbac_propagate` attaches the ambient context as headers and nothing else — it
-calls no service and can deny nothing. That context is opened once, at the
-request entry point:
+calls no service and can deny nothing. That context is opened once, where the
+user's request arrives:
 
 ```python
+import uuid
+
 from cbac import cbac_context
 
-with cbac_context(agent_id="github-worker", user_intent="Close issue #3 in acme/api"):
+with cbac_context(
+    agent_id="github-worker",
+    user_intent="Close issue #3 in acme/api",
+    intent_id=uuid.uuid4().hex,
+):
     ...  # every MCP call made in here goes out labelled
 ```
 
 It lives in a `contextvars.ContextVar`, never a function argument, so an LLM can
 neither supply nor forge it. Without an open scope `cbac_propagate` is a
-passthrough — the calls still reach the gateway, just unlabelled.
+passthrough — the calls still reach the gateway, just unlabelled, and the v2
+gate denies a call that carries no intent.
 
 Gateway side:
 
 ```python
+from cbac import authorize_call
 from cbac.mcp import context_from_headers, denial_body
 
 ctx = context_from_headers(get_http_headers())  # None when unlabelled
-result = await authorize(ctx.agent_id, ..., cbac_url=CBAC_URL)
-if result.decision != "allow":
-    raise ToolError(denial_body(result.decision, result.message))
+result = await authorize_call(
+    ctx.agent_id,
+    ctx.intent_id,
+    ctx.user_intent,
+    tool_name,
+    tool_args,
+    mcp_did=MCP_DID,
+    cbac_url=CBAC_URL,
+)
+if result[1] not in {4301, 4302}:
+    raise ToolError(denial_body(*result))
 ```
 
-`denial_body` renders `{"status": "denied"|"error", "error": ...}` — the same
-shape every enforcement point returns, so a client cannot tell whether the
-block came from an in-process gate, an interceptor, or a gateway several
-hops away.
-
-The developer holds no security logic and cannot switch the check off: deleting
-`cbac_propagate` does not bypass the gateway, it only makes calls arrive
-unlabelled. What a gateway does with an unlabelled call is the gateway's
-policy — deny it outright, or decide it on policy alone with no drift signal.
+`denial_body(decision, status_code, interaction_hash)` renders
+`{"status": "denied"|"error", "error": ..., "decision": ..., "status_code": ...,
+"hash": ...}` — the same shape every enforcement point returns.
 
 ### The headers
 
@@ -168,29 +197,26 @@ policy — deny it outright, or decide it on policy alone with no drift signal.
 | --- | --- |
 | `X-CBAC-Agent-Id` | whose policy applies |
 | `X-CBAC-User-Intent` | what the user actually asked for |
-| `X-CBAC-Intent-Id` | the caller's correlation id, when there is one |
+| `X-CBAC-Intent-Id` | the id of that request |
 
 All are percent-encoded (headers are latin-1 and size-capped; a user intent is
 arbitrary UTF-8), and the intent is capped at 4096 encoded characters without
-ever cutting an escape in half — a truncated intent is still a usable drift
-signal, a rejected request is not. `cbac_headers()` produces them from the
-ambient context and returns `{}` when governance is off, for clients whose
-transport takes headers on the connection rather than per call. The intent id
-is sent only when the workflow minted one, so a deployment that uses no
-correlation ids puts no empty header on every call.
+ever cutting an escape in half. `cbac_headers()` produces them from the ambient
+context and returns `{}` when governance is off, for clients whose transport
+takes headers on the connection rather than per call. The intent id is sent
+only when the workflow minted one.
 
-**Trust boundary.** Both values are client-supplied. `user_intent` is
-unverifiable by anyone — only the client knows what the user asked — so CBAC
-scores it as *evidence* (a drift signal), never as identity. `agent_id` decides
-whose policy applies, which is exactly what a compromised client would lie
-about; a gateway that cannot trust its callers should derive it from its
-authenticated principal (OAuth subject, mTLS SAN, API key) and treat the header
-as a fallback for a trusted network only. `intent_id` is neither identity nor
-evidence — CBAC never parses it, only threads it to the audit row and its hash,
-so a client that forges one corrupts its own trace and nothing else. `mcp_did`
-travels in no header at all: the gateway routes the call, so it is the one party
-that knows where the call went, and asking the client would only let it
-misreport that.
+**Trust boundary.** All three values are set by the agent's *runtime*, never by
+its model: the LLM emits tool calls, not headers. That is what v2 rests on —
+`user_intent` is the source of the request's grants, so whatever sends the
+headers decides what can be granted, and a compromised runtime can ask for
+anything its policy allows. `agent_id` decides whose policy applies; a gateway
+that cannot trust its callers should derive it from its authenticated principal
+(OAuth subject, mTLS SAN, API key) and treat the header as a fallback for a
+trusted network only. `intent_id` binds a request's grants to its query, so
+mint it unguessable (`uuid4`) and never reuse it across requests. `mcp_did`
+travels in no header at all: the gateway routes the call, so it is the one
+party that knows where the call went.
 
 The context travels as headers because that is the only per-call channel MCP
 client adapters expose today. `_meta` is the protocol-native place for it;

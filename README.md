@@ -7,6 +7,16 @@ A standalone FastAPI decision service that answers one question per agent action
 back `allow` / `deny`. Reaching a decision also folds the component scores into
 the caller→callee trust score, so a guard makes exactly one call per action.
 
+It runs two gates:
+
+- **v2** (`/cbac/v2/*`) — permissions come from trusted inputs only. An LLM
+  parses the admin's policy into deny rules and the user's query into exact
+  grants, both stored as OpenFGA tuples. Each tool call is mapped to tuples by
+  code and checked; only its free-text arguments get semantic (NLI) checks, and
+  those can only deny.
+- **v1** (`/cbac/v1/*`) — the whole call is scored semantically against the
+  policy text.
+
 ## Layout
 
 | Path | What it is |
@@ -21,7 +31,10 @@ from there — except Alembic and Docker Compose, which read config relative to
 
 ## Prerequisites
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (for Postgres)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (for Postgres
+  and OpenFGA)
+- For the v2 parsers: [Ollama](https://ollama.com) with the configured model
+  pulled (`ollama pull qwen3:14b`), or a Claude API key
 - [uv](https://docs.astral.sh/uv/) — `brew install uv`
 - Python `>=3.10,<3.13`
 
@@ -39,11 +52,25 @@ Installs every dependency (`agent-dna`, FastAPI, SQLAlchemy, the ML stack) into
 `.venv/`. `--locked` fails if `uv.lock` has drifted from `pyproject.toml`
 instead of silently re-resolving — the same thing CI does.
 
-### 2. Build the Docker image and start Postgres
+### 2. Build the Docker image and start Postgres and OpenFGA
 
 ```bash
 cd cbac_service
 docker compose --env-file .env.dev build
+docker compose --env-file .env.dev up -d
+```
+
+Set `OPENFGA_API_TOKEN` in the env file first: compose refuses to start OpenFGA
+without its pre-shared key, because whoever can write to the store can mint
+grants. OpenFGA's HTTP API is published on loopback only, at
+`OPENFGA_HTTP_PORT`, and keeps its tuples in an `openfga` database inside the
+same Postgres (the one-shot `openfga-migrate` service creates its tables).
+`init-extensions.sql` creates that database on a fresh volume; on a volume
+that predates it, create it once:
+
+```bash
+docker compose --env-file .env.dev exec postgres \
+  sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE DATABASE openfga"'
 docker compose --env-file .env.dev up -d
 ```
 
@@ -189,9 +216,18 @@ All settings are environment variables; defaults live in `cbac_service/config.py
 | `AGENTDNA_API_KEY` | `""` | Provenance Layer access |
 | `CBAC_SERVICE_HOST` | `127.0.0.1` | Bind address (`python -m` entrypoint only) |
 | `CBAC_SERVICE_PORT` | `8767` | Bind port (`python -m` entrypoint only) |
-| `HYBRID_SEARCH_ENABLED` | `true` | Toggle BM25 fusion alongside vector search |
+| `HYBRID_SEARCH_ENABLED` | `false` | Toggle BM25 fusion alongside vector search |
 | `VECTOR_INDEX_TYPE` | `hnsw` | `hnsw` (low latency) or `ivfflat` (large scale) |
 | `RRF_K` | `60` | Reciprocal Rank Fusion constant; higher = less aggressive re-ranking |
+| `OPENFGA_API_URL` | `http://localhost:8080` | The OpenFGA HTTP API |
+| `OPENFGA_STORE_NAME` | *(required)* | Store found or created at startup — one per environment. Unset = every v2 call denies (`4104`) |
+| `OPENFGA_API_TOKEN` | `""` | OpenFGA's pre-shared key (compose requires it) |
+| `INTENT_TTL_SECONDS` | `3600` | How long an intent's grants stay live |
+| `POLICY_PARSER_MODEL` | `ollama:qwen3:14b` | `<backend>:<model>`, backend `ollama` or `anthropic` |
+| `QUERY_PARSER_MODEL` | `ollama:qwen3:14b` | Same format; runs on the first call of each intent |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama server |
+| `ANTHROPIC_API_KEY` | `""` | For an `anthropic:` model; empty lets the SDK find credentials itself |
+| `CBAC_POLICY_KEY` | `""` | Shared secret for `/cbac/v2/policies*` (`X-CBAC-Key`); unset = refuse all |
 
 **The built-in `DATABASE_URL` default is a local macOS socket connection and does
 not match Docker Compose.** Export it as shown in the Quick Start whenever you
@@ -212,7 +248,11 @@ same envelope with HTTP 422 and the field errors under `data.errors`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/cbac/v1/authorize` | The decision gate. `data.decision` is `allow`/`deny`/`advise`/`error` (also mirrored in the `X-CBAC-Decision` header for proxies) and `message` the reason. Folds the component scores into the caller→callee trust score |
+| `POST` | `/cbac/v2/policies` | Upload `{agent_id, policy?, trusted_data?, review_required?}` — the policy document (instructions and tool schemas in one Markdown file, see below) and optionally the agent's trusted data. The new version activates at once, unless `review_required` (default `false`) holds it pending for approval. A document that does not split is a 422. Returns the parsed version: catalog, deny rules, and what was rejected or cannot be enforced. Needs `X-CBAC-Key` |
+| `GET` | `/cbac/v2/policies/{agent_id}` | The agent's active and pending versions. Needs `X-CBAC-Key` |
+| `POST` | `/cbac/v2/policies/{agent_id}/approve` | `{version_id}` — activate a pending version. Needs `X-CBAC-Key` |
+| `POST` | `/cbac/v2/authorize` | The v2 gate: `{agent_id, intent_id, user_query, tool, arguments, callee_type, mcp_did}` → `{decision, status_code, hash}`. Allow codes are `4301`/`4302` |
+| `POST` | `/cbac/v1/authorize` | The v1 gate. `data.decision` is `allow`/`deny`/`error` (also mirrored in the `X-CBAC-Decision` header for proxies) and `message` the reason. Folds the component scores into the caller→callee trust score |
 | `GET` | `/cbac/v1/decisions?agent_id=&limit=&offset=` | An agent's decision history, newest first |
 | `GET` | `/cbac/v1/decisions/{id}` | One decision by id |
 | `GET` | `/cbac/v1/decisions/by-hash/{interaction_hash}` | One decision by its interaction hash |
@@ -220,7 +260,53 @@ same envelope with HTTP 422 and the field errors under `data.errors`.
 | `POST` | `/cbac/v1/lhi-scores` | Current trust for a batch of agents (`{"agent_ids": [...]}`), one entry per caller→callee edge |
 | `GET` | `/health` | Database connectivity check. Unversioned on purpose — probes are wired once and must not track API versions |
 
-## How a decision is made
+## How a decision is made (v2)
+
+**The policy is one Markdown document** holding both the instructions and the
+schemas of the tools they govern, in sections separated by lines that are
+exactly `---`:
+
+```
+---
+Policy Instructions
+<the policy, in prose>
+---
+Tool Schema
+<JSON: a list of MCP tools, or a tools/list result {"tools": [...]}>
+---
+```
+
+The service splits it in code — both sections required, the JSON optionally in
+a fenced code block. **Once per policy version**, `POST /cbac/v2/policies` then
+has an LLM read the instructions and the tool schemas and return a *catalog* — for each tool, which
+arguments are resources (a recipient, a path, a URL, an id) and which are free
+text — plus deny rules and the statements no rule can express (numeric limits,
+"only X"). Code then checks it: every argument of every schema must be
+classified, an argument typed `email`/`uri` must be a resource, every deny rule
+must quote the policy verbatim. Exact deny rules become OpenFGA deny tuples.
+
+**On the first call of each user request** (a new `intent_id`), an LLM parses
+the user's query — with the agent's trusted data, such as a contacts list — into
+grants, keeps only the ones whose resource appears in the query or the trusted
+data, and writes them as allow tuples that expire after `INTENT_TTL_SECONDS`.
+Later calls with that `intent_id` reuse them, and must carry the same query.
+
+**Every call** then goes through, in order:
+
+1. **Mapping** — the catalog maps the call's arguments to resources, normalized
+   (an address with a display name, `..` in a path, letter case). An unknown
+   tool, an unknown argument, or a value that cannot be normalized is a deny.
+2. **Glob deny rules** (`*@competitor.com`, `/etc/*`) — matched in the service.
+3. **OpenFGA** — every resource needs an unexpired allow tuple and no deny
+   tuple.
+4. **Semantic checks** on free-text arguments only, and only able to deny:
+   intent drift (does the text contradict the user's query?) and policy drift
+   (Tier 1 cosine gap, Tier 2 NLI against the policy chunks).
+
+`status_code` names the check that decided (`cbac_service/error_codes.py`,
+the 4000s). Any error is a deny.
+
+## How a decision is made (v1)
 
 Each request walks a tiered pipeline, escalating only when the cheaper tier is
 inconclusive:
@@ -250,6 +336,10 @@ inconclusive/misbehaving Tier 3, becomes a `deny`.
 - **Database:** PostgreSQL 18 with `pgvector` (cosine similarity) and
   `pg_textsearch` (BM25 keyword search), combined for hybrid retrieval via
   Reciprocal Rank Fusion.
+- **Tuples:** OpenFGA v1.22.0 (`cbac_service/fga_model.json`) holds v2's allow
+  and deny tuples; its datastore is the `openfga` database in the same
+  Postgres. `policy_versions` and `cbac_intents` keep the readable record of
+  what was written there and why.
 - **Migrations** are managed with Alembic (async, `asyncpg` driver). Models live
   in `cbac_service/db/models.py`, migrations in
   `cbac_service/db/migrations/versions/`.
