@@ -44,17 +44,22 @@ Modules:
 - `main.py` — the HTTP boundary: `app = FastAPI()`, the lazy `CBAC` singleton,
   DB and OpenFGA lifecycle via lifespan, and the `__main__` uvicorn runner.
 - `cbac.py` — the decision engine (class `CBAC`), no HTTP. Both gates.
-- `ibac.py` — v2's deterministic half, pure functions: resource
-  normalization, OpenFGA object/user ids, catalog validation.
-- `parsers.py` — v2's two LLM parsers (`parse_policy`, `parse_query`), the
-  `chat_json` backend dispatch (Ollama over stdlib HTTP, or the Claude API),
-  and the validation of everything they return.
+- `ibac.py` — v2's deterministic half, pure functions: the canonical form of a
+  resource value, OpenFGA object/user ids, catalog validation. Domain-neutral:
+  nothing in it knows what an email, a path or a URL is.
+- `parsers.py` — policy text in, structures out. Deterministic: structure-aware
+  chunking for the embedding index (`flatten_policy_chunks`, used by both
+  gates), the hard word cap that keeps every chunk and every free-text window
+  inside the cross-encoders' 512 tokens (`split_by_word_budget`), and the v2
+  document split (`split_policy_document`). LLM: v2's two parsers
+  (`parse_policy`, `parse_query`), the `chat_json` backend dispatch (Ollama
+  over stdlib HTTP, or the Claude API), and the validation of everything they
+  return.
 - `fga.py` + `fga_model.json` — OpenFGA access: store binding, tuple writes,
   checks.
 - `config.py` — pipeline tunables as module-level constants (`ALLOW_GAP`,
   `ENCODER_MODEL`, `LHI_WEIGHTS`, `DATABASE_URL`, …). Change a value here and
   redeploy.
-- `chunking.py` — structure-aware policy-text chunking (`chunk_body_text`).
 - `skills.py` — `skill.md` parsing, `render_intent`, the CBAC result dataclasses.
 - `entity.py` — pydantic request models for the HTTP API.
 - **Not published as a wheel** (`[tool.uv] package = false`). Deployed from a
@@ -65,10 +70,10 @@ Modules:
   are pydantic models in `entity.py`; a schema violation answers in the same
   envelope with 422 via the `RequestValidationError` handler.
 - Endpoints:
-  - **`POST /cbac/v2/policies`** — `{agent_id, policy?, trusted_data?,
+  - **`POST /cbac/v2/policies`** — `{agent_id, policy, trusted_data?,
     review_required?}`: upload a policy document (instructions + tool schemas
-    in one Markdown file, see "The v2 pipeline"; omitted, it is the agent's
-    card on the Provenance Layer) and optional trusted data; the policy parser
+    in one Markdown file, see "The v2 pipeline"; required — v2 never reads the
+    Provenance Layer) and optional trusted data; the policy parser
     turns them into a new `policy_versions` row, activated at once unless
     `review_required` (default `false`) holds it `pending` for approval. A
     document that does not split is a 422. Requires `X-CBAC-Key:
@@ -142,9 +147,9 @@ The service uses **PostgreSQL 18** with two extensions:
   chunked for policy drift), and the hash of the whole document
 - `tool_schemas` / `trusted_data` — the document's tool schemas, and the
   upload's trusted data (`{}` when none)
-- `catalog` — tool name → `{resources: [{arg, action, kind}], free_text: [arg],
-  description}`, validated
-- `deny_rules` — `[{action, match: exact|glob, resource, source}]`
+- `catalog` — tool name → `{resources: [arg], free_text: [arg], description}`,
+  validated
+- `deny_rules` — `[{tool, match: exact|glob, resource, source}]`
 - `rejected` / `unenforceable` — what validation threw out, and the policy
   statements no tuple can express
 - `status` — `pending` | `active` | `superseded`; the active version is the
@@ -268,14 +273,24 @@ Tool Schema
 
 Both sections are required, each once; the JSON may be in a fenced code block.
 Then `parse_policy` makes one LLM pass over the instructions and the tools that
-returns the **catalog** (per tool: which top-level arguments are
-*resources* — `email | path | url | id`, each with an `<area>:<verb>` action —
-and which are *free text*), the **deny rules**, and the **unenforceable**
-statements. `ibac.validate_catalog` then checks it in code: every schema
-property classified (coverage — a forgotten `bcc` is an open channel), a
-property with `format: email|uri|…` must be a resource of that kind, one kind
-per action. A tool that fails is left out of the catalog, so calls to it are
-denied. Each deny rule's `source` must be a verbatim quote of the policy.
+returns the **catalog** (per tool: which top-level arguments are *resources* —
+values that name what the call acts on, checked exactly — and which are *free
+text*), the **deny rules** (per tool: an exact value or a glob over its
+resource values, `*` for the whole tool), and the **unenforceable** statements.
+`ibac.validate_catalog` then checks the catalog's shape in code: every schema
+property classified exactly once (coverage — a forgotten argument is an open
+channel). Which class an argument belongs to is the parser's judgment; nothing
+second-guesses it, so an identifier misclassified as free text gets only the
+semantic checks — `review_required` is the mitigation. A tool that fails is
+left out of the catalog, so calls to it are denied. Each deny rule's `source`
+must be a verbatim quote of the policy.
+
+The capability is IBAC's *(tool, resource)*, and the system is deliberately
+domain-neutral: no resource types, no per-domain normalization. A resource
+value is compared in one canonical form (`ibac.canonical`: strings NFC +
+trimmed, numbers and booleans as JSON, so `3` and `"3"` agree), and any other
+spelling is a different resource. Under exact allow-listing that can only
+produce a false deny, never a false allow.
 Activation (`activate_policy_version`) re-indexes the policy chunks
 (`index_policy`, for policy drift), swaps the exact deny tuples in OpenFGA, and
 only then flips the rows. An upload with `review_required: true` stays
@@ -286,14 +301,17 @@ only then flips the rows. An upload with `review_required: true` stays
 
 1. **Intent.** Empty `intent_id`/`user_query` → 4001. Under a transaction-scoped
    advisory lock on the intent id: an unseen id runs `parse_query` (query +
-   trusted data → grants, each resource grounded in the query or trusted data),
+   trusted data → grants of `{tool, argument, resource}`, one value each; the
+   argument must be one of the tool's resources and the value grounded in the
+   query or trusted data — the tuple itself is *(tool, resource)*),
    writes the allow tuples, and stores the `cbac_intents` row; a seen id must
    carry the same query and agent (4002) and be unexpired (4003). A failed
    parse stores nothing (4004), so the next call retries.
 2. **Mapping.** The active version's catalog: unknown tool 4005, an argument
-   that is neither resource nor free text 4006, a resource that fails
-   `ibac.normalize` 4007, no resource value 4008, no active version 4009. A
-   tool with no resource arguments is the resource `tool:<name>#*`.
+   that is neither resource nor free text 4006, a resource value with no
+   canonical form (an object, an empty string) 4007, no resource value 4008, no
+   active version 4009. A tool with no resource arguments has the single
+   resource `*`. A list-valued resource argument is checked item by item.
 3. **Glob deny rules**, matched in the service (OpenFGA cannot wildcard an
    object id) → 4101.
 4. **OpenFGA**: each resource needs a live allow tuple and no deny tuple —
@@ -308,10 +326,13 @@ only then flips the rows. An upload with `review_required: true` stays
 6. **Allow**: 4301 (no free text) or 4302 (free text passed).
 
 Tuple shapes (`fga_model.json`): allow `(user:<sha256(intent_id)>, can_invoke,
-tool_invocation:<sha256(agent_id, action#resource)>)` with a
+tool_invocation:<sha256(agent_id, tool#resource)>)` with a
 `non_expired_grant` condition; deny `(user:*, blocked, …)`. Object ids are
-hashed so OpenFGA's id limits never meet a raw email or URL, and agent-scoped
-so one agent's deny never matches another's call. The readable forms are in
+hashed so OpenFGA's id limits never meet a raw value, and agent-scoped so one
+agent's deny never matches another's call.
+
+Known limit (also IBAC's): each resource argument is checked on its own, so a
+tool with two resource arguments accepts any combination of granted values. The readable forms are in
 `policy_versions` and `cbac_intents`.
 
 `authorize_call` wraps `_authorize_call` the way `verify_cbac` wraps `_decide`:

@@ -18,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cbac_service import error_codes as ec
 from cbac_service import fga
-from cbac_service.chunking import flatten_policy_chunks
 from cbac_service.config import (
     ALLOW_GAP,
     CHUNK_MAX_WORDS,
@@ -53,14 +52,20 @@ from cbac_service.db.repository import (
 )
 from cbac_service.db.search import SearchResult, hybrid_search, vector_search
 from cbac_service.ibac import (
+    WHOLE_TOOL,
     NormalizationError,
+    canonical,
     fga_user,
-    normalize,
     object_id,
     resource_values,
-    tool_action,
 )
-from cbac_service.parsers import parse_policy, parse_query, split_policy_document
+from cbac_service.parsers import (
+    flatten_policy_chunks,
+    parse_policy,
+    parse_query,
+    split_by_word_budget,
+    split_policy_document,
+)
 from cbac_service.skills import (
     VALID_LLM_DECISIONS,
     CBACResult,
@@ -160,18 +165,6 @@ def _as_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-
-
-def _windows(text: str, max_words: int = CHUNK_MAX_WORDS) -> list[str]:
-    """Split free text into windows the cross-encoders read whole.
-
-    Plain word windows, nothing dropped: both models truncate past 512 tokens,
-    and text after the cut would otherwise never be scored.
-    ponytail: no overlap, so a contradiction straddling a window boundary is
-    scored in two halves; add a stride if that shows up in evals.
-    """
-    words = text.split()
-    return [" ".join(words[i : i + max_words]) for i in range(0, len(words), max_words)]
 
 
 class CBAC:
@@ -1055,7 +1048,7 @@ class CBAC:
         self,
         session: AsyncSession,
         agent_id: str,
-        policy: str | None,
+        policy: str,
         trusted_data: dict,
         review_required: bool = False,
     ) -> PolicyVersion:
@@ -1068,17 +1061,12 @@ class CBAC:
         keeps deciding.
 
         ``policy`` is the whole document — instructions and tool schemas, see
-        :func:`~cbac_service.parsers.split_policy_document` — and defaults to
-        the agent's card on the Provenance Layer. The version row stores the
-        two halves apart (``policy`` is the instructions alone, which is what
-        gets chunked for policy drift) and hashes the whole document. The row
-        is written before activation, so a failed activation leaves it
-        ``pending`` and retryable through approval.
+        :func:`~cbac_service.parsers.split_policy_document`. The version row
+        stores the two halves apart (``policy`` is the instructions alone,
+        which is what gets chunked for policy drift) and hashes the whole
+        document. The row is written before activation, so a failed activation
+        leaves it ``pending`` and retryable through approval.
         """
-        if policy is None:
-            policy = await asyncio.to_thread(self._get_latest_agent_policy, agent_id)
-        if not policy:
-            raise RuntimeError(f"No policy found for agent {agent_id}")
         instructions, tools = split_policy_document(policy)
         parsed = await parse_policy(POLICY_PARSER_MODEL, instructions, tools)
         version = await insert_policy_version(
@@ -1116,7 +1104,7 @@ class CBAC:
             if v is None:
                 return []
             return [
-                object_id(v.agent_id, r["action"], r["resource"])
+                object_id(v.agent_id, r["tool"], r["resource"])
                 for r in v.deny_rules
                 if r["match"] == "exact"
             ]
@@ -1211,7 +1199,7 @@ class CBAC:
             return _deny(
                 f"Tool {tool!r} is not in the agent's catalog", ec.MAPPING_UNKNOWN_TOOL
             )
-        known = {r["arg"] for r in entry["resources"]} | set(entry["free_text"])
+        known = set(entry["resources"]) | set(entry["free_text"])
         unknown = sorted(arg for arg in arguments if arg not in known)
         if unknown:
             return _deny(
@@ -1219,30 +1207,30 @@ class CBAC:
                 ec.MAPPING_UNKNOWN_ARGUMENT,
             )
 
-        resources: list[tuple[str, str]] = []
+        resources: list[str] = []
         if not entry["resources"]:
-            resources.append((tool_action(tool), "*"))
-        for res in entry["resources"]:
-            for value in resource_values(arguments, res["arg"]):
+            resources.append(WHOLE_TOOL)
+        for arg in entry["resources"]:
+            for value in resource_values(arguments, arg):
                 try:
-                    resources.append((res["action"], normalize(res["kind"], value)))
+                    resources.append(canonical(value))
                 except NormalizationError as exc:
                     return _deny(
-                        f"{tool}.{res['arg']}: {exc}", ec.MAPPING_NORMALIZATION_FAILED
+                        f"{tool}.{arg}: {exc}", ec.MAPPING_NORMALIZATION_FAILED
                     )
         if not resources:
             return _deny(f"Call to {tool!r} names no resource", ec.MAPPING_NO_RESOURCE)
 
         # 3. Glob deny rules.
-        for action, resource in resources:
+        for resource in resources:
             for rule in version.deny_rules:
                 if (
                     rule["match"] == "glob"
-                    and rule["action"] == action
+                    and rule["tool"] == tool
                     and fnmatch.fnmatchcase(resource, rule["resource"])
                 ):
                     return _deny(
-                        f"{action}#{resource} matches deny rule "
+                        f"{tool}#{resource} matches deny rule "
                         f"{rule['resource']!r} ({rule['source']!r})",
                         ec.AUTHZ_GLOB_DENY,
                     )
@@ -1251,10 +1239,10 @@ class CBAC:
         user = fga_user(intent_id)
         try:
             refused: tuple[str, bool] | None = None
-            for action, resource in resources:
-                obj = object_id(agent_id, action, resource)
+            for resource in resources:
+                obj = object_id(agent_id, tool, resource)
                 if not await fga.can_invoke(user, obj, now):
-                    refused = (f"{action}#{resource}", await fga.is_blocked(user, obj))
+                    refused = (f"{tool}#{resource}", await fga.is_blocked(user, obj))
                     break
         except Exception as exc:
             return _deny(f"OpenFGA check failed: {exc}", ec.AUTHZ_FGA_ERROR)
@@ -1276,7 +1264,7 @@ class CBAC:
         if not texts:
             return CBACResult(
                 decision="allow",
-                reason=f"Granted: {', '.join(f'{a}#{r}' for a, r in resources)}",
+                reason=f"Granted: {', '.join(f'{tool}#{r}' for r in resources)}",
                 error_code=ec.ALLOW_NO_FREE_TEXT,
             )
         return await self._semantic_checks(session, agent_id, user_query, texts)
@@ -1319,7 +1307,7 @@ class CBAC:
             return None, _deny(f"Query parser failed: {exc}", ec.INTENT_PARSE_FAILED)
 
         now = datetime.now(timezone.utc)
-        objects = [object_id(agent_id, g["action"], g["resource"]) for g in grants]
+        objects = [object_id(agent_id, g["tool"], g["resource"]) for g in grants]
         try:
             if objects:
                 await fga.write_grants(
@@ -1382,7 +1370,11 @@ class CBAC:
     ) -> CBACResult:
         """Intent drift and policy drift over every window of every free-text
         argument; HHEM attached, never gating."""
-        windows = [(arg, w) for arg, text in texts for w in _windows(text)]
+        windows = [
+            (arg, w)
+            for arg, text in texts
+            for w in split_by_word_budget(text, CHUNK_MAX_WORDS)
+        ]
         try:
             scores = await asyncio.to_thread(
                 self._nli_scores_batch, [(user_query, w) for _, w in windows]

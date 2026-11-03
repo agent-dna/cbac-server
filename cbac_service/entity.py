@@ -77,9 +77,9 @@ class PolicyUploadRequest(BaseModel):
 
     ``policy`` is one Markdown document holding both the instructions and the
     tool schemas they govern, as ``---``-separated ``Policy Instructions`` and
-    ``Tool Schema`` sections (see ``parsers.split_policy_document``). Omitted,
-    it is the agent's card on the Provenance Layer, in the same format.
-    ``trusted_data`` is what the query parser may resolve names through — a
+    ``Tool Schema`` sections (see ``parsers.split_policy_document``). Required:
+    the tool schemas exist only in this document, so there is nowhere else to
+    take them from. ``trusted_data`` is what the query parser may resolve names through — a
     contacts directory, known repositories — and is trusted because an admin
     supplied it here, never because an agent did.
 
@@ -90,7 +90,7 @@ class PolicyUploadRequest(BaseModel):
     """
 
     agent_id: str = Field(min_length=1)
-    policy: str | None = None
+    policy: str = Field(min_length=1)
     trusted_data: dict[str, Any] = Field(default_factory=dict)
     review_required: bool = False
 

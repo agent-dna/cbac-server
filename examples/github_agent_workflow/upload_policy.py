@@ -40,8 +40,8 @@ async def gateway_schemas() -> list[dict]:
         for t in tools
     ]
     # The gateway authorizes resources/read as a call to the template's name
-    # with one argument, the URI. No `format: uri`: these URIs use their own
-    # schemes (github://…), so the parser should treat them as plain ids.
+    # with one argument, the URI, so each template is uploaded as a tool-like
+    # schema with that one argument.
     schemas += [
         {
             "name": t.name,

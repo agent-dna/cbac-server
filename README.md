@@ -248,7 +248,7 @@ same envelope with HTTP 422 and the field errors under `data.errors`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/cbac/v2/policies` | Upload `{agent_id, policy?, trusted_data?, review_required?}` — the policy document (instructions and tool schemas in one Markdown file, see below) and optionally the agent's trusted data. The new version activates at once, unless `review_required` (default `false`) holds it pending for approval. A document that does not split is a 422. Returns the parsed version: catalog, deny rules, and what was rejected or cannot be enforced. Needs `X-CBAC-Key` |
+| `POST` | `/cbac/v2/policies` | Upload `{agent_id, policy, trusted_data?, review_required?}` — the policy document (instructions and tool schemas in one Markdown file, see below; required) and optionally the agent's trusted data. The new version activates at once, unless `review_required` (default `false`) holds it pending for approval. A document that does not split is a 422. Returns the parsed version: catalog, deny rules, and what was rejected or cannot be enforced. Needs `X-CBAC-Key` |
 | `GET` | `/cbac/v2/policies/{agent_id}` | The agent's active and pending versions. Needs `X-CBAC-Key` |
 | `POST` | `/cbac/v2/policies/{agent_id}/approve` | `{version_id}` — activate a pending version. Needs `X-CBAC-Key` |
 | `POST` | `/cbac/v2/authorize` | The v2 gate: `{agent_id, intent_id, user_query, tool, arguments, callee_type, mcp_did}` → `{decision, status_code, hash}`. Allow codes are `4301`/`4302` |
@@ -278,25 +278,33 @@ Tool Schema
 
 The service splits it in code — both sections required, the JSON optionally in
 a fenced code block. **Once per policy version**, `POST /cbac/v2/policies` then
-has an LLM read the instructions and the tool schemas and return a *catalog* — for each tool, which
-arguments are resources (a recipient, a path, a URL, an id) and which are free
-text — plus deny rules and the statements no rule can express (numeric limits,
-"only X"). Code then checks it: every argument of every schema must be
-classified, an argument typed `email`/`uri` must be a resource, every deny rule
-must quote the policy verbatim. Exact deny rules become OpenFGA deny tuples.
+has an LLM read the instructions and the tool schemas and return a *catalog* —
+for each tool, which arguments are resources (values naming what the call acts
+on) and which are free text — plus deny rules over each tool's resource values
+and the statements no rule can express. Code then checks it: every argument of
+every schema must be classified, every deny rule must quote the policy
+verbatim. Exact deny rules become OpenFGA deny tuples.
 
 **On the first call of each user request** (a new `intent_id`), an LLM parses
-the user's query — with the agent's trusted data, such as a contacts list — into
-grants, keeps only the ones whose resource appears in the query or the trusted
-data, and writes them as allow tuples that expire after `INTENT_TTL_SECONDS`.
-Later calls with that `intent_id` reuse them, and must carry the same query.
+the user's query — with the agent's trusted data, if any — into grants of one
+tool, one of its resource arguments, and one value each, keeps only the ones
+whose argument belongs to the tool and whose value appears in
+the query or the trusted data, and writes them as allow tuples that expire
+after `INTENT_TTL_SECONDS`. Later calls with that `intent_id` reuse them, and
+must carry the same query.
+
+Nothing here is domain-specific. A resource value is compared exactly, in one
+canonical form (strings Unicode-normalized and trimmed; numbers and booleans as
+JSON, so `3` and `"3"` agree). Any other spelling is a different resource and
+is denied — a false deny, never a false allow.
 
 **Every call** then goes through, in order:
 
-1. **Mapping** — the catalog maps the call's arguments to resources, normalized
-   (an address with a display name, `..` in a path, letter case). An unknown
-   tool, an unknown argument, or a value that cannot be normalized is a deny.
-2. **Glob deny rules** (`*@competitor.com`, `/etc/*`) — matched in the service.
+1. **Mapping** — the catalog maps the call's arguments to resource values. An
+   unknown tool, an unknown argument, or a value with no canonical form (an
+   object, an empty string) is a deny.
+2. **Glob deny rules** — patterns over a tool's resource values, matched in the
+   service.
 3. **OpenFGA** — every resource needs an unexpired allow tuple and no deny
    tuple.
 4. **Semantic checks** on free-text arguments only, and only able to deny:

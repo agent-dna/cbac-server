@@ -28,24 +28,16 @@ QUERY = "Check today's calendar and tell Bob the meeting is at 3pm"
 TRUSTED = {"contacts": {"Bob": "bob@company.com", "CEO": "ceo@company.com"}}
 
 CATALOG = {
-    "read_calendar": {
-        "resources": [{"arg": "day", "action": "calendar:read", "kind": "id"}],
-        "free_text": [],
-    },
-    "send_invite": {
-        "resources": [{"arg": "to", "action": "calendar:invite", "kind": "email"}],
-        "free_text": ["body"],
-    },
-    "read_file": {
-        "resources": [{"arg": "path", "action": "file:read", "kind": "path"}],
-        "free_text": [],
-    },
+    "read_calendar": {"resources": ["day"], "free_text": []},
+    "send_invite": {"resources": ["to"], "free_text": ["body"]},
+    "read_file": {"resources": ["path"], "free_text": []},
+    "open_item": {"resources": ["item"], "free_text": []},
     "list_events": {"resources": [], "free_text": []},
 }
 DENY_RULES = [
-    {"action": "file:read", "match": "glob", "resource": "/etc/*", "source": "s"},
+    {"tool": "read_file", "match": "glob", "resource": "/etc/*", "source": "s"},
     {
-        "action": "calendar:invite",
+        "tool": "send_invite",
         "match": "exact",
         "resource": "ceo@company.com",
         "source": "s",
@@ -54,11 +46,12 @@ DENY_RULES = [
 # What the (fake) query parser proposes for QUERY. The CEO grant is grounded
 # in the trusted data; the exact deny tuple must still beat it.
 GRANTS = [
-    {"action": "calendar:read", "resource": "today"},
-    {"action": "calendar:invite", "resource": "bob@company.com"},
-    {"action": "calendar:invite", "resource": "ceo@company.com"},
-    {"action": "file:read", "resource": "/etc/hosts"},
-    {"action": "tool:list_events", "resource": "*"},
+    {"tool": "read_calendar", "argument": "day", "resource": "today"},
+    {"tool": "send_invite", "argument": "to", "resource": "bob@company.com"},
+    {"tool": "send_invite", "argument": "to", "resource": "ceo@company.com"},
+    {"tool": "read_file", "argument": "path", "resource": "/etc/hosts"},
+    {"tool": "open_item", "argument": "item", "resource": "3"},
+    {"tool": "list_events", "argument": "*", "resource": "*"},
 ]
 
 
@@ -99,7 +92,7 @@ class FakeSession:
 @pytest.fixture
 def world(rows, decisions, monkeypatch):
     fga = FakeFGA()
-    fga.denies.add(object_id(AGENT, "calendar:invite", "ceo@company.com"))
+    fga.denies.add(object_id(AGENT, "send_invite", "ceo@company.com"))
     version = SimpleNamespace(
         id=1,
         agent_id=AGENT,
@@ -206,7 +199,7 @@ def test_the_injection_replayed(world):
     assert lie.intent_score == pytest.approx(0.03)
 
     honest = world.call(
-        "send_invite", {"to": "Bob <BOB@company.com>", "body": "The meeting is at 3pm."}
+        "send_invite", {"to": " bob@company.com ", "body": "The meeting is at 3pm."}
     )
     assert (honest.decision, honest.error_code) == ("allow", ec.ALLOW_FREE_TEXT_PASSED)
     assert honest.hallucination_score == 0.5
@@ -227,8 +220,24 @@ def test_exact_deny_tuple_beats_a_grant(world):
 
 
 def test_glob_deny_rule_beats_a_grant(world):
-    result = world.call("read_file", {"path": "/docs/../etc/hosts"})
+    result = world.call("read_file", {"path": "/etc/hosts"})
     assert (result.decision, result.error_code) == ("deny", ec.AUTHZ_GLOB_DENY)
+
+
+def test_a_typed_resource_matches_its_granted_text(world):
+    # The parser grants the text "3"; the tool call carries the integer 3.
+    result = world.call("open_item", {"item": 3})
+    assert (result.decision, result.error_code) == ("allow", ec.ALLOW_NO_FREE_TEXT)
+
+
+@pytest.mark.parametrize(
+    "value", ["Bob@company.com", "Bob <bob@company.com>", "bob@company.com, x@y.io"]
+)
+def test_any_other_spelling_is_a_different_resource(world, value):
+    # No domain knowledge: a value matches a grant only spelled the same way,
+    # so every other spelling fails closed.
+    result = world.call("send_invite", {"to": value})
+    assert (result.decision, result.error_code) == ("deny", ec.AUTHZ_NO_ALLOW_TUPLE)
 
 
 def test_tool_without_resources_needs_its_own_grant(world):
@@ -245,11 +254,7 @@ def test_every_recipient_in_a_list_is_checked(world):
     ("tool", "arguments", "code"),
     [
         ("delete_mailbox", {}, ec.MAPPING_UNKNOWN_TOOL),
-        (
-            "send_invite",
-            {"to": "bob@company.com, eve@evil.com"},
-            ec.MAPPING_NORMALIZATION_FAILED,
-        ),
+        ("send_invite", {"to": {"name": "bob"}}, ec.MAPPING_NORMALIZATION_FAILED),
         ("send_invite", {"body": "hello"}, ec.MAPPING_NO_RESOURCE),
     ],
 )
@@ -383,7 +388,7 @@ def test_upload_activates_unless_review_is_required(monkeypatch, review_required
         id=1,
         agent_id=AGENT,
         deny_rules=[
-            {"action": "calendar:invite", "match": "exact", "resource": "old@x.io"},
+            {"tool": "send_invite", "match": "exact", "resource": "old@x.io"},
         ],
     )
     stored: list[SimpleNamespace] = []
@@ -408,17 +413,15 @@ def test_upload_activates_unless_review_is_required(monkeypatch, review_required
             "catalog": [
                 {
                     "tool": "send_invite",
-                    "resources": [
-                        {"arg": "to", "action": "calendar:invite", "kind": "email"}
-                    ],
+                    "resources": ["to"],
                     "free_text": ["body"],
                 }
             ],
             "deny_rules": [
                 {
-                    "action": "calendar:invite",
+                    "tool": "send_invite",
                     "match": "exact",
-                    "resource": "CEO@company.com",
+                    "resource": " ceo@company.com ",
                     "source": "Never invite the CEO (ceo@company.com).",
                 }
             ],
@@ -426,7 +429,7 @@ def test_upload_activates_unless_review_is_required(monkeypatch, review_required
         }
 
     monkeypatch.setattr(cbac_mod, "fga", fga)
-    fga.denies.add(object_id(AGENT, "calendar:invite", "old@x.io"))
+    fga.denies.add(object_id(AGENT, "send_invite", "old@x.io"))
     monkeypatch.setattr(cbac_mod, "insert_policy_version", insert_policy_version)
     monkeypatch.setattr(
         cbac_mod, "get_active_policy_version", get_active_policy_version
@@ -465,12 +468,12 @@ def test_upload_activates_unless_review_is_required(monkeypatch, review_required
         # Held for an admin: nothing indexed, the old deny tuples untouched.
         assert version.status == "pending"
         assert indexed == []
-        assert fga.denies == {object_id(AGENT, "calendar:invite", "old@x.io")}
+        assert fga.denies == {object_id(AGENT, "send_invite", "old@x.io")}
     else:
         assert version.status == "active"
         # Only the instructions are chunked for policy drift, never the schema.
         assert indexed == [policy]
-        assert fga.denies == {object_id(AGENT, "calendar:invite", "ceo@company.com")}
+        assert fga.denies == {object_id(AGENT, "send_invite", "ceo@company.com")}
 
 
 # ── HTTP: the policy key ─────────────────────────────────────────────────────
