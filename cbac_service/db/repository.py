@@ -8,15 +8,24 @@ plain data (models, booleans, or None).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime, timezone
 
 import numpy as np
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy import text as sql_text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cbac_service.config import ENCODER_MODEL, NLI_MODEL
 
-from .models import CBACDecision, LHIRecord, PolicyChunk, PolicyMeta
+from .models import (
+    CBACDecision,
+    CBACIntent,
+    LHIRecord,
+    PolicyChunk,
+    PolicyMeta,
+    PolicyVersion,
+)
 
 
 async def policy_hash_matches(
@@ -219,16 +228,20 @@ async def insert_lhi_record(
     policy_score: float | None,
     hallucination_score: float | None,
     trust: float,
+    mcp_did: str | None = None,
 ) -> LHIRecord:
     """Append one interaction's scores + resulting trust. Commits.
 
     An unmeasured component is stored as NULL — `trust` already renormalizes
-    over the observed ones, so nothing here substitutes a value.
+    over the observed ones, so nothing here substitutes a value. ``mcp_did``
+    is stored verbatim; it names the MCP server the call went to and plays no
+    part in the edge key or the arithmetic.
     """
     record = LHIRecord(
         agent_id=agent_id,
         callee_name=callee_name,
         callee_type=callee_type,
+        mcp_did=mcp_did,
         intent_score=intent_score,
         policy_score=policy_score,
         hallucination_score=hallucination_score,
@@ -386,3 +399,110 @@ async def get_cbac_decision_by_hash(
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+# ── v2 policy versions ────────────────────────────────────────────────────────
+
+
+async def insert_policy_version(session: AsyncSession, **fields) -> PolicyVersion:
+    """Append one parsed policy upload. Commits."""
+    record = PolicyVersion(**fields)
+    session.add(record)
+    await session.commit()
+    return record
+
+
+async def get_policy_version(
+    session: AsyncSession, agent_id: str, version_id: int
+) -> PolicyVersion | None:
+    """One of an agent's versions by id, or None."""
+    stmt = select(PolicyVersion).where(
+        PolicyVersion.id == version_id, PolicyVersion.agent_id == agent_id
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_active_policy_version(
+    session: AsyncSession, agent_id: str
+) -> PolicyVersion | None:
+    """The version deciding the agent's calls: its latest ``active`` row."""
+    stmt = (
+        select(PolicyVersion)
+        .where(PolicyVersion.agent_id == agent_id, PolicyVersion.status == "active")
+        .order_by(PolicyVersion.id.desc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_open_policy_versions(
+    session: AsyncSession, agent_id: str
+) -> Sequence[PolicyVersion]:
+    """The agent's active and pending versions, newest first — what a
+    reviewer needs to see."""
+    stmt = (
+        select(PolicyVersion)
+        .where(
+            PolicyVersion.agent_id == agent_id,
+            PolicyVersion.status.in_(("active", "pending")),
+        )
+        .order_by(PolicyVersion.id.desc())
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def mark_policy_version_active(
+    session: AsyncSession, version: PolicyVersion
+) -> None:
+    """Make ``version`` the agent's active one and supersede the rest. Commits.
+
+    Called only after its deny tuples are in OpenFGA, so the row never claims
+    rules the store does not hold.
+    """
+    await session.execute(
+        update(PolicyVersion)
+        .where(
+            PolicyVersion.agent_id == version.agent_id,
+            PolicyVersion.status == "active",
+            PolicyVersion.id != version.id,
+        )
+        .values(status="superseded")
+    )
+    version.status = "active"
+    version.approved_at = datetime.now(timezone.utc)
+    session.add(version)
+    await session.commit()
+
+
+# ── v2 intents ────────────────────────────────────────────────────────────────
+
+
+async def lock_intent(session: AsyncSession, intent_id: str) -> None:
+    """Serialize every call carrying ``intent_id`` until this transaction ends.
+
+    A transaction-scoped advisory lock, so concurrent first calls — from any
+    worker process — parse the query once: the second waits, then reads the
+    row the first wrote. Released by the caller's commit or rollback.
+    """
+    await session.execute(
+        sql_text("SELECT pg_advisory_xact_lock(hashtext(:intent_id))"),
+        {"intent_id": intent_id},
+    )
+
+
+async def get_intent(session: AsyncSession, intent_id: str) -> CBACIntent | None:
+    stmt = select(CBACIntent).where(CBACIntent.intent_id == intent_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def insert_intent(session: AsyncSession, **fields) -> CBACIntent:
+    """Bind an intent id to its query and grants. Does not commit: the caller
+    commits, which also releases the :func:`lock_intent` lock."""
+    record = CBACIntent(**fields)
+    session.add(record)
+    await session.flush()
+    return record

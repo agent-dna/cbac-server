@@ -1,9 +1,12 @@
 import asyncio
 import base64
+import fnmatch
 import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -14,34 +17,61 @@ from sentence_transformers import SentenceTransformer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cbac_service import error_codes as ec
-from cbac_service.chunking import flatten_policy_chunks
+from cbac_service import fga
 from cbac_service.config import (
     ALLOW_GAP,
+    CHUNK_MAX_WORDS,
     CONTRADICTION_THRESHOLD,
     DENY_GAP,
     ENCODER_MODEL,
     ENTAILMENT_THRESHOLD,
     HHEM_MODEL,
     HYBRID_SEARCH_ENABLED,
+    INTENT_TTL_SECONDS,
     LHI_LAMBDA_DOWN,
     LHI_LAMBDA_UP,
     LHI_WEIGHTS,
     NLI_BATCH_SIZE,
     NLI_MODEL,
+    POLICY_PARSER_MODEL,
+    QUERY_PARSER_MODEL,
 )
+from cbac_service.db.models import CBACIntent, PolicyVersion
 from cbac_service.db.repository import (
+    get_active_policy_version,
+    get_intent,
     get_latest_trust,
     get_policy_chunks,
     insert_cbac_decision,
+    insert_intent,
     insert_lhi_record,
+    insert_policy_version,
+    lock_intent,
+    mark_policy_version_active,
     save_policy_chunks,
 )
-from cbac_service.db.search import hybrid_search, vector_search
+from cbac_service.db.search import SearchResult, hybrid_search, vector_search
+from cbac_service.ibac import (
+    WHOLE_TOOL,
+    NormalizationError,
+    canonical,
+    fga_user,
+    object_id,
+    resource_values,
+)
+from cbac_service.parsers import (
+    flatten_policy_chunks,
+    parse_policy,
+    parse_query,
+    split_by_word_budget,
+    split_policy_document,
+)
 from cbac_service.skills import (
     VALID_LLM_DECISIONS,
     CBACResult,
     LLMVerdict,
     _intended_action_text,
+    render_intent,
 )
 
 # TODO:- Fix return types in CBAC class
@@ -107,6 +137,34 @@ def _interaction_hash(
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class _Tier1:
+    """What Tier 1 measured for one text — kept so Tier 2 reuses the search."""
+
+    intent_vec: np.ndarray
+    allowed_results: list[SearchResult]
+    allowed_score: float
+    forbidden_score: float
+    gap: float
+    gap_score: float | None
+
+
+def _deny(
+    reason: str, error_code: int, intent_score: float | None = None
+) -> CBACResult:
+    return CBACResult(
+        decision="deny", reason=reason, error_code=error_code, intent_score=intent_score
+    )
+
+
+def _as_text(value: Any) -> str:
+    """A free-text argument as the text the scorers read. Structured values
+    are serialized whole, so nothing inside them escapes the checks."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 class CBAC:
@@ -360,18 +418,14 @@ class CBAC:
 
     # ── Tiered decision (DB-backed search) ────────────────────────────────────
 
-    async def _tiered_decision(
-        self,
-        session: AsyncSession,
-        agent_id: str,
-        intent_text: str,
-    ) -> tuple[str, str, int, float | None]:
-        """Tier 1 (cosine gap) → Tier 2 (NLI entailment) → Tier 3 (LLM).
+    async def _tier1_gap(
+        self, session: AsyncSession, agent_id: str, intent_text: str
+    ) -> _Tier1:
+        """Tier 1 inputs: the closest allowed and forbidden chunks and their gap.
 
-        Uses pgvector search for Tier 1 instead of in-memory numpy operations.
-        Returns ``(decision, reason, error_code, policy_score)``.
+        Shared by v1 (:meth:`_tiered_decision`, where the gap can allow or deny)
+        and v2 (:meth:`_policy_drift`, where it can only deny).
         """
-
         # Encode only the intent at runtime (~5 ms on CPU).
         encoder = self._get_encoder()
         intent_vec = await asyncio.to_thread(
@@ -396,6 +450,51 @@ class CBAC:
         gap_score = (
             max(0.0, min(1.0, (gap + self._deny_gap) / span)) if span > 0 else None
         )
+        return _Tier1(
+            intent_vec, allowed_results, allowed_score, forbidden_score, gap, gap_score
+        )
+
+    async def _tier2_nli(
+        self, session: AsyncSession, agent_id: str, intent_text: str, t1: _Tier1
+    ) -> tuple[str | None, dict[str, float]]:
+        """Tier 2 inputs: the top allowed chunk and the NLI scores against it.
+        ``(None, {})`` when the agent has no allowed chunk."""
+        # Use hybrid search if enabled for better candidate selection,
+        # otherwise fall back to the vector search result we already have.
+        if HYBRID_SEARCH_ENABLED and t1.allowed_results:
+            top_results = await hybrid_search(
+                session,
+                agent_id,
+                t1.intent_vec,
+                intent_text,
+                top_k=1,
+                chunk_type="allowed",
+            )
+            top_chunk = top_results[0].chunk_text if top_results else None
+        elif t1.allowed_results:
+            top_chunk = t1.allowed_results[0].chunk_text
+        else:
+            top_chunk = None
+
+        if not top_chunk:
+            return None, {}
+        scores = await asyncio.to_thread(self._nli_scores, top_chunk, intent_text)
+        return top_chunk, scores
+
+    async def _tiered_decision(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intent_text: str,
+    ) -> tuple[str, str, int, float | None]:
+        """Tier 1 (cosine gap) → Tier 2 (NLI entailment) → Tier 3 (LLM).
+
+        Uses pgvector search for Tier 1 instead of in-memory numpy operations.
+        Returns ``(decision, reason, error_code, policy_score)``.
+        """
+        t1 = await self._tier1_gap(session, agent_id, intent_text)
+        allowed_score, forbidden_score = t1.allowed_score, t1.forbidden_score
+        gap, gap_score = t1.gap, t1.gap_score
 
         if gap > self._allow_gap:
             return (
@@ -419,23 +518,7 @@ class CBAC:
             )
 
         # Tier 2: NLI entailment vs top allowed chunk.
-        # Use hybrid search if enabled for better candidate selection,
-        # otherwise fall back to the vector search result we already have.
-        if HYBRID_SEARCH_ENABLED and allowed_results:
-            top_results = await hybrid_search(
-                session,
-                agent_id,
-                intent_vec,
-                intent_text,
-                top_k=1,
-                chunk_type="allowed",
-            )
-            top_chunk = top_results[0].chunk_text if top_results else None
-        elif allowed_results:
-            top_chunk = allowed_results[0].chunk_text
-        else:
-            top_chunk = None
-
+        top_chunk, t2_scores = await self._tier2_nli(session, agent_id, intent_text, t1)
         if not top_chunk:
             return (
                 "deny",
@@ -444,7 +527,6 @@ class CBAC:
                 None,
             )
 
-        t2_scores = await asyncio.to_thread(self._nli_scores, top_chunk, intent_text)
         entailment = t2_scores.get("entailment", 0.0)
         contradiction = t2_scores.get("contradiction", 0.0)
 
@@ -520,6 +602,7 @@ class CBAC:
         callee_name: str,
         callee_type: str,
         result: CBACResult,
+        mcp_did: str = "",
     ) -> CBACResult:
         """Fold a reached decision's component scores into the edge's trust and
         stamp the new value onto ``result``.
@@ -543,6 +626,7 @@ class CBAC:
                 intent_score=result.intent_score,
                 policy_score=result.policy_score,
                 hallucination_score=result.hallucination_score,
+                mcp_did=mcp_did,
             )
         except Exception:
             # The audit write runs next on this same session. A failed insert
@@ -641,8 +725,9 @@ class CBAC:
         intended_action: Any,
         user_intent: str | None = None,
         callee_name: str = "",
-        callee_type: str = "tool",
+        callee_type: str = "mcp_tool",
         intent_id: str | None = None,
+        mcp_did: str = "",
     ) -> CBACResult:
         """Decide, then write the verdict to the audit log.
 
@@ -655,9 +740,20 @@ class CBAC:
         upstream, at the workflow's first envelope, not by CBAC) — it plays no
         part in the decision itself, so it bypasses ``_decide`` entirely and
         goes straight into the audit write, which is also where it is hashed.
+
+        ``mcp_did`` plays no part in the decision either, but unlike
+        ``intent_id`` it lands on the *trust* record rather than the audit row,
+        and that write happens inside ``_decide`` — so it does have to travel
+        through the pipeline.
         """
         result = await self._decide(
-            session, agent_id, intended_action, user_intent, callee_name, callee_type
+            session,
+            agent_id,
+            intended_action,
+            user_intent,
+            callee_name,
+            callee_type,
+            mcp_did,
         )
         result.interaction_hash = await self._record_decision(
             session,
@@ -678,7 +774,8 @@ class CBAC:
         intended_action: Any,
         user_intent: str | None = None,
         callee_name: str = "",
-        callee_type: str = "tool",
+        callee_type: str = "mcp_tool",
+        mcp_did: str = "",
     ) -> CBACResult:
         """Semantic intent verification against the agent's on-chain policy.
 
@@ -717,8 +814,12 @@ class CBAC:
             The root user request. Enables Check-1 drift + hallucination score.
         callee_name / callee_type:
             The other end of the edge whose trust this decision updates
-            (``"tool"`` / ``"agent"`` / ``"mcp"``). No ``callee_name`` means no
-            trust update.
+            (``"mcp_tool"`` / ``"tool"`` / ``"agent"``). No ``callee_name``
+            means no trust update.
+        mcp_did:
+            The MCP server the call is bound for. Not part of the edge key and
+            not scored — recorded on the trust row so the history says which
+            server the edge was exercised through.
 
         Returns
         -------
@@ -750,6 +851,7 @@ class CBAC:
                         intent_score=intent_score,
                         error_code=error_code,
                     ),
+                    mcp_did,
                 )
 
         all_chunks = await get_policy_chunks(session, agent_id)
@@ -820,6 +922,7 @@ class CBAC:
                 policy_score=policy_score,
                 error_code=error_code,
             ),
+            mcp_did,
         )
 
     async def compute_lhi(
@@ -831,6 +934,7 @@ class CBAC:
         intent_score: float | None,
         policy_score: float | None,
         hallucination_score: float | None,
+        mcp_did: str = "",
     ) -> float | None:
         """Update and return the LHI (Local Heuristic Intelligence) trust
         score for one (agent → callee) edge.
@@ -865,7 +969,10 @@ class CBAC:
         the current trust is simply the edge's latest row (see
         ``repository.get_latest_trust`` / ``get_trust_history``). Unobserved
         components are stored as NULL, never as a substituted value, so the
-        row stays honest about what was measured.
+        row stays honest about what was measured. ``mcp_did`` rides along on
+        the row as descriptive metadata — it names the MCP server the call went
+        to, is not part of the edge key, and enters none of the arithmetic
+        above.
         """
         scores = {
             "intent": intent_score,
@@ -904,6 +1011,9 @@ class CBAC:
             policy_score=policy_score,
             hallucination_score=hallucination_score,
             trust=trust,
+            # NULL rather than "" for a caller that named no MCP server, the
+            # same convention the audit row uses for its optional fields.
+            mcp_did=mcp_did or None,
         )
 
         # ponytail: on-chain mirror of the record is parked — the DB is the
@@ -931,3 +1041,385 @@ class CBAC:
         # await asyncio.to_thread(write, card_id=card_id, card_info=json.dumps(record))
 
         return trust
+
+    # ── v2: IBAC gate + deny-only semantic checks ─────────────────────────────
+
+    async def upload_policy(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        policy: str,
+        trusted_data: dict,
+        review_required: bool = False,
+    ) -> PolicyVersion:
+        """Parse a policy document into a new version, and activate it unless
+        ``review_required`` holds it ``pending`` for an admin to approve.
+
+        ``review_required`` is decided per upload, by the admin uploading —
+        some agents' policies warrant a second reader and some do not. A held
+        version changes nothing until approved: the previous active version
+        keeps deciding.
+
+        ``policy`` is the whole document — instructions and tool schemas, see
+        :func:`~cbac_service.parsers.split_policy_document`. The version row
+        stores the two halves apart (``policy`` is the instructions alone,
+        which is what gets chunked for policy drift) and hashes the whole
+        document. The row is written before activation, so a failed activation
+        leaves it ``pending`` and retryable through approval.
+        """
+        instructions, tools = split_policy_document(policy)
+        parsed = await parse_policy(POLICY_PARSER_MODEL, instructions, tools)
+        version = await insert_policy_version(
+            session,
+            agent_id=agent_id,
+            policy=instructions,
+            policy_hash=_policy_hash(policy),
+            tool_schemas=tools,
+            trusted_data=trusted_data,
+            catalog=parsed.catalog,
+            deny_rules=parsed.deny_rules,
+            rejected=parsed.rejected,
+            unenforceable=parsed.unenforceable,
+            parser_model=POLICY_PARSER_MODEL,
+            status="pending",
+        )
+        if not review_required:
+            await self.activate_policy_version(session, version)
+        return version
+
+    async def activate_policy_version(
+        self, session: AsyncSession, version: PolicyVersion
+    ) -> None:
+        """Make ``version`` the one deciding: re-index its chunks for policy
+        drift, swap the exact deny tuples in OpenFGA, then flip the rows.
+
+        The rows flip last, so ``active`` never names a version whose tuples
+        are not in the store. Steps that fail leave the previous version
+        active; approving again retries the whole sequence.
+        """
+        previous = await get_active_policy_version(session, version.agent_id)
+        await self.index_policy(session, version.agent_id, policy=version.policy)
+
+        def exact_denies(v: PolicyVersion | None) -> list[str]:
+            if v is None:
+                return []
+            return [
+                object_id(v.agent_id, r["tool"], r["resource"])
+                for r in v.deny_rules
+                if r["match"] == "exact"
+            ]
+
+        await fga.replace_denies(exact_denies(version), exact_denies(previous))
+        await mark_policy_version_active(session, version)
+
+    async def authorize_call(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intent_id: str,
+        user_query: str,
+        tool: str,
+        arguments: dict[str, Any],
+        callee_type: str = "mcp_tool",
+        mcp_did: str = "",
+    ) -> CBACResult:
+        """Decide one tool call against the agent's active v2 policy, then
+        fold trust and write the audit row.
+
+        The decision is :meth:`_authorize_call`; this wrapper exists, as
+        :meth:`verify_cbac` does for v1, so the recording happens in exactly
+        one place whatever path the decision took. The trust fold runs on every
+        path: a gate deny measures no component, so it writes no trust row.
+        """
+        result = await self._authorize_call(
+            session, agent_id, intent_id, user_query, tool, arguments
+        )
+        result = await self._fold_trust(
+            session, agent_id, tool, callee_type, result, mcp_did
+        )
+        result.interaction_hash = await self._record_decision(
+            session,
+            agent_id,
+            render_intent(tool, arguments),
+            user_query,
+            tool,
+            callee_type,
+            result,
+            intent_id or None,
+        )
+        return result
+
+    async def _authorize_call(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        intent_id: str,
+        user_query: str,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> CBACResult:
+        """The v2 pipeline. Deterministic gate first, semantic checks last.
+
+        1. Intent: bind ``intent_id`` to its query, parsing grants on first sight.
+        2. Mapping: the active catalog says which arguments are resources.
+        3. Glob deny rules, matched here (OpenFGA cannot wildcard an object).
+        4. OpenFGA: every resource needs a live allow tuple and no deny tuple.
+        5. Semantic checks on the free-text arguments — deny-only.
+
+        Fail-closed throughout: every error is a deny with its own code.
+        """
+        if not intent_id or not user_query.strip():
+            return _deny(
+                "v2 authorize needs an intent_id and a user query", ec.INTENT_MISSING
+            )
+
+        version = await get_active_policy_version(session, agent_id)
+        if version is None:
+            return _deny(
+                f"No active v2 policy for agent {agent_id}", ec.MAPPING_NO_ACTIVE_POLICY
+            )
+
+        intent, denial = await self._resolve_intent(
+            session, version, agent_id, intent_id, user_query
+        )
+        if denial is not None:
+            return denial
+        assert intent is not None
+
+        now = datetime.now(timezone.utc)
+        if intent.expires_at <= now:
+            return _deny(
+                f"Intent {intent_id} expired at {intent.expires_at.isoformat()}",
+                ec.INTENT_EXPIRED,
+            )
+
+        # 2. Mapping.
+        entry = version.catalog.get(tool)
+        if entry is None:
+            return _deny(
+                f"Tool {tool!r} is not in the agent's catalog", ec.MAPPING_UNKNOWN_TOOL
+            )
+        known = set(entry["resources"]) | set(entry["free_text"])
+        unknown = sorted(arg for arg in arguments if arg not in known)
+        if unknown:
+            return _deny(
+                f"Arguments {unknown} of {tool!r} are not in the catalog",
+                ec.MAPPING_UNKNOWN_ARGUMENT,
+            )
+
+        resources: list[str] = []
+        if not entry["resources"]:
+            resources.append(WHOLE_TOOL)
+        for arg in entry["resources"]:
+            for value in resource_values(arguments, arg):
+                try:
+                    resources.append(canonical(value))
+                except NormalizationError as exc:
+                    return _deny(
+                        f"{tool}.{arg}: {exc}", ec.MAPPING_NORMALIZATION_FAILED
+                    )
+        if not resources:
+            return _deny(f"Call to {tool!r} names no resource", ec.MAPPING_NO_RESOURCE)
+
+        # 3. Glob deny rules.
+        for resource in resources:
+            for rule in version.deny_rules:
+                if (
+                    rule["match"] == "glob"
+                    and rule["tool"] == tool
+                    and fnmatch.fnmatchcase(resource, rule["resource"])
+                ):
+                    return _deny(
+                        f"{tool}#{resource} matches deny rule "
+                        f"{rule['resource']!r} ({rule['source']!r})",
+                        ec.AUTHZ_GLOB_DENY,
+                    )
+
+        # 4. OpenFGA.
+        user = fga_user(intent_id)
+        try:
+            refused: tuple[str, bool] | None = None
+            for resource in resources:
+                obj = object_id(agent_id, tool, resource)
+                if not await fga.can_invoke(user, obj, now):
+                    refused = (f"{tool}#{resource}", await fga.is_blocked(user, obj))
+                    break
+        except Exception as exc:
+            return _deny(f"OpenFGA check failed: {exc}", ec.AUTHZ_FGA_ERROR)
+        if refused is not None and refused[1]:
+            return _deny(f"{refused[0]} is blocked by policy", ec.AUTHZ_DENY_TUPLE)
+        if refused is not None:
+            return _deny(
+                f"{refused[0]} was not granted for this intent",
+                ec.AUTHZ_NO_ALLOW_TUPLE,
+            )
+
+        # 5. Semantic checks.
+        texts = [
+            (arg, _as_text(arguments[arg]))
+            for arg in entry["free_text"]
+            if arguments.get(arg) is not None
+        ]
+        texts = [(arg, text) for arg, text in texts if text.strip()]
+        if not texts:
+            return CBACResult(
+                decision="allow",
+                reason=f"Granted: {', '.join(f'{tool}#{r}' for r in resources)}",
+                error_code=ec.ALLOW_NO_FREE_TEXT,
+            )
+        return await self._semantic_checks(session, agent_id, user_query, texts)
+
+    async def _resolve_intent(
+        self,
+        session: AsyncSession,
+        version: PolicyVersion,
+        agent_id: str,
+        intent_id: str,
+        user_query: str,
+    ) -> tuple[CBACIntent | None, CBACResult | None]:
+        """The intent row for ``intent_id``, creating it on first sight.
+
+        Runs under a per-intent advisory lock and ends the transaction on every
+        path, which releases it. The first call parses the query, writes the
+        allow tuples, and stores the binding; every later call must carry the
+        same query and agent, which is what freezes the grants.
+        ponytail: the lock holds a pool connection for one LLM call, so the
+        pool size bounds concurrent new intents; a "parsing" status row frees
+        the connection if that ever binds.
+        """
+        await lock_intent(session, intent_id)
+        intent = await get_intent(session, intent_id)
+        if intent is not None:
+            await session.commit()
+            if intent.agent_id != agent_id or intent.user_query != user_query:
+                return None, _deny(
+                    f"Intent {intent_id} is bound to a different query or agent",
+                    ec.INTENT_MISMATCH,
+                )
+            return intent, None
+
+        try:
+            grants, dropped = await parse_query(
+                QUERY_PARSER_MODEL, user_query, version.trusted_data, version.catalog
+            )
+        except Exception as exc:
+            await session.rollback()
+            return None, _deny(f"Query parser failed: {exc}", ec.INTENT_PARSE_FAILED)
+
+        now = datetime.now(timezone.utc)
+        objects = [object_id(agent_id, g["tool"], g["resource"]) for g in grants]
+        try:
+            if objects:
+                await fga.write_grants(
+                    fga_user(intent_id), objects, now, INTENT_TTL_SECONDS
+                )
+        except Exception as exc:
+            await session.rollback()
+            return None, _deny(f"OpenFGA grant write failed: {exc}", ec.AUTHZ_FGA_ERROR)
+
+        intent = await insert_intent(
+            session,
+            intent_id=intent_id,
+            agent_id=agent_id,
+            user_query=user_query,
+            policy_version_id=version.id,
+            grants=grants,
+            dropped=dropped,
+            parser_model=QUERY_PARSER_MODEL,
+            created_at=now,
+            expires_at=now + timedelta(seconds=INTENT_TTL_SECONDS),
+        )
+        await session.commit()
+        logger.info(
+            "intent parsed", intent_id=intent_id, grants=grants, dropped=dropped
+        )
+        return intent, None
+
+    async def _policy_drift(
+        self, session: AsyncSession, agent_id: str, text: str
+    ) -> tuple[CBACResult | None, float | None]:
+        """Tier 1 then Tier 2 against the policy chunks, each able only to deny.
+
+        Returns ``(denial or None, policy_score)``. Anything short of a clear
+        deny passes: the call already holds an exact grant, and requiring
+        positive entailment would deny nearly every free-text argument.
+        """
+        t1 = await self._tier1_gap(session, agent_id, text)
+        if t1.gap < -self._deny_gap:
+            return _deny(
+                f"Policy drift (Tier 1): gap {t1.gap:+.3f} < -{self._deny_gap} "
+                f"for {text!r}",
+                ec.SEMANTIC_POLICY_DRIFT_TIER1,
+            ), t1.gap_score
+        top_chunk, scores = await self._tier2_nli(session, agent_id, text, t1)
+        contradiction = scores.get("contradiction", 0.0)
+        if top_chunk and contradiction >= CONTRADICTION_THRESHOLD:
+            return _deny(
+                f"Policy drift (Tier 2): {text!r} contradicts {top_chunk!r} "
+                f"(NLI contradiction={contradiction:.2f})",
+                ec.SEMANTIC_POLICY_DRIFT_TIER2,
+            ), t1.gap_score
+        return None, t1.gap_score
+
+    async def _semantic_checks(
+        self,
+        session: AsyncSession,
+        agent_id: str,
+        user_query: str,
+        texts: list[tuple[str, str]],
+    ) -> CBACResult:
+        """Intent drift and policy drift over every window of every free-text
+        argument; HHEM attached, never gating."""
+        windows = [
+            (arg, w)
+            for arg, text in texts
+            for w in split_by_word_budget(text, CHUNK_MAX_WORDS)
+        ]
+        try:
+            scores = await asyncio.to_thread(
+                self._nli_scores_batch, [(user_query, w) for _, w in windows]
+            )
+            contradictions = [s.get("contradiction", 0.0) for s in scores]
+            worst = max(range(len(windows)), key=contradictions.__getitem__)
+            intent_score = 1.0 - contradictions[worst]
+            if contradictions[worst] >= CONTRADICTION_THRESHOLD:
+                arg, window = windows[worst]
+                return _deny(
+                    f"Intent drift: {arg}={window!r} contradicts the user query "
+                    f"(NLI contradiction={contradictions[worst]:.2f})",
+                    ec.SEMANTIC_INTENT_DRIFT,
+                    intent_score=intent_score,
+                )
+
+            policy_score: float | None = None
+            for _, window in windows:
+                denial, score = await self._policy_drift(session, agent_id, window)
+                if score is not None:
+                    policy_score = (
+                        score if policy_score is None else min(policy_score, score)
+                    )
+                if denial is not None:
+                    denial.intent_score = intent_score
+                    denial.policy_score = policy_score
+                    return denial
+        except Exception as exc:
+            return _deny(f"Semantic check failed: {exc}", ec.SEMANTIC_ERROR)
+
+        hallucination = None
+        try:
+            hallucination = await asyncio.to_thread(
+                self.hallucination_score,
+                user_query,
+                " ".join(text for _, text in texts),
+            )
+        except Exception:
+            logger.warning("hallucination scoring failed", exc_info=True)
+
+        return CBACResult(
+            decision="allow",
+            reason=f"Granted; free text {[arg for arg, _ in texts]} passed both drift checks",
+            error_code=ec.ALLOW_FREE_TEXT_PASSED,
+            intent_score=intent_score,
+            policy_score=policy_score,
+            hallucination_score=hallucination,
+        )

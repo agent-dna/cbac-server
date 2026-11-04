@@ -139,9 +139,6 @@ async def check() -> None:
     ``draft_summary`` only rewraps text. Probe 4 is the one real network call,
     and it is read-only.
     """
-    # One correlation id for the whole run: every decision below lands in the
-    # audit log under it, so one check run is one queryable trace.
-    intent_id = uuid.uuid4().hex
     tools = {tool.name: tool for tool in await _mcp_client().get_tools()}
     unlabelled = {
         tool.name: tool for tool in await _mcp_client(labelled=False).get_tools()
@@ -156,7 +153,9 @@ async def check() -> None:
     with cbac_context(
         agent_id=CBAC_AGENT_ID,
         user_intent="Close issue #3 in owner/repo",
-        intent_id=intent_id,
+        # One id per user request: the service binds it to that request's
+        # query and the grants parsed from it.
+        intent_id=uuid.uuid4().hex,
     ):
         denied = await _tool(tools, "close_issue").ainvoke(close)
         unlabelled_result = await _tool(unlabelled, "close_issue").ainvoke(close)
@@ -166,7 +165,9 @@ async def check() -> None:
     with cbac_context(
         agent_id=CBAC_AGENT_ID,
         user_intent="What docs exist for " + THIRDPARTY_REPO,
-        intent_id=intent_id,
+        # One id per user request: the service binds it to that request's
+        # query and the grants parsed from it.
+        intent_id=uuid.uuid4().hex,
     ):
         third_party = await _tool(tools, "read_wiki_structure").ainvoke(
             {"repoName": THIRDPARTY_REPO}
@@ -182,13 +183,17 @@ async def check() -> None:
     with cbac_context(
         agent_id=CBAC_AGENT_ID,
         user_intent="Who can write to owner/repo?",
-        intent_id=intent_id,
+        # One id per user request: the service binds it to that request's
+        # query and the grants parsed from it.
+        intent_id=uuid.uuid4().hex,
     ):
         resource = await _read_collaborators("owner", "repo")
     with cbac_context(
         agent_id=CBAC_AGENT_ID,
         user_intent="Give me a review checklist for owner/repo",
-        intent_id=intent_id,
+        # One id per user request: the service binds it to that request's
+        # query and the grants parsed from it.
+        intent_id=uuid.uuid4().hex,
     ):
         prompt = await _get_review_checklist("owner/repo")
 

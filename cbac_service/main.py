@@ -1,3 +1,4 @@
+import hmac
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
@@ -5,34 +6,42 @@ from uuid import uuid4
 import structlog
 import uvicorn
 from agentdna.provenance import Provenance
-from fastapi import APIRouter, FastAPI, Query, Request
+from fastapi import APIRouter, FastAPI, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from cbac_service import error_codes as ec
+from cbac_service import fga
 from cbac_service.cbac import CBAC
 from cbac_service.config import (
     AGENTDNA_API_KEY,
+    CBAC_POLICY_KEY,
     CBAC_SERVICE_HOST,
     CBAC_SERVICE_PORT,
     PROVENANCE_URL,
 )
 from cbac_service.db.engine import close_db, get_session
-from cbac_service.db.models import CBACDecision, LHIRecord
+from cbac_service.db.models import CBACDecision, LHIRecord, PolicyVersion
 from cbac_service.db.repository import (
     get_cbac_decision,
     get_cbac_decision_by_hash,
     get_cbac_decisions,
     get_latest_trust_for_agents,
+    get_open_policy_versions,
+    get_policy_version,
 )
 from cbac_service.entity import (
+    AuthorizeCallRequest,
     AuthorizeRequest,
     LHIScoresRequest,
+    PolicyApproveRequest,
+    PolicyUploadRequest,
     PrecomputePolicyRequest,
 )
 from cbac_service.logging_config import setup_logging
+from cbac_service.parsers import PolicyDocumentError
 from cbac_service.skills import render_intent
 
 # ── App lifecycle ──────────────────────────────────────────────────────────────
@@ -97,8 +106,19 @@ def api_response(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Shutdown: close the connection pool. The engine builds itself lazily."""
+    """Startup: bind the OpenFGA store, so the first v2 call does not pay for
+    it. Unreachable is logged, not fatal — v1 does not need OpenFGA, and v2
+    retries on first use and denies (4104) while it stays down.
+
+    Shutdown: close the OpenFGA client and the connection pool. The engine
+    builds itself lazily.
+    """
+    try:
+        await fga.ensure_store()
+    except Exception:
+        logger.warning("openfga unavailable at startup", exc_info=True)
     yield
+    await fga.close()
     await close_db()
 
 
@@ -194,6 +214,7 @@ async def authorize_cbac(body: AuthorizeRequest) -> JSONResponse:
                 callee_name=body.callee_name,
                 callee_type=body.callee_type,
                 intent_id=body.intent_id,
+                mcp_did=body.mcp_did,
             )
         decision, reason, status_code = (
             result.decision,
@@ -359,6 +380,7 @@ def _lhi_record_json(record: LHIRecord) -> dict:
     return {
         "callee_name": record.callee_name,
         "callee_type": record.callee_type,
+        "mcp_did": record.mcp_did,
         "intent_score": record.intent_score,
         "policy_score": record.policy_score,
         "hallucination_score": record.hallucination_score,
@@ -429,7 +451,210 @@ async def precompute_policy(body: PrecomputePolicyRequest) -> JSONResponse:
     )
 
 
+# ── v2: IBAC gate ───────────────────────────────────────────────────────────
+
+API_V2_PREFIX = "/cbac/v2"
+router_v2 = APIRouter(prefix=API_V2_PREFIX)
+
+
+def _policy_key_refusal(key: str | None) -> JSONResponse | None:
+    """The response refusing a policy-endpoint call, or None to proceed.
+
+    These endpoints write the deny tuples and the argument mapping, so with
+    no key configured they refuse everyone rather than accept anyone.
+    """
+    if not CBAC_POLICY_KEY:
+        return api_response(
+            message="CBAC_POLICY_KEY is not configured", success=False, status_code=503
+        )
+    if not key or not hmac.compare_digest(key.encode(), CBAC_POLICY_KEY.encode()):
+        return api_response(
+            message="missing or wrong X-CBAC-Key", success=False, status_code=401
+        )
+    return None
+
+
+def _policy_version_json(version: PolicyVersion) -> dict:
+    return {
+        "version_id": version.id,
+        "agent_id": version.agent_id,
+        "status": version.status,
+        "policy_hash": version.policy_hash,
+        "policy": version.policy,
+        "catalog": version.catalog,
+        "deny_rules": version.deny_rules,
+        "rejected": version.rejected,
+        "unenforceable": version.unenforceable,
+        "trusted_data": version.trusted_data,
+        "parser_model": version.parser_model,
+        "created_at": version.created_at.isoformat(),
+        "approved_at": version.approved_at.isoformat() if version.approved_at else None,
+    }
+
+
+@router_v2.post("/policies")
+async def upload_policy_v2(
+    body: PolicyUploadRequest, x_cbac_key: str | None = Header(None)
+) -> JSONResponse:
+    """Parse an agent's policy document into a new policy version.
+
+    The document is split into its instructions and tool schemas (a document
+    that does not split is a 422), then one LLM pass writes the argument
+    catalog and the deny rules; both are validated in code before anything is
+    stored. The version activates at once unless the upload sets
+    ``review_required``, which holds it ``pending`` for approval.
+    The response is the stored version, including what validation rejected
+    and what the policy says that no tuple can enforce.
+    """
+    refusal = _policy_key_refusal(x_cbac_key)
+    if refusal is not None:
+        return refusal
+    _bind_request_context(body.agent_id)
+    try:
+        async with get_session() as session:
+            version = await _get_cbac().upload_policy(
+                session,
+                agent_id=body.agent_id,
+                policy=body.policy,
+                trusted_data=body.trusted_data,
+                review_required=body.review_required,
+            )
+    except PolicyDocumentError as exc:
+        return api_response(message=str(exc), success=False, status_code=422)
+    except Exception as exc:
+        logger.exception("v2 policy upload failed")
+        return api_response(message=str(exc), success=False, status_code=500)
+
+    logger.info(
+        "v2 policy parsed",
+        version_id=version.id,
+        status=version.status,
+        tools=len(version.catalog),
+        deny_rules=len(version.deny_rules),
+        rejected=len(version.rejected),
+    )
+    return api_response(
+        data=_policy_version_json(version),
+        message=f"policy version {version.id} is {version.status}",
+    )
+
+
+@router_v2.get("/policies/{agent_id}")
+async def read_policies_v2(
+    agent_id: str, x_cbac_key: str | None = Header(None)
+) -> JSONResponse:
+    """The agent's active and pending policy versions, newest first."""
+    refusal = _policy_key_refusal(x_cbac_key)
+    if refusal is not None:
+        return refusal
+    try:
+        async with get_session() as session:
+            versions = await get_open_policy_versions(session, agent_id)
+    except Exception as exc:
+        logger.exception("v2 policy lookup failed", agent_id=agent_id)
+        return api_response(message=str(exc), success=False, status_code=500)
+    return api_response(
+        data={
+            "agent_id": agent_id,
+            "versions": [_policy_version_json(v) for v in versions],
+        },
+        message=f"{len(versions)} open version(s) for {agent_id}",
+    )
+
+
+@router_v2.post("/policies/{agent_id}/approve")
+async def approve_policy_v2(
+    agent_id: str, body: PolicyApproveRequest, x_cbac_key: str | None = Header(None)
+) -> JSONResponse:
+    """Activate a pending version: the optional human-review step."""
+    refusal = _policy_key_refusal(x_cbac_key)
+    if refusal is not None:
+        return refusal
+    _bind_request_context(agent_id)
+    try:
+        async with get_session() as session:
+            version = await get_policy_version(session, agent_id, body.version_id)
+            if version is None:
+                return api_response(
+                    message=f"no version {body.version_id} for {agent_id}",
+                    success=False,
+                    status_code=404,
+                )
+            if version.status != "pending":
+                return api_response(
+                    message=f"version {version.id} is {version.status}, not pending",
+                    success=False,
+                    status_code=409,
+                )
+            await _get_cbac().activate_policy_version(session, version)
+    except Exception as exc:
+        logger.exception("v2 policy approval failed")
+        return api_response(message=str(exc), success=False, status_code=500)
+    return api_response(
+        data=_policy_version_json(version),
+        message=f"policy version {version.id} is active",
+    )
+
+
+@router_v2.post("/authorize")
+async def authorize_call_v2(body: AuthorizeCallRequest) -> JSONResponse:
+    """Decide one tool call: the deterministic gate, then the deny-only
+    semantic checks on its free-text arguments.
+
+    The first call carrying a new ``intent_id`` parses its ``user_query``
+    into allow tuples; later calls must carry the same query. Same wire
+    contract as v1: ``data`` is ``{decision, status_code, hash}``, always HTTP
+    200, and the 4000s in ``status_code`` say which check decided.
+    """
+    _bind_request_context(body.agent_id)
+    try:
+        async with get_session() as session:
+            result = await _get_cbac().authorize_call(
+                session,
+                agent_id=body.agent_id,
+                intent_id=body.intent_id,
+                user_query=body.user_query,
+                tool=body.tool,
+                arguments=body.arguments,
+                callee_type=body.callee_type,
+                mcp_did=body.mcp_did,
+            )
+        decision, reason, status_code = (
+            result.decision,
+            result.reason,
+            result.error_code,
+        )
+        interaction_hash = result.interaction_hash
+        logger.info(
+            "cbac v2 decision",
+            decision=decision,
+            reason=reason,
+            status_code=status_code,
+            intent_score=result.intent_score,
+            policy_score=result.policy_score,
+            hallucination_score=result.hallucination_score,
+            trust=result.trust,
+        )
+    except Exception as exc:
+        decision, reason, status_code = "error", str(exc), ec.API_UNHANDLED_EXCEPTION
+        interaction_hash = None
+        logger.exception("cbac v2 authorization failed")
+
+    response = api_response(
+        data={
+            "decision": decision,
+            "status_code": status_code,
+            "hash": interaction_hash,
+        },
+        message=reason,
+        success=decision != "error",
+    )
+    response.headers["X-CBAC-Decision"] = decision
+    return response
+
+
 app.include_router(router)
+app.include_router(router_v2)
 
 
 if __name__ == "__main__":

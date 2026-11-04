@@ -56,6 +56,7 @@ def authorizing(result, calls=None):
 
 AUTHORIZE_BODY = {
     "agent_id": "did:agent",
+    "mcp_did": "did:mcp:github",
     "intended_action": "read pull requests",
     "user_intent": "show me the PRs",
     "callee_name": "github_tool",
@@ -108,13 +109,15 @@ def test_authorize_forwards_the_callee_edge(monkeypatch):
             "callee_name": "github_tool",
             "callee_type": "tool",
             "intent_id": None,
+            "mcp_did": "did:mcp:github",
         }
     ]
 
 
 def test_authorize_defaults_the_callee_edge(monkeypatch):
-    """An older client that sends neither field still authorizes; the empty
-    callee_name is what tells verify_cbac to skip the trust update."""
+    """An older client that sends none of these still authorizes; the empty
+    callee_name is what tells verify_cbac to skip the trust update, and the
+    empty mcp_did is stored as NULL rather than blocking anything."""
     calls = []
     install_cbac(
         monkeypatch,
@@ -123,7 +126,8 @@ def test_authorize_defaults_the_callee_edge(monkeypatch):
     asyncio.run(main.authorize_cbac(stub_request({"agent_id": "did:agent"})))
 
     assert calls[0]["callee_name"] == ""
-    assert calls[0]["callee_type"] == "tool"
+    assert calls[0]["callee_type"] == "mcp_tool"
+    assert calls[0]["mcp_did"] == ""
 
 
 def test_authorize_renders_the_intent_from_the_call_facts(monkeypatch):
@@ -216,6 +220,7 @@ def test_guard_payload_round_trips_into_the_rendered_intent(monkeypatch):
     )
     body = _payload(
         "did:agent",
+        "did:mcp:github",
         "github_close_issue",
         # A value json.dumps cannot encode: the guard renders arguments to text
         # before they hit the wire, so this must survive rather than fail closed.
@@ -233,6 +238,7 @@ def test_guard_payload_round_trips_into_the_rendered_intent(monkeypatch):
     )
     assert calls[0]["callee_name"] == "github_close_issue"
     assert calls[0]["callee_type"] == "mcp"
+    assert calls[0]["mcp_did"] == "did:mcp:github"
 
 
 def test_guard_endpoint_matches_the_route_the_service_serves(monkeypatch):
@@ -429,6 +435,7 @@ def lhi_row(
         "agent_id": agent_id,
         "callee_name": callee_name,
         "callee_type": callee_type,
+        "mcp_did": "did:mcp:github",
         "intent_score": 0.9,
         "policy_score": 0.8,
         "hallucination_score": 0.95,
@@ -474,6 +481,8 @@ def test_lhi_scores_groups_edges_by_agent(monkeypatch):
     }
     assert len(payload["agents"]["did:b"]) == 1
     assert payload["agents"]["did:b"][0]["trust"] == 0.87
+    # The MCP server the edge was exercised through rides back with it.
+    assert payload["agents"]["did:b"][0]["mcp_did"] == "did:mcp:github"
 
 
 def test_lhi_scores_includes_agents_with_no_history(monkeypatch):

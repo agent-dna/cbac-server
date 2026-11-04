@@ -3,7 +3,11 @@
 No models, no DB — pure text in, chunks out.
 """
 
-from cbac_service.chunking import chunk_body_text, flatten_policy_chunks
+from cbac_service.parsers import (
+    chunk_body_text,
+    flatten_policy_chunks,
+    split_by_word_budget,
+)
 from cbac_service.skills import parse_skill_md
 
 SKILL_MD = """---
@@ -58,6 +62,21 @@ def test_unsplittable_long_unit_falls_back_to_word_budget():
     text = " ".join(str(i) for i in range(12))  # no sentence boundaries at all
     chunks = chunk_body_text(text, max_words=5)
     assert [len(c.split()) for c in chunks] == [5, 5, 2]
+
+
+def test_budget_is_a_hard_cap_even_inside_one_sentence():
+    # One over-budget sentence among short ones: emitted whole, its tail would
+    # sit past the cross-encoders' 512-token cut and never be scored.
+    long_sentence = " ".join(f"w{i}" for i in range(12)) + "."
+    text = f"Short one. {long_sentence} Another short one."
+    pieces = split_by_word_budget(text, max_words=5)
+    assert max(len(p.split()) for p in pieces) <= 5
+    assert " ".join(pieces).split() == text.split()
+
+
+def test_text_within_budget_is_returned_untouched():
+    text = "line one\nline two"
+    assert split_by_word_budget(text, max_words=5) == [text]
 
 
 # ── flatten_policy_chunks ─────────────────────────────────────────────────────

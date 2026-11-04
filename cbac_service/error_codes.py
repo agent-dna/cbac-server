@@ -11,7 +11,14 @@ layer:
     3200-3299  Tier 1  — bi-encoder cosine gap
     3300-3399  Tier 2  — NLI entailment/contradiction vs. top chunk
     3400-3499  Tier 3  — optional LLM backend
+    4000-4099  v2 intent & mapping — intent lifecycle, catalog, normalization
+    4100-4199  v2 authorization    — glob deny rules and the OpenFGA check
+    4200-4299  v2 semantic         — deny-only checks on free-text arguments
+    4300-4399  v2 allow
     9000-9099  API     — failures in the HTTP handler, outside the pipeline
+
+The 3000s belong to ``POST /cbac/v1/authorize`` (``CBAC.verify_cbac``), the
+4000s to ``POST /cbac/v2/authorize`` (``CBAC.authorize_call``).
 
 Codes are stable identifiers, not free-form: every code below maps 1:1 to
 exactly one return statement in ``cbac.py``. Do not renumber an existing
@@ -66,6 +73,35 @@ TIER3_LLM_ADVISE_DENY = (
 )
 TIER3_LLM_MALFORMED_DENY = 3409  # deny — backend returned something that isn't a
 # valid LLMVerdict, or an unrecognised `decision` value
+
+# ── 4000s: v2 intent & mapping ───────────────────────────────────────────────
+INTENT_MISSING = 4001  # deny — empty intent_id or user_query
+INTENT_MISMATCH = 4002  # deny — intent_id already bound to another query or agent
+INTENT_EXPIRED = 4003  # deny — the intent's grants are past INTENT_TTL_SECONDS
+INTENT_PARSE_FAILED = (
+    4004  # deny — query parser raised; nothing stored, next call retries
+)
+MAPPING_UNKNOWN_TOOL = 4005  # deny — tool not in the agent's active catalog
+MAPPING_UNKNOWN_ARGUMENT = 4006  # deny — argument neither a resource nor free text
+MAPPING_NORMALIZATION_FAILED = 4007  # deny — a resource value has no canonical form
+MAPPING_NO_RESOURCE = 4008  # deny — the call names no value for any resource argument
+MAPPING_NO_ACTIVE_POLICY = 4009  # deny — the agent has no active policy version
+
+# ── 4100s: v2 authorization ─────────────────────────────────────────────────
+AUTHZ_GLOB_DENY = 4101  # deny — a glob deny rule matches a resource
+AUTHZ_DENY_TUPLE = 4102  # deny — OpenFGA: an exact deny tuple blocks the resource
+AUTHZ_NO_ALLOW_TUPLE = 4103  # deny — OpenFGA: no live allow tuple for the resource
+AUTHZ_FGA_ERROR = 4104  # deny — OpenFGA call raised
+
+# ── 4200s: v2 semantic checks (deny-only) ────────────────────────────────────
+SEMANTIC_INTENT_DRIFT = 4201  # deny — free text contradicts the user query (NLI)
+SEMANTIC_POLICY_DRIFT_TIER1 = 4202  # deny — cosine gap < -DENY_GAP
+SEMANTIC_POLICY_DRIFT_TIER2 = 4203  # deny — NLI contradiction vs top allowed chunk
+SEMANTIC_ERROR = 4204  # deny — a model or search call raised
+
+# ── 4300s: v2 allow ──────────────────────────────────────────────────────────
+ALLOW_NO_FREE_TEXT = 4301  # allow — every resource granted, no free text to check
+ALLOW_FREE_TEXT_PASSED = 4302  # allow — granted, and every free-text check passed
 
 # ── 9000s: API — failures outside the decision pipeline ─────────────────────
 # Produced by main.authorize_cbac's own exception handler, not by anything in

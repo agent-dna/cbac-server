@@ -13,13 +13,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cbac_service.cbac import CBAC, _policy_hash
-from cbac_service.chunking import flatten_policy_chunks
 from cbac_service.db.engine import close_db, get_session
 from cbac_service.db.repository import (
     delete_policy_chunks,
     save_policy_chunks,
 )
 from cbac_service.db.search import bm25_search, hybrid_search, vector_search
+from cbac_service.parsers import flatten_policy_chunks
 
 # ── Sample policy ──────────────────────────────────────────
 

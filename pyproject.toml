@@ -21,6 +21,10 @@ dependencies = [
   "alembic>=1.13.0",
   "pgvector>=0.3.6",
   "greenlet>=3.0.0",
+  # v2 gate: allow/deny tuples live in OpenFGA; the policy and query parsers
+  # call Ollama (stdlib HTTP, no SDK) or the Claude API.
+  "openfga-sdk>=0.10.5",
+  "anthropic>=2.3.0",
   # The guard, from cbac/ in this checkout — see [tool.uv.sources] below.
   "cbac",
 ]

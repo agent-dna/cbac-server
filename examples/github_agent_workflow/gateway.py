@@ -11,13 +11,19 @@ this depends on the agent, the framework, or the upstream server cooperating:
     agent ──MCP──> gateway (PEP) ──MCP──┤     (local stand-in)
                       │                 └─> mcp.deepwiki.com
                       │                       (real third party)
-                      └── POST /cbac/v1/authorize  (CBAC decision service)
+                      └── POST /cbac/v2/authorize  (CBAC decision service)
 
 Why here and not in the agent process: an interceptor inside the agent is
 opt-in, and a security control the developer can delete is not a control. The
 agent's *only* job is to label its calls (``cbac_propagate``), which carries no
-decision. Skip the label and the calls still reach the gateway — contextless,
-so they are judged on policy alone, with no drift check to help them.
+decision. Skip the label and the calls still reach the gateway — but with no
+intent id and user query there is nothing to grant from, so every one is
+denied.
+
+The v2 gate matches each call against the agent's catalog by tool name, so
+upload the tool schemas exactly as this gateway lists them — with FastMCP's
+server prefix (``github_close_issue``) — and each resource template as a
+tool-like schema whose one argument is ``uri`` (``format: uri``).
 
 The gateway is also where the upstream credentials live, and it is the only
 service with a public address — every upstream sits on a private network
@@ -30,7 +36,7 @@ Run:
     python gateway.py
 
 Env: MCP_UPSTREAM_URL, MCP_THIRDPARTY_URL, CBAC_GATEWAY_HOST/PORT, CBAC_URL,
-CBAC_AGENT_ID.
+CBAC_AGENT_ID, CBAC_MCP_DID.
 """
 
 from __future__ import annotations
@@ -48,7 +54,7 @@ from fastmcp.server.middleware import Middleware
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cbac" / "src"))
 
-from cbac import authorize
+from cbac import authorize_call
 from cbac.mcp import context_from_headers, denial_body
 
 load_dotenv()
@@ -71,15 +77,18 @@ CBAC_TIMEOUT = float(os.environ.get("CBAC_TIMEOUT", "600"))
 # the authenticated principal (OAuth subject, mTLS SAN, API key) to an agent id
 # instead, in the two lines where the hooks read the header.
 AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
+# Which MCP server the forwarded call lands on. The gateway routes the call, so
+# it is the only party that knows this for a fact — config here, never a header
+# the agent could misreport. Recorded on the trust record, never scored.
+MCP_DID = os.environ.get("CBAC_MCP_DID", UPSTREAM_URL)
 
-# The service's pipeline codes (``cbac_service.error_codes``) that this gateway
-# treats as permission. Everything else blocks: a deny code, a code minted after
-# this list was written, and the None that means no verdict was reached at all.
+# The service's v2 codes (``cbac_service.error_codes``) that this gateway treats
+# as permission. Everything else blocks: a deny code, a code minted after this
+# list was written, and the 9100s that mean no verdict was reached at all.
 ALLOW_STATUS_CODES = frozenset(
     {
-        3201,  # TIER1_GAP_ALLOW        — cosine gap > +ALLOW_GAP
-        3302,  # TIER2_ENTAILMENT_ALLOW — entailment >= ENTAILMENT_THRESHOLD
-        3406,  # TIER3_LLM_ALLOW        — backend returned decision="allow"
+        4301,  # ALLOW_NO_FREE_TEXT     — every resource granted, no free text
+        4302,  # ALLOW_FREE_TEXT_PASSED — granted, and the free text passed
     }
 )
 
@@ -87,11 +96,11 @@ ALLOW_STATUS_CODES = frozenset(
 class CBACMiddleware(Middleware):
     """Route every acting MCP primitive crossing this gateway through the gate.
 
-    Both hooks read the governance context off the call: ``user_intent``
-    because only the client can know what the user asked (CBAC treats it as
-    evidence — a drift signal — never as identity), and ``agent_id`` because
-    the client says whose policy applies, falling back to ``AGENT_ID`` when it
-    says nothing.
+    Both hooks read the governance context off the call: ``intent_id`` and
+    ``user_intent`` because only the client knows what the user asked — the
+    service parses that query into the workflow's grants the first time it
+    sees the id — and ``agent_id`` because the client says whose policy
+    applies, falling back to ``AGENT_ID`` when it says nothing.
     """
 
     async def on_call_tool(self, context, call_next):
@@ -102,20 +111,14 @@ class CBACMiddleware(Middleware):
         message = context.message
         tool_name, tool_args = message.name, dict(message.arguments or {})
 
-        server = context.fastmcp_context.fastmcp
-        tool_description = None
-        with contextlib.suppress(Exception):
-            obj = await server.get_tool(tool_name)
-            tool_description = (obj.description or "").partition("\n")[0] or None
-
-        result = await authorize(
+        result = await authorize_call(
             agent_id,
+            intent_id,
+            user_intent,
             tool_name,
             tool_args,
-            user_intent,
-            tool_description,
+            mcp_did=MCP_DID,
             callee_type="mcp",
-            intent_id=intent_id,
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )
@@ -146,23 +149,21 @@ class CBACMiddleware(Middleware):
         args = {"uri": key}
 
         server = context.fastmcp_context.fastmcp
-        name = description = None
+        name = None
         with contextlib.suppress(Exception):
             for template in await server.list_resource_templates():
                 if template.matches(key) is not None:
                     name = template.name
-                    first = (template.description or "").partition("\n")[0]
-                    description = first or None
                     break
 
-        result = await authorize(
+        result = await authorize_call(
             agent_id,
+            intent_id,
+            user_intent,
             name or key,
             args,
-            user_intent,
-            description,
+            mcp_did=MCP_DID,
             callee_type="mcp",
-            intent_id=intent_id,
             cbac_url=CBAC_URL,
             cbac_timeout=CBAC_TIMEOUT,
         )

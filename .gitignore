@@ -149,6 +149,9 @@ activemq-data/
 
 # Environments
 .env
+# Per-environment files (.env.dev, .env.test-prod) hold real credentials.
+.env.*
+!.env.sample
 .envrc
 .venv
 env/
@@ -216,7 +219,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
+*eval*
 # Working notes, not part of the deliverable
 TODO.md
 
@@ -224,3 +227,4 @@ TODO.md
 eval*.html
 eval*.json
 eval*.txt
+fine-tune
