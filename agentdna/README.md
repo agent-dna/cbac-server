@@ -507,7 +507,7 @@ async with PROVENANCE_RELAY.session(AGENT, existing_intent_workflow) as session:
 
 If the tools run in another process on the same machine, give it the session's URL, and keep the session open until that process is done.
 
-For how the relay works, see [agentdna/mcp/relay/README.md](agentdna/mcp/relay/README.md). For complete examples, see [GitHub Repository Agent](examples/github_repository_agent) (LangGraph), [RSS Research Agent](examples/rss_research_agent) (LangGraph, two agents) and [SQLite Analytics Agent](examples/sqlite_analytics_agent) (CrewAI).
+For how the relay works, see [agentdna/mcp/relay/README.md](agentdna/mcp/relay/README.md). For complete examples, see [GitHub Repository Agent](../examples/github_repository_agent) (LangGraph), [RSS Research Agent](../examples/rss_research_agent) (LangGraph, two agents) and [SQLite Analytics Agent](../examples/sqlite_analytics_agent) (CrewAI).
 
 **2. MCP Server Middleware**
 
@@ -612,7 +612,7 @@ mcp.add_middleware(
 Currently supported MCP server integrations:
 
 - [FastMCP](https://github.com/PrefectHQ/fastmcp) - `from agentdna.mcp.server.fastmcp import AgentDNAMCPMiddleware`
-- [MCP v2 Python SDK](https://github.com/modelcontextprotocol/python-sdks) - Refer [here](./examples/rss_research_agent/mcp_server_mcp2.py) for a complete usage example
+- [MCP v2 Python SDK](https://github.com/modelcontextprotocol/python-sdks) - Refer [here](../examples/rss_research_agent/mcp_server_mcp2.py) for a complete usage example
 
 ## Authentication evidence 
 

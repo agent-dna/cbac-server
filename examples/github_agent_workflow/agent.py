@@ -89,8 +89,8 @@ THIRDPARTY_REPO = os.environ.get(
 )
 
 CBAC_URL = os.environ.get("CBAC_URL", "http://127.0.0.1:8767")
-# Whose policy is checked. Matches policies/<CBAC_AGENT_ID>.md when the service
-# runs from service.py; an on-chain actor id otherwise.
+# Whose policy is checked: the agent id upload_policy.py stores the v2 policy
+# under. The v2 gate reads only that upload, so any stable label works here.
 CBAC_AGENT_ID = os.environ.get("CBAC_AGENT_ID", "github-worker")
 # A cold service loads three transformer models on the first request.
 CBAC_TIMEOUT = float(os.environ.get("CBAC_TIMEOUT", "600"))

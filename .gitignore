@@ -228,3 +228,7 @@ eval*.html
 eval*.json
 eval*.txt
 fine-tune
+
+# Examples: runtime data (SQLite cache / database) and per-example venvs
+examples/*/data/
+examples/*/.venv/

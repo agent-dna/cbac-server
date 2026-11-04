@@ -14,7 +14,7 @@ from collections import Counter
 
 import pytest
 
-from cbac_service.chunking import flatten_policy_chunks
+from cbac_service.parsers import flatten_policy_chunks
 from cbac_service.skills import parse_skill_md
 from cbac_service.tests.eval.corpus import (
     ALLOW,

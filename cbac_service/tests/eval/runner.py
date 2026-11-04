@@ -42,7 +42,7 @@ from typing import Any
 import numpy as np
 
 import cbac_service.cbac as cbac_mod
-from cbac_service.chunking import flatten_policy_chunks
+from cbac_service.parsers import flatten_policy_chunks
 from cbac_service.skills import render_intent
 from cbac_service.tests.eval.corpus import (
     ALLOWED,

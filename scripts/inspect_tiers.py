@@ -46,7 +46,6 @@ from agentdna.provenance import Provenance
 import cbac_service.cbac as cbac_mod
 import cbac_service.error_codes as ec
 from cbac_service.cbac import CBAC
-from cbac_service.chunking import flatten_policy_chunks
 from cbac_service.config import (
     ALLOW_GAP,
     CONTRADICTION_THRESHOLD,
@@ -54,6 +53,7 @@ from cbac_service.config import (
     ENTAILMENT_THRESHOLD,
     HYBRID_SEARCH_ENABLED,
 )
+from cbac_service.parsers import flatten_policy_chunks
 from cbac_service.tests.eval.corpus import Intent, Spec, spec_by_id
 from cbac_service.tests.eval.harness import build_index, patch_search
 

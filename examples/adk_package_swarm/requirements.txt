@@ -1,0 +1,11 @@
+# agentdna, the cbac guard and the local stand-ins all come from this repo.
+-e ../../agentdna
+-e ../../cbac
+-e ../agentdna_local
+
+google-adk>=2.12.0
+fastmcp==3.4.7
+httpx>=0.28.0
+python-dotenv>=1.0.0
+requests>=2.32.0
+pytest>=8.0.0

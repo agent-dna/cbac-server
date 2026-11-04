@@ -1,0 +1,16 @@
+# agentdna, the cbac guard and the local stand-ins all come from this repo.
+-e ../../agentdna
+-e ../../cbac
+-e ../agentdna_local
+
+fastmcp==3.4.7
+httpx>=0.28.0
+langchain-core>=0.3.0
+langchain-mcp-adapters==0.3.2
+langgraph>=0.2.50
+langchain-ollama>=0.2.0
+langchain-openai>=0.2.0
+langchain-google-genai>=2.0.0
+python-dotenv>=1.0.0
+requests>=2.32.0
+pytest>=8.0.0

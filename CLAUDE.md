@@ -101,7 +101,8 @@ Modules:
     the id batch is the body.
   - **`GET /health`** — DB connectivity check. Unversioned on purpose: probes
     are wired once at deploy time and must not track API versions.
-- Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`).
+- Depends on `agent-dna` (for `Provenance`, `AgentCard`, `IntentWorkflow`, `id`),
+  vendored under `agentdna/` (see "Environment").
 
 ## Architecture
 
@@ -203,17 +204,27 @@ alembic upgrade head
 `pyproject.toml`, `uv.lock`, and `.venv` all live at the **repo root** — run
 everything from there, not from inside `cbac_service/`:
 
-- `uv sync --locked` — install from `uv.lock`. `agent-dna` resolves from PyPI
-  like any other dependency; there is no path source to the sibling checkout, so
-  library edits are **not** picked up live — publish, then bump the pin here.
-  `cbac` is the exception: it is a workspace member (`[tool.uv.workspace]`,
-  `[tool.uv.sources]`), installed from `cbac/` in this checkout, so guard edits
-  *are* live.
+- `uv sync --locked` — install from `uv.lock`. Both first-party libraries are
+  installed editable from this checkout, so edits to either are live:
+  - `cbac` is a workspace member (`[tool.uv.workspace]`, `[tool.uv.sources]`),
+    installed from `cbac/`.
+  - `agent-dna` (0.6.0) is vendored as plain files under `agentdna/` and is a
+    path source (`agent-dna = { path = "agentdna", editable = true }`), not a
+    workspace member: it keeps its own `pyproject.toml`, dev group, ruff and
+    pyright config, and tests. It is installed in setuptools' `compat` editable
+    mode (`[tool.uv] config-settings-package`), a plain path entry, because
+    the repo root is on `sys.path` for pytest and the example runners, and
+    the import-hook mode would lose to the repo-root `agentdna/` directory
+    there (imported as an empty namespace package).
+- Root pyright excludes `agentdna/` (checked from its own config) and
+  `examples/` (their dependencies are not in this lock).
 - `uv build --package cbac` — build the guard's sdist + wheel into `dist/`. It
   declares one dependency (`requests`) and ships only `cbac/src/cbac/`; the
   service is not published (`[tool.uv] package = false`).
-- `uv run pytest` — runs `cbac_service/tests/` (`[tool.pytest.ini_options]`,
-  `pythonpath = ["."]`).
+- `uv run pytest` — runs `cbac_service/tests/` and
+  `examples/agentdna_local/tests/` (`[tool.pytest.ini_options]`,
+  `pythonpath = ["."]`). Each other example has its own venv, `pytest.ini` and
+  tests.
 - `ruff` and `pyright` are pinned **exactly**, not floored: CI and the local
   `PostToolUse` hook must run the same linter. Bump them in `pyproject.toml`.
 - `transformers` is pinned `<5` on purpose — HHEM-2.1's remote code
@@ -440,6 +451,28 @@ error, or an inconclusive/misbehaving Tier 3, → `deny`).
   functions faked in-memory via the shared `rows` fixture in
   `tests/conftest.py`, no DB needed); the fold into `verify_cbac` by
   `cbac_service/tests/test_cbac_verify.py` — keep both green when touching it.
+
+## Examples
+
+`examples/` holds agents behind the v2 gate that run on one machine, with no
+call to a hosted AgentDNA or CBAC service:
+
+- `agentdna_local/` — the shared support package (flat layout: the directory
+  *is* the package). `install()` swaps agentdna's hosted entry points at
+  runtime (Rubix `Provenance` → `LocalProvenance`, registration, admin
+  whitelist, login, auth-evidence post) for one SQLite store in
+  `AGENTDNA_LOCAL_DIR`; `make_cbac_fn()` is agentdna's `CbacFn` over
+  `cbac.authorize_call` (allow only on 4301/4302, intent id
+  `<workflow id>:<agent DID>`); `policy.py` builds and uploads v2 policy
+  documents; `service.py` runs `cbac_service.main.app` with a `LocalProvenance`
+  engine. `agentdna/` itself is not modified.
+- `github_repository_agent/`, `rss_research_agent/`, `sqlite_analytics_agent/`,
+  `adk_package_swarm/` — agentdna's examples, each with its own venv
+  (`requirements.txt` installs `agentdna`, `cbac` and `agentdna_local` from
+  this repo), `cbac_policies/`, `upload_policy.py` and `pytest.ini`. The CBAC
+  `agent_id` is the calling agent's DID, so policies are uploaded per agent.
+- `github_agent_workflow/` — a gateway (PEP) in front of MCP servers; uses the
+  shared service runner.
 
 ## Evaluating the pipeline
 

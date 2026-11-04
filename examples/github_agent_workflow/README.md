@@ -166,8 +166,6 @@ agent.py                    the agent + the (CBAC-unaware) MCP server
 agent_check.py              drives every path directly and asserts — no agent LLM
 gateway.py                  the CBAC gateway — the enforcement point, fronting
                             github-mcp and the public mcp.deepwiki.com
-service.py                  the CBAC decision service, started against the
-                            policy files below instead of the Provenance Layer
 upload_policy.py            uploads the policy document: the policy + the
                             gateway's tool schemas (v2)
 policies/github-worker.md   the policy CBAC decides against
@@ -188,18 +186,16 @@ uv run --env-file .env.dev alembic upgrade head
 cd ..
 
 HYBRID_SEARCH_ENABLED=true \
-  uv run --env-file cbac_service/.env.dev python examples/github_agent_workflow/service.py
+  uv run --env-file cbac_service/.env.dev python examples/agentdna_local/service.py
 ```
 
-`service.py` is what makes this demo standalone. It starts the real
-`cbac_service` app — same pipeline, same endpoints, same Postgres — with one
-substitution: wherever the service would resolve a policy from the Provenance
-Layer, which would need an API key and a registered actor id, it reads
-`policies/{agent_id}.md` instead. (The v2 gate the gateway uses gets its policy
-from `upload_policy.py`, which sends the file's text explicitly.) The
-substitution lives in the demo, not in the service: run
-`uvicorn cbac_service.main:app` directly and you get the production behaviour,
-because that is the only policy source the service itself knows.
+`examples/agentdna_local/service.py` is the runner every example here shares.
+It starts the real `cbac_service` app — same pipeline, same endpoints, same
+Postgres and OpenFGA — with its engine's provenance pointed at the local
+AgentDNA store instead of the Rubix chain, so the service makes no call to a
+hosted service. This demo needs nothing from that store: the gateway asks the
+v2 gate, which decides from the policy `upload_policy.py` sends and never reads
+provenance. See [agentdna_local](../agentdna_local/README.md).
 
 Run it from the **repo root** with the root venv — the service's ML
 dependencies live there, not in this directory's venv.

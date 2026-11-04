@@ -6,7 +6,8 @@ requires-python = ">=3.10,<3.13"
 license = "Apache-2.0"
 
 dependencies = [
-  "agent-dna>=0.4.1",
+  # The library, from agentdna/ in this checkout — see [tool.uv.sources] below.
+  "agent-dna>=0.6.0",
   "fastapi>=0.115.0",
   "uvicorn>=0.30.0",
   "structlog>=24.1.0",
@@ -32,14 +33,23 @@ dependencies = [
 # Deployed from a checkout (uvicorn cbac_service.cbac:app).
 [tool.uv]
 package = false
+# agent-dna's editable install as a plain path entry (setuptools "compat" mode)
+# rather than an import hook. The repo root is on sys.path for pytest and the
+# example runners, and its `agentdna/` directory would otherwise be imported as
+# an empty namespace package; a path entry to the real package wins over it.
+config-settings-package = { agent-dna = { editable_mode = "compat" } }
 
 # The guard is its own distribution (published to PyPI as `cbac`); the service
 # depends on it from this checkout rather than from the index.
 [tool.uv.workspace]
 members = ["cbac"]
 
+# agent-dna is vendored under agentdna/ and installed editable from there, so
+# library edits are live. It is a path source, not a workspace member: it keeps
+# its own pyproject (dev group, ruff and pyright config) and its own tests.
 [tool.uv.sources]
 cbac = { workspace = true }
+agent-dna = { path = "agentdna", editable = true }
 
 [dependency-groups]
 dev = [
@@ -72,8 +82,10 @@ venv = ".venv"
 # examples/ installs its own venv from its own requirements.txt (langgraph,
 # fastmcp, the LLM providers) — none of which belong in this repo's lock file.
 # Checking it against the root venv would report every one as unresolved.
+# agentdna/ is the vendored library: it carries its own pyright config and its
+# own dev dependencies (fastmcp), so it is checked from there, not from here.
 # Defaults are replaced, not merged, so the usual ignores are repeated here.
-exclude = ["**/node_modules", "**/__pycache__", "**/.*", "examples"]
+exclude = ["**/node_modules", "**/__pycache__", "**/.*", "examples", "agentdna"]
 
 # Test doubles — SimpleNamespace fakes, None sessions, monkeypatched repositories —
 # deliberately don't satisfy production signatures; that is what makes them usable
@@ -89,4 +101,6 @@ reportAttributeAccessIssue = "none"
 [tool.pytest.ini_options]
 # `from cbac_service.cbac import ...` resolves against the repo root.
 pythonpath = ["."]
-testpaths = ["cbac_service/tests"]
+# examples/agentdna_local needs nothing beyond this venv (agent-dna, cbac,
+# cryptography), so its tests run here; the examples' own tests do not.
+testpaths = ["cbac_service/tests", "examples/agentdna_local/tests"]

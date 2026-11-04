@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agentdna.provenance import Provenance
 
 from cbac_service.cbac import CBAC
-from cbac_service.chunking import flatten_policy_chunks
+from cbac_service.parsers import flatten_policy_chunks
 from cbac_service.tests.eval.corpus import Rendering, Spec, spec_by_id
 
 # The two hypotheses `_classify_chunks` scores every chunk against, and the

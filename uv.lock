@@ -15,18 +15,38 @@ members = [
 
 [[package]]
 name = "agent-dna"
-version = "0.4.1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.6.0"
+source = { editable = "agentdna" }
 dependencies = [
+    { name = "colorama" },
+    { name = "httpx" },
     { name = "py-multiformats-cid" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "requests" },
     { name = "rubix-py" },
+    { name = "structlog" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f7/25/573252e66773b1e05bca4edb773101188ee31098899ee59cdb176e011524/agent_dna-0.4.1.tar.gz", hash = "sha256:50aa824804ce164b8d07a1c7a564ab05a53f74ae67bd6069d7fadc6275c8c435", size = 27007, upload-time = "2026-07-08T12:01:39.218Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/66/00/95a33f09adcf330f0936522825ec66ae10ed2ba9fd6fddc5ad551941792f/agent_dna-0.4.1-py3-none-any.whl", hash = "sha256:c552378816fda35a1b100dbcee90f170cd728e133eed39e2e249c240ca5bf4d6", size = 27314, upload-time = "2026-07-08T12:01:37.895Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "colorama" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "py-multiformats-cid", specifier = ">=0.4.4" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "requests", specifier = ">=2.0.0" },
+    { name = "rubix-py", specifier = ">=1.2.1" },
+    { name = "structlog", specifier = ">=24.0.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "fastmcp", specifier = "==3.4.7" },
+    { name = "pyright", specifier = ">=1.1.411" },
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "ruff", specifier = "==0.16.0" },
+    { name = "uvicorn" },
 ]
 
 [[package]]
@@ -365,7 +385,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-dna", specifier = ">=0.4.1" },
+    { name = "agent-dna", editable = "agentdna" },
     { name = "alembic", specifier = ">=1.13.0" },
     { name = "anthropic", specifier = ">=2.3.0" },
     { name = "asyncpg", specifier = ">=0.29.0" },
@@ -869,6 +889,19 @@ wheels = [
 ]
 
 [[package]]
+name = "httpcore"
+version = "1.0.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/06/94/82699a10bca87a5556c9c59b5963f2d039dbd239f25bc2a63907a05a14cb/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8", size = 85484, upload-time = "2025-04-24T22:06:22.219Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55", size = 78784, upload-time = "2025-04-24T22:06:20.566Z" },
+]
+
+[[package]]
 name = "httpcore2"
 version = "2.10.0"
 source = { registry = "https://pypi.org/simple" }
@@ -879,6 +912,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a9/83/a896fc59940fc5a6e2aff3a4be1d92fa890112936803b331cae75a993c34/httpcore2-2.10.0.tar.gz", hash = "sha256:13c0cc3d1919d4f28457f60cd2c2abe04113a8af184ccf1142811beba936f9dc", size = 67427, upload-time = "2026-08-09T09:11:32.123Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e5/4f/d149104195a35e2853a2fc203a8e3477747e58c80e17dda686dace174383/httpcore2-2.10.0-py3-none-any.whl", hash = "sha256:7df06cfb34070cae4f7c89be69dc1095eca138e9704ceffb98d25c1912ab6f01", size = 83000, upload-time = "2026-08-09T09:11:29.555Z" },
+]
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "certifi" },
+    { name = "httpcore" },
+    { name = "idna" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, upload-time = "2024-12-06T15:37:21.509Z" },
 ]
 
 [[package]]
@@ -2311,7 +2359,7 @@ wheels = [
 
 [[package]]
 name = "rubix-py"
-version = "1.1.1"
+version = "1.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "bip32utils" },
@@ -2323,9 +2371,9 @@ dependencies = [
     { name = "py-cid" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bc/57/cb1ebde1732fc0650e4b48d8a7c7b5ecd870de6ac859b8828764ad0707a6/rubix_py-1.1.1.tar.gz", hash = "sha256:c1b842b9aa6686a040d61b45ad2f82088c9f908c805eb51e7f384ca8fb4ae066", size = 20910, upload-time = "2026-05-19T08:41:56.816Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5f/df/3980cf753e948ac66b511ddb931278db0db807487cea63faced97ab033e5/rubix_py-1.2.1.tar.gz", hash = "sha256:ccc8906623da3e89cd76ac0543ba27eb795354b2ba19658278d6de3027d3e148", size = 21415, upload-time = "2026-09-28T19:43:39.104Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d0/97/cf78f44131867355956a287e97662ca5cf7e0894b2f0331ec0541fa7ac76/rubix_py-1.1.1-py3-none-any.whl", hash = "sha256:f2cee3d8b92d8e551749473d61a70241eafefed1f12cbe9c4df5a8b13d73d199", size = 20617, upload-time = "2026-05-19T08:41:55.315Z" },
+    { url = "https://files.pythonhosted.org/packages/85/cd/59ebc743932598450ad52fecd9604ff2d49d7fe3a77b242453f5e2467ade/rubix_py-1.2.1-py3-none-any.whl", hash = "sha256:c050c62be2abd558f400120e3714d851fd39d6d8356dae5356b1f6ae8402a690", size = 21321, upload-time = "2026-09-28T19:43:37.995Z" },
 ]
 
 [[package]]

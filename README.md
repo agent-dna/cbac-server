@@ -23,6 +23,8 @@ It runs two gates:
 |---|---|
 | `cbac_service/` | The decision service — FastAPI app, decision engine, DB layer. All ML dependencies live here. |
 | `cbac/` | The framework-agnostic guard + optional MCP glue. Imports none of the ML stack. |
+| `agentdna/` | The `agent-dna` library (0.6.0), vendored. The service and the examples install it from here. |
+| `examples/` | Agents behind the v2 gate, run entirely on one machine. `examples/agentdna_local/` replaces agentdna's hosted services at runtime and holds the shared CBAC service runner. See [`examples/agentdna_local/README.md`](examples/agentdna_local/README.md). |
 | `scripts/` | Developer tools — pipeline inspectors, the lifecycle smoke test, the dashboard rebuilder. See [`scripts/README.md`](scripts/README.md). |
 
 `pyproject.toml`, `uv.lock`, and `.venv` live at the **repo root**. Run everything
@@ -48,9 +50,11 @@ uv venv --python 3.11
 uv sync --locked
 ```
 
-Installs every dependency (`agent-dna`, FastAPI, SQLAlchemy, the ML stack) into
-`.venv/`. `--locked` fails if `uv.lock` has drifted from `pyproject.toml`
-instead of silently re-resolving — the same thing CI does.
+Installs every dependency (FastAPI, SQLAlchemy, the ML stack) into `.venv/`,
+and `agent-dna` and `cbac` editable from `agentdna/` and `cbac/` in this
+checkout, so edits to either are live. `--locked` fails if `uv.lock` has
+drifted from `pyproject.toml` instead of silently re-resolving — the same thing
+CI does.
 
 ### 2. Build the Docker image and start Postgres and OpenFGA
 

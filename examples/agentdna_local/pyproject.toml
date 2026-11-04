@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentdna-local"
+version = "0.1.0"
+description = "Local stand-ins for AgentDNA's hosted services, and a CBAC v2 cbac_fn, for the examples"
+requires-python = ">=3.10,<3.13"
+license = "Apache-2.0"
+# agent-dna and cbac come from this repo (agentdna/, cbac/): each example's
+# requirements.txt installs them editable before this package.
+dependencies = [
+  "agent-dna>=0.6.0",
+  "cbac",
+  "cryptography>=42.0",
+  "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+# policy.server_tools lists a FastMCP server's tools in process.
+fastmcp = ["fastmcp>=3.0.0"]
+
+# Flat: this directory is the package, so `import agentdna_local` finds the
+# same code whether it is installed or `examples/` is on sys.path.
+[tool.setuptools]
+packages = ["agentdna_local"]
+package-dir = { agentdna_local = "." }
+
+# Its own pytest config, so running these tests from an example's venv does not
+# pick up the repo root's (whose `pythonpath` puts the repo root on sys.path).
+[tool.pytest.ini_options]
+testpaths = ["tests"]

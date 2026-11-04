@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 
-from cbac_service.chunking import flatten_policy_chunks
+from cbac_service.parsers import flatten_policy_chunks
 from cbac_service.tests.eval.corpus import ALLOWED, FORBIDDEN, spec_by_id
 from cbac_service.tests.eval.harness import build_index, patch_search
 
