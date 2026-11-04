@@ -1,0 +1,107 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agentdna*"]
+
+[project]
+name = "agent-dna"
+version = "0.6.0"
+description = "Security, Governance and Audit framework for AI Agents"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "Apache-2.0"
+
+authors = [
+  { name = "Aparna Ullas"},
+  { name = "Arnab Ghose"},
+  { name = "Shreya Patil"},
+]
+
+dependencies = [
+  "requests>=2.0.0",
+  "httpx>=0.27",
+  "python-dotenv>=1.0.0",
+  "rubix-py>=1.2.1",
+  "py-multiformats-cid>=0.4.4",
+  "pyyaml>=6.0",
+  "structlog>=24.0.0",
+  "colorama"
+]
+
+
+[project.urls]
+Homepage = "https://agentdna.io"
+Repository = "https://github.com/agent-dna/agentdna"
+
+[dependency-groups]
+# Dependency groups for dev testing.
+dev = [
+  "pyright>=1.1.411",
+  "pytest>=8.0.0",
+  "ruff==0.16.0",
+  "fastmcp==3.4.7",
+  "uvicorn",
+]
+
+# # MCP Server Adapters
+# fastmcp3 = [
+#   "fastmcp>=3.0.0,<4.0.0",
+# ]
+# fastmcp4 = [
+#   "fastmcp>=4.0.0,<5.0.0",
+# ]
+# mcp2 = [
+#   "mcp>=2.0.0",
+# ]
+
+# # MCP Client Adapters
+# langchain = [
+#   "langchain-mcp-adapters<=0.3.2"
+# ]
+# crewai = [
+#   "crewai-tools[mcp]<2"
+# ]
+
+
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+# cbac_service has its own env and its own pytest config; run it from there.
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Curated, low-noise ruleset — the single source of truth for local + CI.
+#   E/F   pycodestyle errors + pyflakes (undefined names, unused imports)
+#   I     import sorting
+#   UP    pyupgrade (modern 3.10+ type hints: list[str], X | None)
+#   B     flake8-bugbear (real bug patterns)
+#   ISC   implicit string-concat bugs
+# Deliberately NOT enabled — they fight intentional design in cbac_service:
+#   BLE001         the CBAC pipeline is fail-closed (any error → deny), so
+#                  broad `except Exception` is correct, not a smell.
+#   TRY003/TRY004  descriptive error messages and parse_skill_md's documented
+#                  ValueError contract are intentional.
+select = ["E", "F", "I", "UP", "B", "ISC"]
+ignore = [
+    "ISC001",  # conflicts with the formatter
+    "E501",    # line length is enforced by `ruff format`; E501 only nags about
+               # strings/comments/URLs the formatter can't break
+    "B904"
+]
+
+[tool.pyright]
+# Package is only partially typed; basic keeps the hook signal useful without noise.
+typeCheckingMode = "basic"
+reportAttributeAccessIssue = "none"
+pythonVersion = "3.10"
+venvPath = "."
+venv = ".venv"
+include = ["agentdna"]
+# examples/ has its own heavy deps that aren't in the dev env; ruff still covers it, pyright does not.
+exclude = ["examples", ".venv", "**/__pycache__", "agentdna/mcp/client", "agentdna/mcp/server"]
