@@ -23,6 +23,16 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); [ \"$branch\" = \"eval/cbac-harness\" ] || printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Blocked: current branch is '\"$branch\"', only eval/cbac-harness is allowed\"}}'",
+            "statusMessage": "checking branch"
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {
