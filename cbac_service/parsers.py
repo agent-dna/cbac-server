@@ -27,7 +27,13 @@ from typing import Any
 
 import structlog
 
-from cbac_service.config import ANTHROPIC_API_KEY, CHUNK_MAX_WORDS, OLLAMA_URL
+from cbac_service.config import (
+    ANTHROPIC_API_KEY,
+    CHUNK_MAX_WORDS,
+    NVIDIA_API_KEY,
+    NVIDIA_URL,
+    OLLAMA_URL,
+)
 from cbac_service.ibac import (
     WHOLE_TOOL,
     NormalizationError,
@@ -176,14 +182,16 @@ _anthropic_client: Any = None
 async def chat_json(model: str, system: str, user: str, schema: dict) -> dict:
     """One structured completion: the model's answer as a JSON object.
 
-    ``model`` is ``"<backend>:<name>"``. Both backends constrain decoding to
-    ``schema``; neither result is trusted beyond being parseable JSON.
+    ``model`` is ``"<backend>:<name>"``. Every backend is asked to constrain
+    decoding to ``schema``; no result is trusted beyond being parseable JSON.
     """
     backend, _, name = model.partition(":")
     if backend == "ollama":
         raw = await asyncio.to_thread(_ollama, name, system, user, schema)
     elif backend == "anthropic":
         raw = await _anthropic(name, system, user, schema)
+    elif backend == "nvidia":
+        raw = await asyncio.to_thread(_nvidia, name, system, user, schema)
     else:
         raise ValueError(f"unknown parser backend in {model!r}")
     data = json.loads(raw)
@@ -211,6 +219,51 @@ def _ollama(name: str, system: str, user: str, schema: dict) -> str:
     )
     with urllib.request.urlopen(request, timeout=_OLLAMA_TIMEOUT_S) as response:
         return json.loads(response.read())["message"]["content"]
+
+
+_THINK = re.compile(r"^\s*<think>.*?</think>", re.DOTALL)
+
+
+def _nvidia(name: str, system: str, user: str, schema: dict) -> str:
+    """NVIDIA's OpenAI-compatible chat API, with reasoning off.
+
+    Reasoning off keeps the parser on the latency path short; sampling is
+    NVIDIA's recommended instruct-mode setting for Nemotron (temperature 0.2,
+    top_k 1). ``max_tokens`` is raised from that setting's 1024 because a
+    policy parse can return a large catalog."""
+    if not NVIDIA_API_KEY:
+        raise RuntimeError("NVIDIA_API_KEY is not set")
+    body = {
+        "model": name,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "output", "schema": schema},
+        },
+        "chat_template_kwargs": {"enable_thinking": False},
+        "max_tokens": 16000,
+        "temperature": 0.2,
+        "top_k": 1,
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        f"{NVIDIA_URL.rstrip('/')}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=_OLLAMA_TIMEOUT_S) as response:
+        choice = json.loads(response.read())["choices"][0]
+    if choice.get("finish_reason") == "length":
+        raise RuntimeError("parser stopped with 'length'")
+    # Should the flag be ignored, the reasoning arrives inline ahead of the answer.
+    return _THINK.sub("", choice["message"]["content"] or "", count=1)
 
 
 async def _anthropic(name: str, system: str, user: str, schema: dict) -> str:

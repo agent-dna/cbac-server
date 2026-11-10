@@ -223,10 +223,12 @@ All settings are environment variables; defaults live in `cbac_service/config.py
 | `OPENFGA_STORE_NAME` | *(required)* | Store found or created at startup — one per environment. Unset = every v2 call denies (`4104`) |
 | `OPENFGA_API_TOKEN` | `""` | OpenFGA's pre-shared key (compose requires it) |
 | `INTENT_TTL_SECONDS` | `3600` | How long an intent's grants stay live |
-| `POLICY_PARSER_MODEL` | `ollama:qwen3:14b` | `<backend>:<model>`, backend `ollama` or `anthropic` |
+| `POLICY_PARSER_MODEL` | `ollama:qwen3:14b` | `<backend>:<model>`, backend `ollama`, `anthropic` or `nvidia` |
 | `QUERY_PARSER_MODEL` | `ollama:qwen3:14b` | Same format; runs on the first call of each intent |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server |
 | `ANTHROPIC_API_KEY` | `""` | For an `anthropic:` model; empty lets the SDK find credentials itself |
+| `NVIDIA_URL` | `https://integrate.api.nvidia.com/v1` | NVIDIA's OpenAI-compatible API, for an `nvidia:` model |
+| `NVIDIA_API_KEY` | `""` | Required for an `nvidia:` model |
 | `CBAC_POLICY_KEY` | `""` | Shared secret for `/cbac/v2/policies*` (`X-CBAC-Key`); unset = refuse all |
 
 **The built-in `DATABASE_URL` default is a local macOS socket connection and does

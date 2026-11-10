@@ -53,7 +53,7 @@ Modules:
   inside the cross-encoders' 512 tokens (`split_by_word_budget`), and the v2
   document split (`split_policy_document`). LLM: v2's two parsers
   (`parse_policy`, `parse_query`), the `chat_json` backend dispatch (Ollama
-  over stdlib HTTP, or the Claude API), and the validation of everything they
+  or NVIDIA's API over stdlib HTTP, or the Claude API), and the validation of everything they
   return.
 - `fga.py` + `fga_model.json` — OpenFGA access: store binding, tuple writes,
   checks.
@@ -241,8 +241,8 @@ See `.env.sample` for the full list. Key ones:
   that forgets it denies every v2 call rather than writing into another
   environment's store
 - `POLICY_PARSER_MODEL` / `QUERY_PARSER_MODEL` — `"<backend>:<model>"`, backend
-  `ollama` or `anthropic` (default `ollama:qwen3:14b`); `OLLAMA_URL`,
-  `ANTHROPIC_API_KEY`
+  `ollama`, `anthropic` or `nvidia` (default `ollama:qwen3:14b`); `OLLAMA_URL`,
+  `ANTHROPIC_API_KEY`, `NVIDIA_URL`, `NVIDIA_API_KEY`
 - `CBAC_POLICY_KEY` — the v2 policy endpoints' shared secret
 - `INTENT_TTL_SECONDS` (default 3600)
 

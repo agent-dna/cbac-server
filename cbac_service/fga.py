@@ -134,7 +134,12 @@ async def _write(
 async def write_grants(
     user: str, objects: Sequence[str], grant_time: datetime, ttl_seconds: int
 ) -> None:
-    """Allow tuples for one intent, live for ``ttl_seconds`` from ``grant_time``."""
+    """Allow tuples for one intent, live for ``ttl_seconds`` from ``grant_time``.
+
+    Objects are deduplicated: two grants on one tool that differ only in
+    ``argument`` hash to the same object, and OpenFGA refuses a request that
+    carries a tuple twice, even with duplicate writes set to ignore.
+    """
     condition = RelationshipCondition(
         name="non_expired_grant",
         context={
@@ -147,7 +152,7 @@ async def write_grants(
             ClientTuple(
                 user=user, relation="can_invoke", object=obj, condition=condition
             )
-            for obj in objects
+            for obj in dict.fromkeys(objects)
         ]
     )
 
@@ -160,12 +165,14 @@ async def replace_denies(add: Sequence[str], remove: Sequence[str]) -> None:
     """Swap one policy version's exact deny tuples for the next one's.
 
     New tuples are written before old ones are deleted, so a rule present in
-    both versions is never briefly missing.
+    both versions is never briefly missing. Both lists are deduplicated: two
+    rules can name the same tool and value, and OpenFGA refuses a request
+    that carries a tuple twice.
     """
     keep = set(add)
     await _write(
-        writes=[_deny(obj) for obj in add],
-        deletes=[_deny(obj) for obj in remove if obj not in keep],
+        writes=[_deny(obj) for obj in dict.fromkeys(add)],
+        deletes=[_deny(obj) for obj in dict.fromkeys(remove) if obj not in keep],
     )
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 
 import pytest
@@ -262,3 +263,32 @@ def test_split_policy_document_takes_a_tools_list_result():
 def test_split_policy_document_rejects(text, why):
     with pytest.raises(parsers.PolicyDocumentError, match=why):
         parsers.split_policy_document(text)
+
+
+def test_nvidia_backend_strips_inline_reasoning(monkeypatch):
+    sent = {}
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout):
+        sent.update(json.loads(request.data), auth=request.get_header("Authorization"))
+        content = '<think>\nhmm {"x": 0}\n</think>\n{"ok": "yes"}'
+        message = {
+            "choices": [{"finish_reason": "stop", "message": {"content": content}}]
+        }
+        return _Response(json.dumps(message).encode())
+
+    monkeypatch.setattr(parsers, "NVIDIA_API_KEY", "k")
+    monkeypatch.setattr(parsers.urllib.request, "urlopen", urlopen)
+    schema = {"type": "object"}
+    out = asyncio.run(parsers.chat_json("nvidia:nvidia/some-model", "s", "u", schema))
+    assert out == {"ok": "yes"}
+    assert sent["model"] == "nvidia/some-model"
+    assert sent["response_format"]["json_schema"]["schema"] == schema
+    assert sent["auth"] == "Bearer k"
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}

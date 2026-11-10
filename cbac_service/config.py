@@ -92,7 +92,7 @@ OPENFGA_API_TOKEN: str = os.environ.get("OPENFGA_API_TOKEN", "")
 INTENT_TTL_SECONDS: int = int(os.environ.get("INTENT_TTL_SECONDS", "3600"))
 
 # ── v2 gate: parsers ──────────────────────────────────────────────────────────
-# "<backend>:<model>", backend one of "ollama" | "anthropic". The policy parser
+# "<backend>:<model>", backend one of "ollama" | "anthropic" | "nvidia". The policy parser
 # runs once per upload and can afford a large model; the query parser runs on
 # the first call of every intent, so it sits on the latency path.
 POLICY_PARSER_MODEL: str = os.environ.get("POLICY_PARSER_MODEL", "ollama:qwen3:14b")
@@ -101,6 +101,9 @@ OLLAMA_URL: str = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 # Empty lets the Anthropic SDK resolve credentials itself (an `ant auth login`
 # profile, ANTHROPIC_AUTH_TOKEN, ...).
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
+# For an nvidia: model, e.g. nvidia:nvidia/nemotron-3-nano-omni-30b-a3b-reasoning.
+NVIDIA_URL: str = os.environ.get("NVIDIA_URL", "https://integrate.api.nvidia.com/v1")
+NVIDIA_API_KEY: str = os.environ.get("NVIDIA_API_KEY", "")
 
 # Shared secret for the v2 policy endpoints, sent as X-CBAC-Key. Those
 # endpoints write deny tuples and the argument mapping, so an unset key makes
