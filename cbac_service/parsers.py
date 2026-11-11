@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,6 +34,8 @@ from cbac_service.config import (
     NVIDIA_API_KEY,
     NVIDIA_URL,
     OLLAMA_URL,
+    QUERY_PARSER_MAX_TOKENS,
+    QUERY_PARSER_TIMEOUT_SECONDS,
 )
 from cbac_service.ibac import (
     WHOLE_TOOL,
@@ -175,32 +178,59 @@ def flatten_policy_chunks(policy: Any) -> list[str]:
 
 # ── LLM access ────────────────────────────────────────────────────────────────
 
-_OLLAMA_TIMEOUT_S = 600
+# The policy parser's limits. It runs once per upload, off the latency path,
+# and a large catalog is a long answer. The query parser's are in config.py.
+_POLICY_TIMEOUT_S = 600
+_POLICY_MAX_TOKENS = 16000
 _anthropic_client: Any = None
 
 
-async def chat_json(model: str, system: str, user: str, schema: dict) -> dict:
+async def chat_json(
+    model: str,
+    system: str,
+    user: str,
+    schema: dict,
+    *,
+    timeout: float,
+    max_tokens: int,
+) -> dict:
     """One structured completion: the model's answer as a JSON object.
 
     ``model`` is ``"<backend>:<name>"``. Every backend is asked to constrain
     decoding to ``schema``; no result is trusted beyond being parseable JSON.
+
+    ``timeout`` is a deadline in seconds on the whole call, whatever the
+    backend does inside it (connecting, retrying, generating). The HTTP
+    backends also get it as their socket timeout, so the thread a missed
+    deadline leaves behind ends too. ``max_tokens`` caps the answer; an
+    answer cut off at the cap is an error, never a shorter result.
     """
     backend, _, name = model.partition(":")
     if backend == "ollama":
-        raw = await asyncio.to_thread(_ollama, name, system, user, schema)
+        call = asyncio.to_thread(
+            _ollama, name, system, user, schema, timeout, max_tokens
+        )
     elif backend == "anthropic":
-        raw = await _anthropic(name, system, user, schema)
+        call = _anthropic(name, system, user, schema, max_tokens)
     elif backend == "nvidia":
-        raw = await asyncio.to_thread(_nvidia, name, system, user, schema)
+        call = asyncio.to_thread(
+            _nvidia, name, system, user, schema, timeout, max_tokens
+        )
     else:
         raise ValueError(f"unknown parser backend in {model!r}")
+    try:
+        raw = await asyncio.wait_for(call, timeout)
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"parser gave no answer within {timeout:g}s") from None
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise TypeError("parser returned JSON that is not an object")
     return data
 
 
-def _ollama(name: str, system: str, user: str, schema: dict) -> str:
+def _ollama(
+    name: str, system: str, user: str, schema: dict, timeout: float, max_tokens: int
+) -> str:
     body = {
         "model": name,
         "messages": [
@@ -210,27 +240,31 @@ def _ollama(name: str, system: str, user: str, schema: dict) -> str:
         "stream": False,
         "think": False,
         "format": schema,
-        "options": {"temperature": 0},
+        "options": {"temperature": 0, "num_predict": max_tokens},
     }
     request = urllib.request.Request(
         f"{OLLAMA_URL.rstrip('/')}/api/chat",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=_OLLAMA_TIMEOUT_S) as response:
-        return json.loads(response.read())["message"]["content"]
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        reply = json.loads(response.read())
+    if reply.get("done_reason") == "length":
+        raise RuntimeError("parser stopped with 'length'")
+    return reply["message"]["content"]
 
 
 _THINK = re.compile(r"^\s*<think>.*?</think>", re.DOTALL)
 
 
-def _nvidia(name: str, system: str, user: str, schema: dict) -> str:
+def _nvidia(
+    name: str, system: str, user: str, schema: dict, timeout: float, max_tokens: int
+) -> str:
     """NVIDIA's OpenAI-compatible chat API, with reasoning off.
 
     Reasoning off keeps the parser on the latency path short; sampling is
     NVIDIA's recommended instruct-mode setting for Nemotron (temperature 0.2,
-    top_k 1). ``max_tokens`` is raised from that setting's 1024 because a
-    policy parse can return a large catalog."""
+    top_k 1), except ``max_tokens``, which is the caller's cap."""
     if not NVIDIA_API_KEY:
         raise RuntimeError("NVIDIA_API_KEY is not set")
     body = {
@@ -244,7 +278,7 @@ def _nvidia(name: str, system: str, user: str, schema: dict) -> str:
             "json_schema": {"name": "output", "schema": schema},
         },
         "chat_template_kwargs": {"enable_thinking": False},
-        "max_tokens": 16000,
+        "max_tokens": max_tokens,
         "temperature": 0.2,
         "top_k": 1,
         "stream": False,
@@ -258,7 +292,7 @@ def _nvidia(name: str, system: str, user: str, schema: dict) -> str:
             "Authorization": f"Bearer {NVIDIA_API_KEY}",
         },
     )
-    with urllib.request.urlopen(request, timeout=_OLLAMA_TIMEOUT_S) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         choice = json.loads(response.read())["choices"][0]
     if choice.get("finish_reason") == "length":
         raise RuntimeError("parser stopped with 'length'")
@@ -266,7 +300,9 @@ def _nvidia(name: str, system: str, user: str, schema: dict) -> str:
     return _THINK.sub("", choice["message"]["content"] or "", count=1)
 
 
-async def _anthropic(name: str, system: str, user: str, schema: dict) -> str:
+async def _anthropic(
+    name: str, system: str, user: str, schema: dict, max_tokens: int
+) -> str:
     global _anthropic_client
     if _anthropic_client is None:
         from anthropic import AsyncAnthropic
@@ -277,7 +313,7 @@ async def _anthropic(name: str, system: str, user: str, schema: dict) -> str:
     # same. No temperature either — current models reject sampling params.
     response = await _anthropic_client.messages.create(
         model=name,
-        max_tokens=16000,
+        max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": user}],
         output_config={"format": {"type": "json_schema", "schema": schema}},
@@ -479,7 +515,14 @@ async def parse_policy(model: str, policy: str, tools: list[dict]) -> PolicyPars
     """
     names = sorted({t["name"] for t in tools if isinstance(t.get("name"), str)})
     user = f"Policy:\n{policy}\n\nTools:\n{json.dumps(tools, indent=1, sort_keys=True)}"
-    data = await chat_json(model, POLICY_SYSTEM, user, policy_schema(names))
+    data = await chat_json(
+        model,
+        POLICY_SYSTEM,
+        user,
+        policy_schema(names),
+        timeout=_POLICY_TIMEOUT_S,
+        max_tokens=_POLICY_MAX_TOKENS,
+    )
 
     entries = data.get("catalog")
     rules = data.get("deny_rules")
@@ -555,12 +598,33 @@ def query_schema(tool_names: list[str]) -> dict:
 
 
 def _leaves(value: Any) -> list[str]:
-    """Every scalar in the trusted data, as text — keys are structure, not data."""
+    """Every scalar in the trusted data, in canonical form — keys are
+    structure, not data."""
     if isinstance(value, dict):
         return [leaf for v in value.values() for leaf in _leaves(v)]
     if isinstance(value, list | tuple):
         return [leaf for v in value for leaf in _leaves(v)]
-    return [] if value is None else [str(value)]
+    try:
+        return [canonical(value)]
+    except NormalizationError:  # null, an empty string
+        return []
+
+
+def _grounded(resource: str, query: str, leaves: set[str]) -> bool:
+    """Whether a trusted input names the canonical ``resource``.
+
+    Either it equals a trusted-data leaf, or the query holds it as a whole
+    span: an occurrence with no letter or digit directly before or after it.
+    Being contained somewhere is not enough — ``/`` is inside every path and
+    ``1`` inside ``$100``, and neither was named by the user. ``query`` and
+    ``leaves`` arrive casefolded.
+    """
+    value = resource.casefold()
+    if value in leaves:
+        return True
+    # [^\W_] is one letter or digit.
+    span = rf"(?<![^\W_]){re.escape(value)}(?![^\W_])"
+    return re.search(span, query) is not None
 
 
 def _vocabulary(catalog: dict[str, dict]) -> str:
@@ -582,13 +646,18 @@ async def parse_query(
     The model names the argument each value is for, so it has to give one
     value per grant rather than packing a call's values into one string, and
     an argument that is not one of the tool's resources is dropped. The
-    OpenFGA tuple is still *(tool, resource)*; ``argument`` is the readable
-    record of what the value was granted for.
+    argument is part of the capability: the value is granted for that
+    argument of that tool and no other.
 
-    A grant is kept only if its resource is *grounded*: it appears in the
-    query or in the trusted data, either as the model wrote it or in its
-    canonical form. The query and the trusted data are trusted; the model
-    reading them is not, so a value it invented is dropped here.
+    A grant is kept only if its resource is *grounded* (:func:`_grounded`):
+    it is a trusted-data leaf, or the query names it as a whole span. The
+    query and the trusted data are trusted; the model reading them is not, so
+    a value it invented, or cut out of the middle of another, is dropped
+    here.
+
+    The call runs under the query parser's own deadline and output cap
+    (``QUERY_PARSER_TIMEOUT_SECONDS``, ``QUERY_PARSER_MAX_TOKENS``): a guarded
+    tool call is waiting on it, and its answer is a short list.
     """
     if not catalog:
         return [], []
@@ -597,15 +666,20 @@ async def parse_query(
         f"Trusted data:\n{json.dumps(trusted_data, indent=1, sort_keys=True)}\n\n"
         f"Tools:\n{_vocabulary(catalog)}"
     )
-    data = await chat_json(model, QUERY_SYSTEM, user, query_schema(sorted(catalog)))
+    data = await chat_json(
+        model,
+        QUERY_SYSTEM,
+        user,
+        query_schema(sorted(catalog)),
+        timeout=QUERY_PARSER_TIMEOUT_SECONDS,
+        max_tokens=QUERY_PARSER_MAX_TOKENS,
+    )
     proposed = data.get("grants")
     if not isinstance(proposed, list):
         raise TypeError("query parser output has no grants list")
 
-    sources = [
-        user_query.casefold(),
-        *(leaf.casefold() for leaf in _leaves(trusted_data)),
-    ]
+    query = unicodedata.normalize("NFC", user_query).casefold()
+    leaves = {leaf.casefold() for leaf in _leaves(trusted_data)}
     grants: list[dict] = []
     dropped: list[dict] = []
     for grant in proposed:
@@ -627,8 +701,7 @@ async def parse_query(
             except NormalizationError as exc:
                 dropped.append({"grant": grant, "reason": str(exc)})
                 continue
-            forms = {raw.strip().casefold(), resource.casefold()}
-            if not any(form in source for form in forms for source in sources):
+            if not _grounded(resource, query, leaves):
                 dropped.append({"grant": grant, "reason": "resource is not grounded"})
                 continue
         checked = {"tool": tool, "argument": argument, "resource": resource}

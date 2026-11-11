@@ -15,7 +15,7 @@ class _Client:
 def test_writes_never_carry_a_tuple_twice(monkeypatch):
     """OpenFGA refuses a request that repeats a tuple, even with duplicates
     set to ignore — so a policy with two rules on one value must still
-    activate, and two grants on one object must still be written."""
+    activate, and a grant listed twice must still be written."""
     client = _Client()
 
     async def ensure_store():
@@ -23,9 +23,14 @@ def test_writes_never_carry_a_tuple_twice(monkeypatch):
 
     monkeypatch.setattr(fga, "ensure_store", ensure_store)
     asyncio.run(fga.replace_denies(["a", "b", "a"], ["c", "c", "a"]))
-    asyncio.run(fga.write_grants("user:u", ["x", "x"], datetime.now(UTC), 60))
+    pairs = [("user:u", "x"), ("user:u", "x"), ("user:v", "x")]
+    asyncio.run(fga.write_grants(pairs, datetime.now(UTC), 60))
 
     writes, deletes, grants = client.requests
     assert [t.object for t in writes.writes] == ["a", "b"]
     assert [t.object for t in deletes.deletes] == ["c"]
-    assert [t.object for t in grants.writes] == ["x"]
+    # One object, two users: two exact spellings granted in one class.
+    assert [(t.user, t.object) for t in grants.writes] == [
+        ("user:u", "x"),
+        ("user:v", "x"),
+    ]

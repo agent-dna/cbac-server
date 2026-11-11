@@ -4,23 +4,44 @@ Pure functions, no I/O. Everything here runs identically when a tuple is
 *written* (from a parser's output) and when a tool call is *checked*, so a
 resource only ever matches itself in the same canonical form.
 
-A capability is IBAC's *(tool, resource)*: one tool, and one value of one of
-its resource arguments. A **catalog** says, per tool, which top-level
-arguments are *resources* — the values the call acts on, checked exactly — and
-which are *free text*, which nothing can match and which get the semantic
-checks instead. The policy parser writes it from the tool schemas;
-:func:`validate_catalog` checks its shape against those schemas.
+A capability is *(tool, argument, resource)*: one tool, one of its resource
+arguments, and one value for that argument. A **catalog** says, per tool,
+which top-level arguments are *resources* — the values the call acts on,
+checked exactly — and which are *free text*, which nothing can match and which
+get the semantic checks instead. The policy parser writes it from the tool
+schemas; :func:`validate_catalog` checks its shape against those schemas.
+
+Allowing is strict and denying is loose, and one OpenFGA object carries both::
+
+    allow  (fga_user(intent, resource), can_invoke, object_id(agent, tool, argument, resource))
+    deny   (user:*,                     blocked,    object_id(agent, tool, argument, resource))
+
+The object names a *class* of spellings (:func:`deny_key` of the resource);
+the user names one exact spelling. An allow tuple therefore matches only the
+value spelled as it was granted, in the argument it was granted for, while a
+deny tuple blocks every spelling in the class. A deny rule names no argument,
+so it is written once per resource argument of its tool. Both tuples sit on
+the same object, which is what the model's ``can_invoke = grant but not
+blocked`` needs to let a deny beat a grant.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import unicodedata
 from typing import Any
 
 # The resource of a tool that has no resource argument: the tool as a whole.
+# Such a tool's one capability is (tool, "*", "*").
 WHOLE_TOOL = "*"
+
+# What :func:`object_id` and :func:`fga_user` hash. Bump it whenever either
+# changes: tuples written under another number can never match again. A policy
+# version records the number its deny tuples were written under, and the gate
+# denies every call (4010) until the version is re-activated under this one.
+TUPLE_SCHEME = 1
 
 
 class NormalizationError(ValueError):
@@ -36,7 +57,8 @@ def canonical(value: Any) -> str:
     case, a display name, ``..`` in a path — are two different resources.
     Under exact allow-listing that can only cost a false deny, never a false
     allow, because a value matches a grant only by being spelled the way the
-    grant was. Objects, lists and ``null`` are not resources.
+    grant was. Deny rules compare more loosely, see :func:`deny_key`. Objects,
+    lists and ``null`` are not resources.
     """
     if isinstance(value, bool | int | float):
         return json.dumps(value)
@@ -47,22 +69,63 @@ def canonical(value: Any) -> str:
     raise NormalizationError(f"not a resource value: {value!r}")
 
 
-def object_id(agent_id: str, tool: str, resource: str) -> str:
-    """The OpenFGA object for ``tool#resource``, scoped to one agent.
+def deny_key(resource: str) -> str:
+    """The form a canonical resource is compared in by deny rules: NFKC, then
+    casefolded.
+
+    Looser than :func:`canonical` on purpose, and used only to deny. Letter
+    case and compatibility spellings (fullwidth letters, ligatures) of a
+    forbidden value are forbidden too, so ``Production`` does not get past a
+    rule on ``production``. Loose matching here can only add denies: allowing
+    still needs the exact spelling that was granted.
+    """
+    folded = unicodedata.normalize("NFKC", resource).casefold()
+    # Casefolding can leave a string that is no longer normalized.
+    return unicodedata.normalize("NFKC", folded)
+
+
+def glob_denies(pattern: str, resource: str) -> bool:
+    """Whether a glob deny rule covers ``resource``, both in :func:`deny_key`
+    form. ``*`` and ``?`` are the only wildcards: ``[`` is escaped to a
+    literal, because NFKC can produce one from a fullwidth bracket and a
+    character class would match less than the literal does."""
+    return fnmatch.fnmatchcase(
+        deny_key(resource), deny_key(pattern).replace("[", "[[]")
+    )
+
+
+def _digest(*parts: str) -> str:
+    """sha256 over the parts as a JSON array, so no value can pose as a
+    boundary between two of them."""
+    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()
+
+
+def object_id(agent_id: str, tool: str, argument: str, resource: str) -> str:
+    """The OpenFGA object for one resource argument of one tool holding
+    ``resource`` in any spelling :func:`deny_key` treats as the same.
+
+    ``argument`` is part of the object, so a value granted for one argument
+    is not granted for another: a grant for ``from`` does not let the same
+    value through as ``to``. Including ``agent_id`` keeps one agent's deny
+    tuple from ever matching another agent's call.
 
     Hashed rather than spelled out: raw values run into OpenFGA's id character
-    and length limits, and an escaping bug there would be a bypass. Including
-    ``agent_id`` keeps one agent's deny tuple from ever matching another
-    agent's call. The readable form lives in Postgres.
+    and length limits, and an escaping bug there would be a bypass. The
+    readable form lives in Postgres.
     """
-    digest = hashlib.sha256(f"{agent_id}\x00{tool}#{resource}".encode()).hexdigest()
-    return f"tool_invocation:{digest}"
+    return f"tool_invocation:{_digest(agent_id, tool, argument, deny_key(resource))}"
 
 
-def fga_user(intent_id: str) -> str:
-    """The OpenFGA user an intent's grants are written to. Hashed for the
-    same reason as :func:`object_id` — the intent id comes off the wire."""
-    return f"user:{hashlib.sha256(intent_id.encode()).hexdigest()}"
+def fga_user(intent_id: str, resource: str) -> str:
+    """The OpenFGA user one grant is written to: this intent, holding exactly
+    this canonical ``resource``.
+
+    The exact spelling lives here because :func:`object_id` holds only its
+    class. A call spelled any other way asks as a different user and finds no
+    allow tuple. Hashed for the same reasons as :func:`object_id` — the
+    intent id comes off the wire.
+    """
+    return f"user:{_digest(intent_id, resource)}"
 
 
 def resource_values(arguments: dict[str, Any], arg: str) -> list[Any]:

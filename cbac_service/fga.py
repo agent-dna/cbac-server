@@ -7,7 +7,9 @@ authorization model is ``fga_model.json``::
     tool_invocation.can_invoke = [user with non_expired_grant] but not blocked
     tool_invocation.blocked    = [user:*]
 
-so an allow tuple carries its own expiry and an exact deny tuple beats it.
+so an allow tuple carries its own expiry and an exact deny tuple on the same
+object beats it. What a user and an object stand for is
+:mod:`cbac_service.ibac`'s business.
 """
 
 from __future__ import annotations
@@ -132,13 +134,15 @@ async def _write(
 
 
 async def write_grants(
-    user: str, objects: Sequence[str], grant_time: datetime, ttl_seconds: int
+    grants: Sequence[tuple[str, str]], grant_time: datetime, ttl_seconds: int
 ) -> None:
     """Allow tuples for one intent, live for ``ttl_seconds`` from ``grant_time``.
 
-    Objects are deduplicated: two grants on one tool that differ only in
-    ``argument`` hash to the same object, and OpenFGA refuses a request that
-    carries a tuple twice, even with duplicate writes set to ignore.
+    Each grant is a ``(user, object)`` pair, as built by
+    :func:`~cbac_service.ibac.fga_user` and
+    :func:`~cbac_service.ibac.object_id`. Pairs are deduplicated: OpenFGA
+    refuses a request that carries a tuple twice, even with duplicate writes
+    set to ignore.
     """
     condition = RelationshipCondition(
         name="non_expired_grant",
@@ -152,7 +156,7 @@ async def write_grants(
             ClientTuple(
                 user=user, relation="can_invoke", object=obj, condition=condition
             )
-            for obj in dict.fromkeys(objects)
+            for user, obj in dict.fromkeys(grants)
         ]
     )
 
@@ -166,8 +170,8 @@ async def replace_denies(add: Sequence[str], remove: Sequence[str]) -> None:
 
     New tuples are written before old ones are deleted, so a rule present in
     both versions is never briefly missing. Both lists are deduplicated: two
-    rules can name the same tool and value, and OpenFGA refuses a request
-    that carries a tuple twice.
+    rules can name the same tool and value, or two spellings of it, and
+    OpenFGA refuses a request that carries a tuple twice.
     """
     keep = set(add)
     await _write(

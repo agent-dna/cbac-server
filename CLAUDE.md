@@ -45,16 +45,17 @@ Modules:
   DB and OpenFGA lifecycle via lifespan, and the `__main__` uvicorn runner.
 - `cbac.py` — the decision engine (class `CBAC`), no HTTP. Both gates.
 - `ibac.py` — v2's deterministic half, pure functions: the canonical form of a
-  resource value, OpenFGA object/user ids, catalog validation. Domain-neutral:
-  nothing in it knows what an email, a path or a URL is.
+  resource value, the looser form deny rules compare in, OpenFGA object/user
+  ids, catalog validation. Domain-neutral: nothing in it knows what an email,
+  a path or a URL is.
 - `parsers.py` — policy text in, structures out. Deterministic: structure-aware
   chunking for the embedding index (`flatten_policy_chunks`, used by both
   gates), the hard word cap that keeps every chunk and every free-text window
   inside the cross-encoders' 512 tokens (`split_by_word_budget`), and the v2
   document split (`split_policy_document`). LLM: v2's two parsers
   (`parse_policy`, `parse_query`), the `chat_json` backend dispatch (Ollama
-  or NVIDIA's API over stdlib HTTP, or the Claude API), and the validation of everything they
-  return.
+  or NVIDIA's API over stdlib HTTP, or the Claude API) with a deadline and an
+  output cap on every call, and the validation of everything they return.
 - `fga.py` + `fga_model.json` — OpenFGA access: store binding, tuple writes,
   checks.
 - `config.py` — pipeline tunables as module-level constants (`ALLOW_GAP`,
@@ -81,7 +82,9 @@ Modules:
   - **`GET /cbac/v2/policies/{agent_id}`** — the agent's active and pending
     versions, for a reviewer. Same key.
   - **`POST /cbac/v2/policies/{agent_id}/approve`** — `{"version_id": n}`:
-    activate a pending version (the optional human-review step). Same key.
+    activate a pending version (the optional human-review step), or
+    re-activate the active one. Re-activation rewrites the version's deny
+    tuples and is what clears a 4010. A superseded version is a 409. Same key.
   - **`POST /cbac/v2/authorize`** — the v2 decision gate:
     `{agent_id, intent_id, user_query, tool, arguments, callee_type, mcp_did}`
     → `data` `{decision, status_code, hash}`. Always HTTP 200, like v1.
@@ -116,6 +119,7 @@ user -> agent -> gateway (cbac/ guard) --HTTP--> cbac_service (FastAPI) -> tool 
                      in this Postgres)      ├── policy_meta
                                             ├── policy_versions (v2 policy + catalog)
                                             ├── cbac_intents (intent -> query, grants)
+                                            ├── cbac_intent_failures (failed query parses)
                                             ├── cbac_decisions (audit log)
                                             └── lhi_records (trust history)
 ```
@@ -149,17 +153,26 @@ The service uses **PostgreSQL 18** with two extensions:
   upload's trusted data (`{}` when none)
 - `catalog` — tool name → `{resources: [arg], free_text: [arg], description}`,
   validated
-- `deny_rules` — `[{tool, match: exact|glob, resource, source}]`
+- `deny_rules` — `[{tool, match: exact|glob, resource, source}]`, each
+  resource as the admin spelled it; matching is loose (see the v2 pipeline)
 - `rejected` / `unenforceable` — what validation threw out, and the policy
   statements no tuple can express
 - `status` — `pending` | `active` | `superseded`; the active version is the
   agent's latest `active` row
+- `tuple_scheme` — `ibac.TUPLE_SCHEME` as of the version's last activation,
+  NULL until then. The gate denies every call (4010) on an active version
+  whose number is not the current one
 - `parser_model`, `created_at`, `approved_at`
 
 **`cbac_intents`** — one row per `intent_id`, written by the first v2 call that
 carries it and never updated: `agent_id`, `user_query`, `policy_version_id`,
 `grants` (readable form of the allow tuples), `dropped`, `parser_model`,
 `created_at`, `expires_at`.
+
+**`cbac_intent_failures`** — one row per `intent_id` whose query parse failed,
+overwritten by each new failure: `reason`, `failed_at`. Read only for an id
+that has no `cbac_intents` row. It is a table, not process memory, so every
+uvicorn worker sees the same failures. Rows are never deleted.
 
 **`cbac_decisions`** — one row per verdict of either gate, the **audit log**:
 - `agent_id` / `decision` / `reason` / `error_code` — who, what, why, which check
@@ -243,6 +256,12 @@ See `.env.sample` for the full list. Key ones:
 - `POLICY_PARSER_MODEL` / `QUERY_PARSER_MODEL` — `"<backend>:<model>"`, backend
   `ollama`, `anthropic` or `nvidia` (default `ollama:qwen3:14b`); `OLLAMA_URL`,
   `ANTHROPIC_API_KEY`, `NVIDIA_URL`, `NVIDIA_API_KEY`
+- `QUERY_PARSER_TIMEOUT_SECONDS` (default 15) / `QUERY_PARSER_MAX_TOKENS`
+  (default 1024) — the query parser's own deadline and output cap. The policy
+  parser's are constants in `parsers.py` (600 s, 16000 tokens): it runs once
+  per upload
+- `QUERY_PARSER_RETRY_SECONDS` (default 30) — how long a failed query parse is
+  remembered, during which calls with that intent id deny at once
 - `CBAC_POLICY_KEY` — the v2 policy endpoints' shared secret
 - `INTENT_TTL_SECONDS` (default 3600)
 
@@ -285,37 +304,58 @@ semantic checks — `review_required` is the mitigation. A tool that fails is
 left out of the catalog, so calls to it are denied. Each deny rule's `source`
 must be a verbatim quote of the policy.
 
-The capability is IBAC's *(tool, resource)*, and the system is deliberately
-domain-neutral: no resource types, no per-domain normalization. A resource
-value is compared in one canonical form (`ibac.canonical`: strings NFC +
-trimmed, numbers and booleans as JSON, so `3` and `"3"` agree), and any other
-spelling is a different resource. Under exact allow-listing that can only
-produce a false deny, never a false allow.
+The capability is *(tool, argument, resource)*: IBAC's *(tool, resource)* plus
+the argument the value is for, so a value granted as `from` is not granted as
+`to`. The system is deliberately domain-neutral: no resource types, no
+per-domain normalization.
+
+**Allowing is strict.** A resource value is compared in one canonical form
+(`ibac.canonical`: strings NFC + trimmed, numbers and booleans as JSON, so `3`
+and `"3"` agree), and any other spelling is a different resource. Under exact
+allow-listing that can only produce a false deny, never a false allow.
+
+**Denying is loose.** Deny rules, exact and glob alike, compare in
+`ibac.deny_key` form (NFKC, then casefolded), so `Production` does not get
+past a rule on `production`. A deny rule names no argument and covers every
+resource argument of its tool. Loose matching can only add denies: an allow
+still needs the exact spelling that was granted.
+
 Activation (`activate_policy_version`) re-indexes the policy chunks
-(`index_policy`, for policy drift), swaps the exact deny tuples in OpenFGA, and
-only then flips the rows. An upload with `review_required: true` stays
-`pending` — the previous active version keeps deciding — until
+(`index_policy`, for policy drift), swaps the exact deny tuples in OpenFGA,
+stamps the version with `ibac.TUPLE_SCHEME`, and only then flips the rows. An
+upload with `review_required: true` stays `pending` — the previous active
+version keeps deciding — until
 `POST /cbac/v2/policies/{agent_id}/approve` activates it.
 
 **Per call**, in order:
 
 1. **Intent.** Empty `intent_id`/`user_query` → 4001. Under a transaction-scoped
    advisory lock on the intent id: an unseen id runs `parse_query` (query +
-   trusted data → grants of `{tool, argument, resource}`, one value each; the
-   argument must be one of the tool's resources and the value grounded in the
-   query or trusted data — the tuple itself is *(tool, resource)*),
+   trusted data → grants of `{tool, argument, resource}`, one value each),
    writes the allow tuples, and stores the `cbac_intents` row; a seen id must
-   carry the same query and agent (4002) and be unexpired (4003). A failed
-   parse stores nothing (4004), so the next call retries.
+   carry the same query and agent (4002) and be unexpired (4003).
+   A grant is kept only if its argument is one of the tool's resources and its
+   value is *grounded*: it equals a trusted-data leaf, or the query holds it
+   as a whole span, with no letter or digit directly before or after it. `/`
+   is not grounded by `/tmp/x`, nor `1` by `$100`. Both comparisons are
+   casefolded.
+   The parse runs under `QUERY_PARSER_TIMEOUT_SECONDS` and
+   `QUERY_PARSER_MAX_TOKENS`. A failed parse grants nothing (4004) and is
+   recorded in `cbac_intent_failures`; for `QUERY_PARSER_RETRY_SECONDS` after
+   it, calls with that intent id deny with 4004 at once, without parsing. The
+   first call after the window parses again.
 2. **Mapping.** The active version's catalog: unknown tool 4005, an argument
    that is neither resource nor free text 4006, a resource value with no
    canonical form (an object, an empty string) 4007, no resource value 4008, no
-   active version 4009. A tool with no resource arguments has the single
-   resource `*`. A list-valued resource argument is checked item by item.
+   active version 4009, an active version not stamped with the current
+   `ibac.TUPLE_SCHEME` 4010. A tool with no resource arguments has the single
+   capability `(tool, *, *)`. A list-valued resource argument is checked item
+   by item.
 3. **Glob deny rules**, matched in the service (OpenFGA cannot wildcard an
-   object id) → 4101.
-4. **OpenFGA**: each resource needs a live allow tuple and no deny tuple —
-   4102 deny tuple, 4103 not granted, 4104 OpenFGA error.
+   object id) → 4101. `*` and `?` are the only wildcards.
+4. **OpenFGA**: each value of each resource argument needs a live allow tuple
+   for that argument and that exact spelling, and no deny tuple — 4102 deny
+   tuple, 4103 not granted, 4104 OpenFGA error.
 5. **Semantic checks** on free-text arguments, **deny-only**: every word window
    (`CHUNK_MAX_WORDS`) is scored, so nothing hides past the models' 512-token
    cut. Intent drift (NLI contradiction vs the query) → 4201; policy drift
@@ -325,15 +365,35 @@ only then flips the rows. An upload with `review_required: true` stays
    never gating.
 6. **Allow**: 4301 (no free text) or 4302 (free text passed).
 
-Tuple shapes (`fga_model.json`): allow `(user:<sha256(intent_id)>, can_invoke,
-tool_invocation:<sha256(agent_id, tool#resource)>)` with a
-`non_expired_grant` condition; deny `(user:*, blocked, …)`. Object ids are
-hashed so OpenFGA's id limits never meet a raw value, and agent-scoped so one
-agent's deny never matches another's call.
+Tuple shapes (`fga_model.json`, ids built in `ibac.py`):
 
-Known limit (also IBAC's): each resource argument is checked on its own, so a
-tool with two resource arguments accepts any combination of granted values. The readable forms are in
-`policy_versions` and `cbac_intents`.
+```
+allow  (user:<sha256(intent_id, resource)>, can_invoke,
+        tool_invocation:<sha256(agent_id, tool, argument, deny_key(resource))>)
+        with a non_expired_grant condition
+deny   (user:*, blocked, the same object)
+        one per resource argument of the rule's tool
+```
+
+The object is a class of spellings and the user is one exact spelling. That
+puts the allow tuple and the deny tuple on the same object, which the model's
+`can_invoke = grant but not blocked` needs for a deny to beat a grant, while
+the allow still matches only the spelling granted, in the argument it was
+granted for. Ids are hashed so OpenFGA's id limits never meet a raw value, and
+objects are agent-scoped so one agent's deny never matches another's call. The
+readable forms are in `policy_versions` and `cbac_intents`.
+
+`ibac.TUPLE_SCHEME` numbers what those ids hash. Tuples written under another
+number can never match again, so a release that changes it leaves every active
+version's deny tuples unfindable. The gate then denies each agent's calls with
+4010 until an operator re-activates its active version
+(`POST /cbac/v2/policies/{agent_id}/approve` with that version's id, from
+`GET /cbac/v2/policies/{agent_id}`). Intents granted before the change get
+4103 and need a new `intent_id`. The tuples left behind match nothing.
+
+Known limit (also IBAC's): each resource argument is checked on its own. If
+one query grants two calls of a tool, `transfer(from=a, to=b)` and
+`transfer(from=c, to=d)`, then `transfer(from=a, to=d)` also passes.
 
 `authorize_call` wraps `_authorize_call` the way `verify_cbac` wraps `_decide`:
 the trust fold and the audit write happen in one place for every path.
@@ -446,8 +506,10 @@ error, or an inconclusive/misbehaving Tier 3, → `deny`).
 
 ## v2 tests
 
-No OpenFGA, Postgres or LLM needed: `test_ibac.py` (normalization, catalog
-validation), `test_parsers.py` (validation behind a fake `chat_json`), and
+No OpenFGA, Postgres or LLM needed: `test_ibac.py` (normalization, tuple ids,
+loose deny matching, catalog validation), `test_parsers.py` (validation and
+grounding behind a fake `chat_json`, the parsers' limits), and
 `test_authorize_v2.py` (the talk's injection replayed through `authorize_call`
-against in-memory fakes of OpenFGA and the repository, plus the guard↔route
-contract and the policy-key check).
+against in-memory fakes of OpenFGA and the repository; grants per argument,
+loose denies, the remembered parse failure, re-activation; plus the
+guard↔route contract and the policy-key check).

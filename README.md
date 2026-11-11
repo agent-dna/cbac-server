@@ -225,6 +225,9 @@ All settings are environment variables; defaults live in `cbac_service/config.py
 | `INTENT_TTL_SECONDS` | `3600` | How long an intent's grants stay live |
 | `POLICY_PARSER_MODEL` | `ollama:qwen3:14b` | `<backend>:<model>`, backend `ollama`, `anthropic` or `nvidia` |
 | `QUERY_PARSER_MODEL` | `ollama:qwen3:14b` | Same format; runs on the first call of each intent |
+| `QUERY_PARSER_TIMEOUT_SECONDS` | `15` | Deadline for one query parse. A parse that misses it denies the call (`4004`) |
+| `QUERY_PARSER_MAX_TOKENS` | `1024` | Output cap for one query parse; its answer is a short list of grants |
+| `QUERY_PARSER_RETRY_SECONDS` | `30` | How long a failed query parse is remembered. Calls with that `intent_id` deny (`4004`) at once in that window |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server |
 | `ANTHROPIC_API_KEY` | `""` | For an `anthropic:` model; empty lets the SDK find credentials itself |
 | `NVIDIA_URL` | `https://integrate.api.nvidia.com/v1` | NVIDIA's OpenAI-compatible API, for an `nvidia:` model |
@@ -252,7 +255,7 @@ same envelope with HTTP 422 and the field errors under `data.errors`.
 |---|---|---|
 | `POST` | `/cbac/v2/policies` | Upload `{agent_id, policy, trusted_data?, review_required?}` — the policy document (instructions and tool schemas in one Markdown file, see below; required) and optionally the agent's trusted data. The new version activates at once, unless `review_required` (default `false`) holds it pending for approval. A document that does not split is a 422. Returns the parsed version: catalog, deny rules, and what was rejected or cannot be enforced. Needs `X-CBAC-Key` |
 | `GET` | `/cbac/v2/policies/{agent_id}` | The agent's active and pending versions. Needs `X-CBAC-Key` |
-| `POST` | `/cbac/v2/policies/{agent_id}/approve` | `{version_id}` — activate a pending version. Needs `X-CBAC-Key` |
+| `POST` | `/cbac/v2/policies/{agent_id}/approve` | `{version_id}` — activate a pending version, or re-activate the active one (rewrites its deny tuples; clears a `4010`). Needs `X-CBAC-Key` |
 | `POST` | `/cbac/v2/authorize` | The v2 gate: `{agent_id, intent_id, user_query, tool, arguments, callee_type, mcp_did}` → `{decision, status_code, hash}`. Allow codes are `4301`/`4302` |
 | `POST` | `/cbac/v1/authorize` | The v1 gate. `data.decision` is `allow`/`deny`/`error` (also mirrored in the `X-CBAC-Decision` header for proxies) and `message` the reason. Folds the component scores into the caller→callee trust score |
 | `GET` | `/cbac/v1/decisions?agent_id=&limit=&offset=` | An agent's decision history, newest first |
@@ -285,20 +288,35 @@ for each tool, which arguments are resources (values naming what the call acts
 on) and which are free text — plus deny rules over each tool's resource values
 and the statements no rule can express. Code then checks it: every argument of
 every schema must be classified, every deny rule must quote the policy
-verbatim. Exact deny rules become OpenFGA deny tuples.
+verbatim. Exact deny rules become OpenFGA deny tuples, one per resource
+argument of the rule's tool.
 
 **On the first call of each user request** (a new `intent_id`), an LLM parses
 the user's query — with the agent's trusted data, if any — into grants of one
-tool, one of its resource arguments, and one value each, keeps only the ones
-whose argument belongs to the tool and whose value appears in
-the query or the trusted data, and writes them as allow tuples that expire
-after `INTENT_TTL_SECONDS`. Later calls with that `intent_id` reuse them, and
-must carry the same query.
+tool, one of its resource arguments, and one value each. Code keeps a grant
+only if its argument belongs to the tool and its value is *grounded*: it
+equals a value in the trusted data, or it appears in the query as a whole
+span, with no letter or digit directly before or after it. (`/` is not
+grounded by `/tmp/x`, nor `1` by `$100`.) The kept grants are written as allow
+tuples that expire after `INTENT_TTL_SECONDS`. Later calls with that
+`intent_id` reuse them, and must carry the same query.
 
-Nothing here is domain-specific. A resource value is compared exactly, in one
-canonical form (strings Unicode-normalized and trimmed; numbers and booleans as
-JSON, so `3` and `"3"` agree). Any other spelling is a different resource and
-is denied — a false deny, never a false allow.
+The parse has its own deadline (`QUERY_PARSER_TIMEOUT_SECONDS`) and output cap
+(`QUERY_PARSER_MAX_TOKENS`). If it fails, the call is denied (`4004`) and the
+failure is remembered in Postgres for `QUERY_PARSER_RETRY_SECONDS`: calls with
+that `intent_id` in that window are denied at once, without parsing again.
+
+Nothing here is domain-specific, and the two directions compare differently:
+
+- **Allowing is strict.** A value is granted for one argument of one tool, in
+  one canonical form (strings Unicode-normalized and trimmed; numbers and
+  booleans as JSON, so `3` and `"3"` agree). Any other spelling, or the same
+  value in another argument, is not granted — a false deny, never a false
+  allow.
+- **Denying is loose.** Deny rules, exact and glob, ignore letter case and
+  Unicode compatibility forms (NFKC + casefold), and cover every resource
+  argument of their tool. `Production` does not get past a rule on
+  `production`. Loose matching can only add denies.
 
 **Every call** then goes through, in order:
 
@@ -307,14 +325,39 @@ is denied — a false deny, never a false allow.
    object, an empty string) is a deny.
 2. **Glob deny rules** — patterns over a tool's resource values, matched in the
    service.
-3. **OpenFGA** — every resource needs an unexpired allow tuple and no deny
-   tuple.
+3. **OpenFGA** — every value of every resource argument needs an unexpired
+   allow tuple for that argument and that spelling, and no deny tuple.
 4. **Semantic checks** on free-text arguments only, and only able to deny:
    intent drift (does the text contradict the user's query?) and policy drift
    (Tier 1 cosine gap, Tier 2 NLI against the policy chunks).
 
 `status_code` names the check that decided (`cbac_service/error_codes.py`,
 the 4000s). Any error is a deny.
+
+**Re-activating after a tuple scheme change.** `ibac.TUPLE_SCHEME` numbers how
+OpenFGA ids are built, and each policy version records the number its deny
+tuples were written under. When a release changes the number, tuples already
+in the store can no longer match, so the gate denies every call of an agent
+with `4010` until its active version is re-activated. After deploying such a
+release and running `alembic upgrade head`, do this once per agent:
+
+```bash
+curl -s -H "X-CBAC-Key: $CBAC_POLICY_KEY" \
+  "http://127.0.0.1:8767/cbac/v2/policies/$AGENT_ID"            # find the active version_id
+curl -s -X POST -H "X-CBAC-Key: $CBAC_POLICY_KEY" -H "Content-Type: application/json" \
+  -d '{"version_id": <active version_id>}' \
+  "http://127.0.0.1:8767/cbac/v2/policies/$AGENT_ID/approve"    # rewrite its deny tuples
+```
+
+The agents that still need it:
+
+```sql
+SELECT agent_id, id FROM policy_versions
+WHERE status = 'active' AND tuple_scheme IS DISTINCT FROM <ibac.TUPLE_SCHEME>;
+```
+
+Intents granted before the change are denied (`4103`) and need a new
+`intent_id`. The old tuples stay in the store and match nothing.
 
 ## How a decision is made (v1)
 

@@ -566,7 +566,14 @@ async def read_policies_v2(
 async def approve_policy_v2(
     agent_id: str, body: PolicyApproveRequest, x_cbac_key: str | None = Header(None)
 ) -> JSONResponse:
-    """Activate a pending version: the optional human-review step."""
+    """Activate a pending version (the optional human-review step), or
+    re-activate the active one.
+
+    Re-activating replays the active version into the stores: its chunks are
+    re-indexed and its deny tuples rewritten under the current
+    ``ibac.TUPLE_SCHEME``. That is what clears a 4010 deny. A superseded
+    version is refused; it has been replaced.
+    """
     refusal = _policy_key_refusal(x_cbac_key)
     if refusal is not None:
         return refusal
@@ -580,9 +587,10 @@ async def approve_policy_v2(
                     success=False,
                     status_code=404,
                 )
-            if version.status != "pending":
+            if version.status not in ("pending", "active"):
                 return api_response(
-                    message=f"version {version.id} is {version.status}, not pending",
+                    message=f"version {version.id} is {version.status}, "
+                    "not pending or active",
                     success=False,
                     status_code=409,
                 )
