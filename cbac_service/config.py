@@ -97,6 +97,18 @@ INTENT_TTL_SECONDS: int = int(os.environ.get("INTENT_TTL_SECONDS", "3600"))
 # the first call of every intent, so it sits on the latency path.
 POLICY_PARSER_MODEL: str = os.environ.get("POLICY_PARSER_MODEL", "ollama:qwen3:14b")
 QUERY_PARSER_MODEL: str = os.environ.get("QUERY_PARSER_MODEL", "ollama:qwen3:14b")
+# The query parser's own deadline and output cap. Its answer is a short list of
+# grants, and a guarded tool call is waiting on it; the policy parser's long
+# limits live in parsers.py.
+QUERY_PARSER_TIMEOUT_SECONDS: float = float(
+    os.environ.get("QUERY_PARSER_TIMEOUT_SECONDS", "15")
+)
+QUERY_PARSER_MAX_TOKENS: int = int(os.environ.get("QUERY_PARSER_MAX_TOKENS", "1024"))
+# How long a failed query parse is remembered. Calls carrying that intent id
+# inside the window deny (4004) at once instead of parsing again.
+QUERY_PARSER_RETRY_SECONDS: float = float(
+    os.environ.get("QUERY_PARSER_RETRY_SECONDS", "30")
+)
 OLLAMA_URL: str = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 # Empty lets the Anthropic SDK resolve credentials itself (an `ant auth login`
 # profile, ANTHROPIC_AUTH_TOKEN, ...).

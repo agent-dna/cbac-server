@@ -21,6 +21,7 @@ from cbac_service.config import ENCODER_MODEL, NLI_MODEL
 from .models import (
     CBACDecision,
     CBACIntent,
+    CBACIntentFailure,
     LHIRecord,
     PolicyChunk,
     PolicyMeta,
@@ -506,3 +507,29 @@ async def insert_intent(session: AsyncSession, **fields) -> CBACIntent:
     session.add(record)
     await session.flush()
     return record
+
+
+async def get_intent_failure(
+    session: AsyncSession, intent_id: str
+) -> CBACIntentFailure | None:
+    """The latest failed query parse recorded for ``intent_id``, or None."""
+    stmt = select(CBACIntentFailure).where(CBACIntentFailure.intent_id == intent_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def record_intent_failure(
+    session: AsyncSession, intent_id: str, reason: str
+) -> None:
+    """Remember that ``intent_id``'s query parse just failed, replacing any
+    earlier failure. Commits, which also releases the :func:`lock_intent`
+    lock."""
+    stmt = insert(CBACIntentFailure).values(
+        intent_id=intent_id, reason=reason, failed_at=datetime.now(timezone.utc)
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["intent_id"],
+        set_={"reason": stmt.excluded.reason, "failed_at": stmt.excluded.failed_at},
+    )
+    await session.execute(stmt)
+    await session.commit()

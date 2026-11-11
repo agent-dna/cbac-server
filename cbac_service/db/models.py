@@ -223,10 +223,11 @@ class PolicyVersion(Base):
     policy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     tool_schemas: Mapped[list] = mapped_column(JSONB, nullable=False)
     trusted_data: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    # tool name -> {"resources": [{arg, action, kind}], "free_text": [arg]}
+    # tool name -> {"resources": [arg], "free_text": [arg], "description": str}
     catalog: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    # [{action, match: "exact"|"glob", resource, source}]; exact rules are
-    # also OpenFGA deny tuples while this version is active.
+    # [{tool, match: "exact"|"glob", resource, source}]; while this version is
+    # active, each exact rule is an OpenFGA deny tuple per resource argument
+    # of its tool.
     deny_rules: Mapped[list] = mapped_column(JSONB, nullable=False)
     rejected: Mapped[list] = mapped_column(JSONB, nullable=False)
     unenforceable: Mapped[list] = mapped_column(JSONB, nullable=False)
@@ -238,6 +239,10 @@ class PolicyVersion(Base):
     approved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # ibac.TUPLE_SCHEME as of this version's last activation, i.e. the scheme
+    # its deny tuples in OpenFGA were written under. NULL until activated. The
+    # gate refuses to decide on a version whose number is not the current one.
+    tuple_scheme: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         Index("ix_policy_versions_agent_status_id", "agent_id", "status", "id"),
@@ -271,3 +276,24 @@ class CBACIntent(Base):
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class CBACIntentFailure(Base):
+    """The latest failed query parse of an intent id.
+
+    One row per intent id, overwritten by each new failure. While the row is
+    younger than ``QUERY_PARSER_RETRY_SECONDS``, a call carrying that id is
+    denied at once instead of running the parser again. It is a table rather
+    than process memory so that every worker sees the same failures.
+
+    Only read for an id that has no ``cbac_intents`` row, so a row left behind
+    by a parse that later succeeded is never consulted.
+    ponytail: rows are never deleted, one per intent id that ever failed;
+    prune on ``failed_at`` if the table grows.
+    """
+
+    __tablename__ = "cbac_intent_failures"
+
+    intent_id: Mapped[str] = mapped_column(String, primary_key=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    failed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

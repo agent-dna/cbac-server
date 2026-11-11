@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import fnmatch
 import hashlib
 import json
 import uuid
@@ -35,11 +34,13 @@ from cbac_service.config import (
     NLI_MODEL,
     POLICY_PARSER_MODEL,
     QUERY_PARSER_MODEL,
+    QUERY_PARSER_RETRY_SECONDS,
 )
 from cbac_service.db.models import CBACIntent, PolicyVersion
 from cbac_service.db.repository import (
     get_active_policy_version,
     get_intent,
+    get_intent_failure,
     get_latest_trust,
     get_policy_chunks,
     insert_cbac_decision,
@@ -48,14 +49,17 @@ from cbac_service.db.repository import (
     insert_policy_version,
     lock_intent,
     mark_policy_version_active,
+    record_intent_failure,
     save_policy_chunks,
 )
 from cbac_service.db.search import SearchResult, hybrid_search, vector_search
 from cbac_service.ibac import (
+    TUPLE_SCHEME,
     WHOLE_TOOL,
     NormalizationError,
     canonical,
     fga_user,
+    glob_denies,
     object_id,
     resource_values,
 )
@@ -157,6 +161,30 @@ def _deny(
     return CBACResult(
         decision="deny", reason=reason, error_code=error_code, intent_score=intent_score
     )
+
+
+def _exact_deny_objects(version: PolicyVersion | None) -> list[str]:
+    """The OpenFGA objects a version's exact deny rules block.
+
+    A rule names a tool and a value but no argument, and it blocks the value
+    wherever the tool takes a resource. So it is one object per resource
+    argument of the tool: the same objects the allow tuples for those
+    arguments sit on, which is what lets the deny beat them. A tool with no
+    resource arguments has the single object of its whole-tool capability.
+    """
+    if version is None:
+        return []
+    return [
+        object_id(version.agent_id, rule["tool"], argument, rule["resource"])
+        for rule in version.deny_rules
+        if rule["match"] == "exact"
+        for argument in version.catalog[rule["tool"]]["resources"] or [WHOLE_TOOL]
+    ]
+
+
+def _site(tool: str, argument: str, resource: str) -> str:
+    """One capability, as a decision's reason spells it."""
+    return tool if argument == WHOLE_TOOL else f"{tool}.{argument}={resource!r}"
 
 
 def _as_text(value: Any) -> str:
@@ -1096,20 +1124,18 @@ class CBAC:
         The rows flip last, so ``active`` never names a version whose tuples
         are not in the store. Steps that fail leave the previous version
         active; approving again retries the whole sequence.
+
+        The version is stamped with the ``TUPLE_SCHEME`` its deny tuples were
+        just written under. Activating the version that is already active is
+        therefore how its tuples are rewritten under the current scheme: the
+        gate denies every call (4010) on a version stamped with another one.
         """
         previous = await get_active_policy_version(session, version.agent_id)
         await self.index_policy(session, version.agent_id, policy=version.policy)
-
-        def exact_denies(v: PolicyVersion | None) -> list[str]:
-            if v is None:
-                return []
-            return [
-                object_id(v.agent_id, r["tool"], r["resource"])
-                for r in v.deny_rules
-                if r["match"] == "exact"
-            ]
-
-        await fga.replace_denies(exact_denies(version), exact_denies(previous))
+        await fga.replace_denies(
+            _exact_deny_objects(version), _exact_deny_objects(previous)
+        )
+        version.tuple_scheme = TUPLE_SCHEME
         await mark_policy_version_active(session, version)
 
     async def authorize_call(
@@ -1163,8 +1189,12 @@ class CBAC:
         1. Intent: bind ``intent_id`` to its query, parsing grants on first sight.
         2. Mapping: the active catalog says which arguments are resources.
         3. Glob deny rules, matched here (OpenFGA cannot wildcard an object).
-        4. OpenFGA: every resource needs a live allow tuple and no deny tuple.
+        4. OpenFGA: every value of every resource argument needs a live allow
+           tuple for that argument and that exact spelling, and no deny tuple.
         5. Semantic checks on the free-text arguments — deny-only.
+
+        Deny rules, glob and exact alike, match loosely
+        (:func:`~cbac_service.ibac.deny_key`); allow tuples match strictly.
 
         Fail-closed throughout: every error is a deny with its own code.
         """
@@ -1177,6 +1207,15 @@ class CBAC:
         if version is None:
             return _deny(
                 f"No active v2 policy for agent {agent_id}", ec.MAPPING_NO_ACTIVE_POLICY
+            )
+        if version.tuple_scheme != TUPLE_SCHEME:
+            # Its deny tuples would not be found by the objects checked below,
+            # so deciding on it could let a forbidden value through.
+            return _deny(
+                f"Policy version {version.id} of agent {agent_id} must be "
+                f"re-activated: its deny tuples are not in tuple scheme "
+                f"{TUPLE_SCHEME}",
+                ec.MAPPING_STALE_TUPLES,
             )
 
         intent, denial = await self._resolve_intent(
@@ -1207,13 +1246,14 @@ class CBAC:
                 ec.MAPPING_UNKNOWN_ARGUMENT,
             )
 
-        resources: list[str] = []
+        # (argument, canonical value) for every value of every resource argument.
+        resources: list[tuple[str, str]] = []
         if not entry["resources"]:
-            resources.append(WHOLE_TOOL)
+            resources.append((WHOLE_TOOL, WHOLE_TOOL))
         for arg in entry["resources"]:
             for value in resource_values(arguments, arg):
                 try:
-                    resources.append(canonical(value))
+                    resources.append((arg, canonical(value)))
                 except NormalizationError as exc:
                     return _deny(
                         f"{tool}.{arg}: {exc}", ec.MAPPING_NORMALIZATION_FAILED
@@ -1221,28 +1261,32 @@ class CBAC:
         if not resources:
             return _deny(f"Call to {tool!r} names no resource", ec.MAPPING_NO_RESOURCE)
 
-        # 3. Glob deny rules.
-        for resource in resources:
+        # 3. Glob deny rules. Like an exact rule, a glob names no argument and
+        # covers every resource argument of its tool.
+        for arg, resource in resources:
             for rule in version.deny_rules:
                 if (
                     rule["match"] == "glob"
                     and rule["tool"] == tool
-                    and fnmatch.fnmatchcase(resource, rule["resource"])
+                    and glob_denies(rule["resource"], resource)
                 ):
                     return _deny(
-                        f"{tool}#{resource} matches deny rule "
+                        f"{_site(tool, arg, resource)} matches deny rule "
                         f"{rule['resource']!r} ({rule['source']!r})",
                         ec.AUTHZ_GLOB_DENY,
                     )
 
         # 4. OpenFGA.
-        user = fga_user(intent_id)
         try:
             refused: tuple[str, bool] | None = None
-            for resource in resources:
-                obj = object_id(agent_id, tool, resource)
+            for arg, resource in resources:
+                user = fga_user(intent_id, resource)
+                obj = object_id(agent_id, tool, arg, resource)
                 if not await fga.can_invoke(user, obj, now):
-                    refused = (f"{tool}#{resource}", await fga.is_blocked(user, obj))
+                    refused = (
+                        _site(tool, arg, resource),
+                        await fga.is_blocked(user, obj),
+                    )
                     break
         except Exception as exc:
             return _deny(f"OpenFGA check failed: {exc}", ec.AUTHZ_FGA_ERROR)
@@ -1264,7 +1308,7 @@ class CBAC:
         if not texts:
             return CBACResult(
                 decision="allow",
-                reason=f"Granted: {', '.join(f'{tool}#{r}' for r in resources)}",
+                reason=f"Granted: {', '.join(_site(tool, *r) for r in resources)}",
                 error_code=ec.ALLOW_NO_FREE_TEXT,
             )
         return await self._semantic_checks(session, agent_id, user_query, texts)
@@ -1283,6 +1327,11 @@ class CBAC:
         path, which releases it. The first call parses the query, writes the
         allow tuples, and stores the binding; every later call must carry the
         same query and agent, which is what freezes the grants.
+
+        A parse that fails is recorded in ``cbac_intent_failures``, and for
+        ``QUERY_PARSER_RETRY_SECONDS`` after it every call carrying the id is
+        denied without parsing again. Calls queue on the lock, so without the
+        record each one waiting behind a failed parse would repeat it in turn.
         ponytail: the lock holds a pool connection for one LLM call, so the
         pool size bounds concurrent new intents; a "parsing" status row frees
         the connection if that ever binds.
@@ -1298,21 +1347,51 @@ class CBAC:
                 )
             return intent, None
 
-        try:
-            grants, dropped = await parse_query(
-                QUERY_PARSER_MODEL, user_query, version.trusted_data, version.catalog
-            )
-        except Exception as exc:
+        grants: list[dict] = []
+        dropped: list[dict] = []
+        error: str | None = None
+        failure = await get_intent_failure(session, intent_id)
+        if failure is not None:
+            retry_at = failure.failed_at + timedelta(seconds=QUERY_PARSER_RETRY_SECONDS)
+            if datetime.now(timezone.utc) < retry_at:
+                error = (
+                    f"{failure.reason} (not parsed again before {retry_at.isoformat()})"
+                )
+        if error is None:
+            try:
+                grants, dropped = await parse_query(
+                    QUERY_PARSER_MODEL,
+                    user_query,
+                    version.trusted_data,
+                    version.catalog,
+                )
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+                try:
+                    await record_intent_failure(session, intent_id, error)
+                except Exception:
+                    # An unrecorded failure costs a repeated parse on the next
+                    # call. It cannot turn this deny into an allow.
+                    logger.warning(
+                        "failed query parse not recorded",
+                        intent_id=intent_id,
+                        exc_info=True,
+                    )
+        if error is not None:
             await session.rollback()
-            return None, _deny(f"Query parser failed: {exc}", ec.INTENT_PARSE_FAILED)
+            return None, _deny(f"Query parser failed: {error}", ec.INTENT_PARSE_FAILED)
 
         now = datetime.now(timezone.utc)
-        objects = [object_id(agent_id, g["tool"], g["resource"]) for g in grants]
+        tuples = [
+            (
+                fga_user(intent_id, g["resource"]),
+                object_id(agent_id, g["tool"], g["argument"], g["resource"]),
+            )
+            for g in grants
+        ]
         try:
-            if objects:
-                await fga.write_grants(
-                    fga_user(intent_id), objects, now, INTENT_TTL_SECONDS
-                )
+            if tuples:
+                await fga.write_grants(tuples, now, INTENT_TTL_SECONDS)
         except Exception as exc:
             await session.rollback()
             return None, _deny(f"OpenFGA grant write failed: {exc}", ec.AUTHZ_FGA_ERROR)

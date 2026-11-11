@@ -78,14 +78,15 @@ TIER3_LLM_MALFORMED_DENY = 3409  # deny — backend returned something that isn'
 INTENT_MISSING = 4001  # deny — empty intent_id or user_query
 INTENT_MISMATCH = 4002  # deny — intent_id already bound to another query or agent
 INTENT_EXPIRED = 4003  # deny — the intent's grants are past INTENT_TTL_SECONDS
-INTENT_PARSE_FAILED = (
-    4004  # deny — query parser raised; nothing stored, next call retries
-)
+INTENT_PARSE_FAILED = 4004  # deny — the intent's query parse failed, on this call
+# or within QUERY_PARSER_RETRY_SECONDS before it; nothing is granted
 MAPPING_UNKNOWN_TOOL = 4005  # deny — tool not in the agent's active catalog
 MAPPING_UNKNOWN_ARGUMENT = 4006  # deny — argument neither a resource nor free text
 MAPPING_NORMALIZATION_FAILED = 4007  # deny — a resource value has no canonical form
 MAPPING_NO_RESOURCE = 4008  # deny — the call names no value for any resource argument
 MAPPING_NO_ACTIVE_POLICY = 4009  # deny — the agent has no active policy version
+MAPPING_STALE_TUPLES = 4010  # deny — the active version's deny tuples were not
+# written under ibac.TUPLE_SCHEME; it has to be re-activated
 
 # ── 4100s: v2 authorization ─────────────────────────────────────────────────
 AUTHZ_GLOB_DENY = 4101  # deny — a glob deny rule matches a resource

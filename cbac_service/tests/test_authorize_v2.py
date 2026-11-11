@@ -19,13 +19,17 @@ import cbac_service.cbac as cbac_mod
 from cbac_service import error_codes as ec
 from cbac_service import main, parsers
 from cbac_service.cbac import CBAC
-from cbac_service.entity import PolicyUploadRequest
-from cbac_service.ibac import object_id
+from cbac_service.config import QUERY_PARSER_RETRY_SECONDS
+from cbac_service.entity import PolicyApproveRequest, PolicyUploadRequest
+from cbac_service.ibac import TUPLE_SCHEME, object_id
 
 AGENT = "did:agent:calendar"
 INTENT = "intent-1"
 QUERY = "Check today's calendar and tell Bob the meeting is at 3pm"
-TRUSTED = {"contacts": {"Bob": "bob@company.com", "CEO": "ceo@company.com"}}
+TRUSTED = {
+    "contacts": {"Bob": "bob@company.com", "CEO": "ceo@company.com"},
+    "agenda": {"first item": 3},
+}
 
 CATALOG = {
     "read_calendar": {"resources": ["day"], "free_text": []},
@@ -33,25 +37,44 @@ CATALOG = {
     "read_file": {"resources": ["path"], "free_text": []},
     "open_item": {"resources": ["item"], "free_text": []},
     "list_events": {"resources": [], "free_text": []},
+    "transfer": {"resources": ["from", "to"], "free_text": ["memo"]},
+    "deploy": {"resources": ["env"], "free_text": []},
 }
+
+
+def deny(tool, match, resource):
+    return {"tool": tool, "match": match, "resource": resource, "source": "s"}
+
+
 DENY_RULES = [
-    {"tool": "read_file", "match": "glob", "resource": "/etc/*", "source": "s"},
-    {
-        "tool": "send_invite",
-        "match": "exact",
-        "resource": "ceo@company.com",
-        "source": "s",
-    },
+    deny("read_file", "glob", "/etc/*"),
+    deny("send_invite", "exact", "ceo@company.com"),
+    deny("transfer", "exact", "offshore"),
+    deny("deploy", "exact", "production"),
 ]
-# What the (fake) query parser proposes for QUERY. The CEO grant is grounded
-# in the trusted data; the exact deny tuple must still beat it.
+
+
+def grant(tool, argument, resource):
+    return {"tool": tool, "argument": argument, "resource": resource}
+
+
+# What the (fake) query parser proposes, whatever the query. Grounding keeps
+# the ones the query at hand or the trusted data names. The CEO grant is
+# grounded in the trusted data; the exact deny tuple must still beat it.
 GRANTS = [
-    {"tool": "read_calendar", "argument": "day", "resource": "today"},
-    {"tool": "send_invite", "argument": "to", "resource": "bob@company.com"},
-    {"tool": "send_invite", "argument": "to", "resource": "ceo@company.com"},
-    {"tool": "read_file", "argument": "path", "resource": "/etc/hosts"},
-    {"tool": "open_item", "argument": "item", "resource": "3"},
-    {"tool": "list_events", "argument": "*", "resource": "*"},
+    grant("read_calendar", "day", "today"),
+    grant("send_invite", "to", "bob@company.com"),
+    grant("send_invite", "to", "ceo@company.com"),
+    grant("read_file", "path", "/etc/hosts"),
+    grant("read_file", "path", "/ETC/hosts"),
+    grant("open_item", "item", "3"),
+    grant("list_events", "*", "*"),
+    grant("transfer", "from", "savings"),
+    grant("transfer", "to", "checking"),
+    grant("transfer", "from", "offshore"),
+    grant("transfer", "to", "offshore"),
+    grant("deploy", "env", "Production"),
+    grant("deploy", "env", "staging"),
 ]
 
 
@@ -63,8 +86,8 @@ class FakeFGA:
         self.denies: set[str] = set()
         self.fail = False
 
-    async def write_grants(self, user, objects, grant_time, ttl_seconds):
-        for obj in objects:
+    async def write_grants(self, grants, grant_time, ttl_seconds):
+        for user, obj in grants:
             self.grants[(user, obj)] = grant_time + timedelta(seconds=ttl_seconds)
 
     async def replace_denies(self, add, remove):
@@ -92,17 +115,28 @@ class FakeSession:
 @pytest.fixture
 def world(rows, decisions, monkeypatch):
     fga = FakeFGA()
-    fga.denies.add(object_id(AGENT, "send_invite", "ceo@company.com"))
     version = SimpleNamespace(
         id=1,
         agent_id=AGENT,
         catalog=CATALOG,
         deny_rules=DENY_RULES,
         trusted_data=TRUSTED,
+        tuple_scheme=TUPLE_SCHEME,
     )
+    # The deny tuples activation writes for this version.
+    fga.denies.update(cbac_mod._exact_deny_objects(version))
     intents: dict[str, SimpleNamespace] = {}
+    failures: dict[str, SimpleNamespace] = {}
     llm_calls: list[str] = []
     llm_failures: list[Exception] = []
+
+    async def get_intent_failure(session, intent_id):
+        return failures.get(intent_id)
+
+    async def record_intent_failure(session, intent_id, reason):
+        failures[intent_id] = SimpleNamespace(
+            reason=reason, failed_at=datetime.now(timezone.utc)
+        )
 
     async def get_active_policy_version(session, agent_id):
         return version if agent_id == AGENT else None
@@ -117,12 +151,14 @@ def world(rows, decisions, monkeypatch):
         intents[fields["intent_id"]] = SimpleNamespace(**fields)
         return intents[fields["intent_id"]]
 
-    async def chat_json(model, system, user, schema):
+    async def chat_json(model, system, user, schema, **limits):
         llm_calls.append(user)
         if llm_failures:
             raise llm_failures.pop()
         return {"grants": GRANTS}
 
+    monkeypatch.setattr(cbac_mod, "get_intent_failure", get_intent_failure)
+    monkeypatch.setattr(cbac_mod, "record_intent_failure", record_intent_failure)
     monkeypatch.setattr(cbac_mod, "fga", fga)
     monkeypatch.setattr(
         cbac_mod, "get_active_policy_version", get_active_policy_version
@@ -169,7 +205,9 @@ def world(rows, decisions, monkeypatch):
         call=call,
         cbac=cbac,
         fga=fga,
+        version=version,
         intents=intents,
+        failures=failures,
         llm_calls=llm_calls,
         llm_failures=llm_failures,
         decisions=decisions,
@@ -294,14 +332,100 @@ def test_expired_intent_denies(world):
     assert result.error_code == ec.INTENT_EXPIRED
 
 
-def test_parse_failure_denies_and_the_next_call_retries(world):
-    world.llm_failures.append(TimeoutError("ollama timed out"))
+def test_a_failed_parse_is_remembered_and_not_repeated(world):
+    world.llm_failures.append(TimeoutError("parser gave no answer within 15s"))
     first = world.call("read_calendar", {"day": "today"})
     assert first.error_code == ec.INTENT_PARSE_FAILED
     assert INTENT not in world.intents
-    second = world.call("read_calendar", {"day": "today"})
-    assert second.error_code == ec.ALLOW_NO_FREE_TEXT
+
+    # Inside the window: denied at once, and the parser is not asked again.
+    again = world.call("read_calendar", {"day": "today"})
+    assert (again.decision, again.error_code) == ("deny", ec.INTENT_PARSE_FAILED)
+    assert "within 15s" in again.reason
+    assert len(world.llm_calls) == 1
+
+    # Past the window the next call parses again, and this time it works.
+    world.failures[INTENT].failed_at -= timedelta(
+        seconds=QUERY_PARSER_RETRY_SECONDS + 1
+    )
+    retry = world.call("read_calendar", {"day": "today"})
+    assert retry.error_code == ec.ALLOW_NO_FREE_TEXT
     assert len(world.llm_calls) == 2
+
+
+def test_a_failed_parse_that_cannot_be_recorded_still_denies(world, monkeypatch):
+    async def down(session, intent_id, reason):
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(cbac_mod, "record_intent_failure", down)
+    world.llm_failures.append(TimeoutError("slow"))
+    result = world.call("read_calendar", {"day": "today"})
+    assert (result.decision, result.error_code) == ("deny", ec.INTENT_PARSE_FAILED)
+
+
+# ── the argument is part of the grant ───────────────────────────────────────
+
+
+def test_a_value_is_granted_for_one_argument_only(world):
+    """savings is granted as the source and checking as the destination, so
+    the same two values the other way round are not granted."""
+
+    def transfer(source, destination):
+        return world.call(
+            "transfer",
+            {"from": source, "to": destination},
+            query="move $100 from savings to checking",
+            intent="intent-transfer",
+        )
+
+    asked = transfer("savings", "checking")
+    assert (asked.decision, asked.error_code) == ("allow", ec.ALLOW_NO_FREE_TEXT)
+    swapped = transfer("checking", "savings")
+    assert (swapped.decision, swapped.error_code) == ("deny", ec.AUTHZ_NO_ALLOW_TUPLE)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{"from": "offshore", "to": "checking"}, {"from": "savings", "to": "offshore"}],
+)
+def test_an_exact_deny_blocks_its_value_in_every_argument(world, arguments):
+    # The rule names no argument. Both calls hold a grant for every value.
+    query = "move $100 from offshore to checking, then from savings to offshore"
+    result = world.call("transfer", arguments, query=query, intent="intent-offshore")
+    assert (result.decision, result.error_code) == ("deny", ec.AUTHZ_DENY_TUPLE)
+
+
+# ── deny rules match loosely, allow tuples strictly ─────────────────────────
+
+
+def test_another_spelling_does_not_get_past_a_deny_rule(world):
+    # The rules are on "production" and "/etc/*". The user typed neither
+    # spelling, so the grants are for "Production" and "/ETC/hosts".
+    def call(tool, arguments):
+        return world.call(
+            tool,
+            arguments,
+            query="deploy to Production and to staging, then read /ETC/hosts",
+            intent="intent-deploy",
+        )
+
+    exact = call("deploy", {"env": "Production"})
+    assert (exact.decision, exact.error_code) == ("deny", ec.AUTHZ_DENY_TUPLE)
+    glob = call("read_file", {"path": "/ETC/hosts"})
+    assert (glob.decision, glob.error_code) == ("deny", ec.AUTHZ_GLOB_DENY)
+
+    # Loose matching only ever denies: a grant still needs its exact spelling.
+    assert call("deploy", {"env": "staging"}).error_code == ec.ALLOW_NO_FREE_TEXT
+    assert call("deploy", {"env": "Staging"}).error_code == ec.AUTHZ_NO_ALLOW_TUPLE
+
+
+def test_a_version_with_stale_tuples_denies_every_call(world):
+    # Activated under another tuple scheme: its deny tuples are not on the
+    # objects the gate checks, so nothing is decided on it.
+    world.version.tuple_scheme = None
+    result = world.call("read_calendar", {"day": "today"})
+    assert (result.decision, result.error_code) == ("deny", ec.MAPPING_STALE_TUPLES)
+    assert world.llm_calls == []
 
 
 def test_openfga_failure_denies(world):
@@ -387,15 +511,16 @@ def test_upload_activates_unless_review_is_required(monkeypatch, review_required
     old = SimpleNamespace(
         id=1,
         agent_id=AGENT,
-        deny_rules=[
-            {"tool": "send_invite", "match": "exact", "resource": "old@x.io"},
-        ],
+        catalog={"send_invite": {"resources": ["to"], "free_text": ["body"]}},
+        deny_rules=[deny("send_invite", "exact", "old@x.io")],
     )
     stored: list[SimpleNamespace] = []
     indexed: list[str] = []
 
     async def insert_policy_version(session, **fields):
-        stored.append(SimpleNamespace(id=2, approved_at=None, **fields))
+        stored.append(
+            SimpleNamespace(id=2, approved_at=None, tuple_scheme=None, **fields)
+        )
         return stored[-1]
 
     async def get_active_policy_version(session, agent_id):
@@ -408,7 +533,7 @@ def test_upload_activates_unless_review_is_required(monkeypatch, review_required
         indexed.append(policy)
         return 3
 
-    async def chat_json(model, system, user, schema):
+    async def chat_json(model, system, user, schema, **limits):
         return {
             "catalog": [
                 {
@@ -429,7 +554,7 @@ def test_upload_activates_unless_review_is_required(monkeypatch, review_required
         }
 
     monkeypatch.setattr(cbac_mod, "fga", fga)
-    fga.denies.add(object_id(AGENT, "send_invite", "old@x.io"))
+    fga.denies.add(object_id(AGENT, "send_invite", "to", "old@x.io"))
     monkeypatch.setattr(cbac_mod, "insert_policy_version", insert_policy_version)
     monkeypatch.setattr(
         cbac_mod, "get_active_policy_version", get_active_policy_version
@@ -468,12 +593,59 @@ def test_upload_activates_unless_review_is_required(monkeypatch, review_required
         # Held for an admin: nothing indexed, the old deny tuples untouched.
         assert version.status == "pending"
         assert indexed == []
-        assert fga.denies == {object_id(AGENT, "send_invite", "old@x.io")}
+        assert fga.denies == {object_id(AGENT, "send_invite", "to", "old@x.io")}
+        assert version.tuple_scheme is None
     else:
         assert version.status == "active"
         # Only the instructions are chunked for policy drift, never the schema.
         assert indexed == [policy]
-        assert fga.denies == {object_id(AGENT, "send_invite", "ceo@company.com")}
+        assert fga.denies == {object_id(AGENT, "send_invite", "to", "ceo@company.com")}
+        assert version.tuple_scheme == TUPLE_SCHEME
+
+
+def test_reactivating_the_active_version_rewrites_its_deny_tuples(monkeypatch):
+    """What an operator does after a tuple scheme change: the store holds no
+    deny tuple the gate would find, and the version is not stamped current."""
+    fga = FakeFGA()
+    version = SimpleNamespace(
+        id=1,
+        agent_id=AGENT,
+        policy="p",
+        catalog=CATALOG,
+        deny_rules=DENY_RULES,
+        status="active",
+        tuple_scheme=None,
+    )
+
+    async def get_active_policy_version(session, agent_id):
+        return version
+
+    async def mark_policy_version_active(session, version):
+        version.status = "active"
+
+    async def index_policy(session, agent_id, policy=None):
+        return 1
+
+    monkeypatch.setattr(cbac_mod, "fga", fga)
+    monkeypatch.setattr(
+        cbac_mod, "get_active_policy_version", get_active_policy_version
+    )
+    monkeypatch.setattr(
+        cbac_mod, "mark_policy_version_active", mark_policy_version_active
+    )
+    cbac = CBAC(provenance=SimpleNamespace())
+    monkeypatch.setattr(cbac, "index_policy", index_policy)
+
+    asyncio.run(cbac.activate_policy_version(None, version))
+
+    # One tuple per resource argument of each exact rule's tool; globs none.
+    assert fga.denies == {
+        object_id(AGENT, "send_invite", "to", "ceo@company.com"),
+        object_id(AGENT, "transfer", "from", "offshore"),
+        object_id(AGENT, "transfer", "to", "offshore"),
+        object_id(AGENT, "deploy", "env", "production"),
+    }
+    assert version.tuple_scheme == TUPLE_SCHEME
 
 
 # ── HTTP: the policy key ─────────────────────────────────────────────────────
@@ -548,17 +720,61 @@ def test_guard_authorize_call_posts_what_the_v2_route_reads(monkeypatch):
     assert parsed.arguments == {"to": ["bob@company.com"], "when": str(when)}
 
 
+class _Session:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.mark.parametrize(
+    ("status", "http_status"),
+    [("pending", 200), ("active", 200), ("superseded", 409)],
+)
+def test_approve_activates_a_pending_or_an_active_version(
+    monkeypatch, status, http_status
+):
+    version = SimpleNamespace(
+        id=7,
+        agent_id=AGENT,
+        status=status,
+        policy_hash="h",
+        policy="p",
+        catalog={},
+        deny_rules=[],
+        rejected=[],
+        unenforceable=[],
+        trusted_data={},
+        parser_model="m",
+        created_at=datetime.now(timezone.utc),
+        approved_at=None,
+    )
+    activated: list[int] = []
+
+    async def get_policy_version(session, agent_id, version_id):
+        return version
+
+    async def activate_policy_version(session, version):
+        activated.append(version.id)
+
+    monkeypatch.setattr(main, "CBAC_POLICY_KEY", "s3cret")
+    monkeypatch.setattr(main, "get_session", _Session)
+    monkeypatch.setattr(main, "get_policy_version", get_policy_version)
+    monkeypatch.setattr(
+        main,
+        "_get_cbac",
+        lambda: SimpleNamespace(activate_policy_version=activate_policy_version),
+    )
+    body = PolicyApproveRequest(version_id=7)
+    answered, _ = envelope(asyncio.run(main.approve_policy_v2(AGENT, body, "s3cret")))
+    assert answered == http_status
+    assert activated == ([7] if http_status == 200 else [])
+
+
 def test_a_document_that_does_not_split_is_a_422(monkeypatch):
     monkeypatch.setattr(main, "CBAC_POLICY_KEY", "s3cret")
     monkeypatch.setattr(main, "_get_cbac", lambda: CBAC(provenance=SimpleNamespace()))
-
-    class _Session:
-        async def __aenter__(self):
-            return None
-
-        async def __aexit__(self, *exc):
-            return False
-
     monkeypatch.setattr(main, "get_session", _Session)
     no_tools = PolicyUploadRequest(
         agent_id=AGENT, policy="---\nPolicy Instructions\nNever.\n---\n"

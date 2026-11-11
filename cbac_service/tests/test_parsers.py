@@ -44,8 +44,8 @@ CATALOG_OUT = [
 def fake_llm(monkeypatch, answer):
     calls = []
 
-    async def chat_json(model, system, user, schema):
-        calls.append({"model": model, "user": user, "schema": schema})
+    async def chat_json(model, system, user, schema, **limits):
+        calls.append({"model": model, "user": user, "schema": schema, "limits": limits})
         if isinstance(answer, Exception):
             raise answer
         return answer
@@ -213,9 +213,73 @@ def test_parse_query_with_empty_catalog_skips_the_model(monkeypatch):
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("query", "trusted", "resource", "kept"),
+    [
+        # Inside the query, but not as a whole span.
+        ("read /tmp/x", {}, "/", False),
+        ("move $100 to savings", {}, "1", False),
+        ("tell Bobby", {}, "bob", False),
+        # A whole span: nothing but punctuation, space or the ends around it.
+        ("email bob@company.com.", {}, "bob@company.com", True),
+        ("raise it on acme/api", {}, "acme/api", True),
+        ("Email BOB@company.com", {}, "bob@company.com", True),
+        # Trusted data grounds a whole leaf, never a piece of one or a key.
+        (
+            "email him",
+            {"contacts": {"Bob": "bob@company.com"}},
+            "bob@company.com",
+            True,
+        ),
+        ("email him", {"contacts": {"Bob": "bob@company.com"}}, "bob", False),
+        ("email him", {"contacts": {"Bob": "bob@company.com"}}, "company.com", False),
+        ("open it", {"items": [3]}, "3", True),
+    ],
+)
+def test_grounding_needs_a_whole_span_or_a_whole_leaf(
+    monkeypatch, query, trusted, resource, kept
+):
+    fake_llm(monkeypatch, {"grants": [grant("act_on", "target", resource)]})
+    grants, dropped = asyncio.run(
+        parsers.parse_query("ollama:m", query, trusted, CATALOG)
+    )
+    assert [g["resource"] for g in grants] == ([resource] if kept else [])
+    assert [d["reason"] for d in dropped] == (
+        [] if kept else ["resource is not grounded"]
+    )
+
+
+def test_each_parser_runs_under_its_own_limits(monkeypatch):
+    # The query parser's come from config; the policy parser keeps long ones.
+    monkeypatch.setattr(parsers, "QUERY_PARSER_TIMEOUT_SECONDS", 7.0)
+    monkeypatch.setattr(parsers, "QUERY_PARSER_MAX_TOKENS", 300)
+    calls = fake_llm(monkeypatch, {"grants": []})
+    asyncio.run(parsers.parse_query("ollama:m", QUERY, TRUSTED, CATALOG))
+    assert calls[0]["limits"] == {"timeout": 7.0, "max_tokens": 300}
+
+    calls = fake_llm(
+        monkeypatch, {"catalog": [], "deny_rules": [], "unenforceable": []}
+    )
+    asyncio.run(parsers.parse_policy("ollama:m", POLICY, TOOLS))
+    assert calls[0]["limits"] == {"timeout": 600, "max_tokens": 16000}
+
+
+def test_chat_json_gives_up_at_its_deadline(monkeypatch):
+    async def never(name, system, user, schema, max_tokens):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(parsers, "_anthropic", never)
+    with pytest.raises(TimeoutError, match="within 0.01s"):
+        asyncio.run(
+            parsers.chat_json("anthropic:m", "s", "u", {}, timeout=0.01, max_tokens=8)
+        )
+
+
 def test_chat_json_rejects_an_unknown_backend():
     with pytest.raises(ValueError, match="unknown parser backend"):
-        asyncio.run(parsers.chat_json("openai:gpt", "s", "u", {}))
+        asyncio.run(
+            parsers.chat_json("openai:gpt", "s", "u", {}, timeout=1, max_tokens=8)
+        )
 
 
 # ── the policy document ──────────────────────────────────────────────────────
@@ -265,30 +329,52 @@ def test_split_policy_document_rejects(text, why):
         parsers.split_policy_document(text)
 
 
-def test_nvidia_backend_strips_inline_reasoning(monkeypatch):
+def fake_urlopen(monkeypatch, reply):
+    """Answer the HTTP backends with ``reply``; returns what they sent."""
     sent = {}
 
-    class _Response(io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
     def urlopen(request, timeout):
-        sent.update(json.loads(request.data), auth=request.get_header("Authorization"))
-        content = '<think>\nhmm {"x": 0}\n</think>\n{"ok": "yes"}'
-        message = {
-            "choices": [{"finish_reason": "stop", "message": {"content": content}}]
-        }
-        return _Response(json.dumps(message).encode())
+        sent.update(
+            json.loads(request.data),
+            auth=request.get_header("Authorization"),
+            socket_timeout=timeout,
+        )
+        return io.BytesIO(json.dumps(reply).encode())
 
-    monkeypatch.setattr(parsers, "NVIDIA_API_KEY", "k")
     monkeypatch.setattr(parsers.urllib.request, "urlopen", urlopen)
+    return sent
+
+
+def test_nvidia_backend_strips_inline_reasoning(monkeypatch):
+    content = '<think>\nhmm {"x": 0}\n</think>\n{"ok": "yes"}'
+    sent = fake_urlopen(
+        monkeypatch,
+        {"choices": [{"finish_reason": "stop", "message": {"content": content}}]},
+    )
+    monkeypatch.setattr(parsers, "NVIDIA_API_KEY", "k")
     schema = {"type": "object"}
-    out = asyncio.run(parsers.chat_json("nvidia:nvidia/some-model", "s", "u", schema))
+    out = asyncio.run(
+        parsers.chat_json(
+            "nvidia:nvidia/some-model", "s", "u", schema, timeout=9, max_tokens=70
+        )
+    )
     assert out == {"ok": "yes"}
     assert sent["model"] == "nvidia/some-model"
     assert sent["response_format"]["json_schema"]["schema"] == schema
     assert sent["auth"] == "Bearer k"
     assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+    assert (sent["max_tokens"], sent["socket_timeout"]) == (70, 9)
+
+
+def test_ollama_backend_caps_the_answer_and_refuses_a_cut_one(monkeypatch):
+    reply = {"done_reason": "stop", "message": {"content": '{"ok": "yes"}'}}
+    sent = fake_urlopen(monkeypatch, reply)
+    call = ("ollama:some-model", "s", "u", {"type": "object"})
+    out = asyncio.run(parsers.chat_json(*call, timeout=9, max_tokens=70))
+    assert out == {"ok": "yes"}
+    assert (sent["options"]["num_predict"], sent["socket_timeout"]) == (70, 9)
+
+    # Cut off at the cap: half an answer is an error, not a shorter answer.
+    reply["done_reason"] = "length"
+    with pytest.raises(RuntimeError, match="length"):
+        asyncio.run(parsers.chat_json(*call, timeout=9, max_tokens=70))
